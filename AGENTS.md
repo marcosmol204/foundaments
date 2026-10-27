@@ -46,6 +46,15 @@ When Marcos asks a side question about the material (often starting with "btw", 
 - Add the date and, where useful, a link to the lesson section that covers it.
 - Don't log requests for changes (e.g. "add a diagram"). Log questions only.
 
+### Catch up on `/btw` questions at the start of every session
+
+Questions asked with Claude Code's `/btw` command are answered on the side and **never reach the session transcript**, so the rule above can't catch them as they happen. At the start of every session in this workspace, before other work:
+
+1. Read the prompt history `~/.claude/history.jsonl` (one JSON object per line). Keep entries whose `project` is this repo's path and whose `display` starts with `/btw`. `timestamp` is in milliseconds.
+2. Skip any question already in the topic's `QUESTIONS.md`. Entries from `/btw` carry `· /btw` in their date line, so you can match on that and on the question text.
+3. For each new one, write a fresh answer from the sources (the original `/btw` answer isn't saved) and file it as usual. Use the history timestamp as the date, add `· /btw` to the date line, and put it under the lesson it's about.
+4. Tell Marcos in one line how many you added. Say nothing if there were none.
+
 Entry format:
 
 ```md
