@@ -39,7 +39,7 @@
   </ul>
   <p>Take your <code>reviews</code> collection with a compound index <code>{verified: 1, rating: 1}</code>. Its keys are sorted by <code>verified</code> first (<code>false</code> before <code>true</code>), then by <code>rating</code>. So all the <code>{verified: true, rating: 5}</code> entries sit next to each other. That is the real reason prefix rules exist: the engine can seek to <code>verified: true</code> because <code>verified</code> comes first. It can't seek straight to <code>rating: 5</code>, because those entries are split between the <code>false</code> part and the <code>true</code> part of the tree. In the lab, the planner chose a full collection scan for <code>find({rating: 5})</code>.</p>
 
-  <h2>2b · B-tree concepts, step by step <span class="tag layer">added after your feedback</span></h2>
+  <h2 id="s2b">2b · B-tree concepts, step by step <span class="tag layer">added after your feedback</span></h2>
   <p>Before the two-tree picture, here is <em>one</em> tree, slowly: the <code>reviews</code> collection table. Its keys are RecordIds. To keep it simple, there are only nine reviews, with RecordIds <code>1</code> … <code>9</code>.</p>
 
   <h3>The vocabulary</h3>
@@ -161,7 +161,7 @@
   </table>
   <p>A <strong>covered query</strong> is one where the index key alone holds every field you asked for. Then there is no <code>FETCH</code> at all: one B-tree instead of two.<a class="cite" href="https://www.mongodb.com/docs/manual/reference/explain-results/">explain docs</a> Note that <code>_id</code> is returned by default. If it isn't in the index, the query isn't covered.</p>
 
-  <h2>3b · From Q3 to a best practice: cover your hot queries <span class="tag layer">added after your feedback</span></h2>
+  <h2 id="s3b">3b · From Q3 to a best practice: cover your hot queries <span class="tag layer">added after your feedback</span></h2>
   <p>Q3 asked which query avoids <code>FETCH</code>. That turns into a real performance rule:</p>
   <div class="callout">
     <p><strong>For a query that runs very often, make it <em>covered</em>.</strong> Put every field it filters on, sorts on and returns into one index, and project only those fields, with <code>_id: 0</code> unless <code>_id</code> is in the index.</p>
