@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MongoDB Architecture Map</title>
-<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="../../assets/style.css">
 <style>
   .stack { display: grid; gap: 6px; margin: 1.5rem 0; }
   .layer { display: grid; grid-template-columns: 11rem 1fr; gap: 1rem; border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; break-inside: avoid; }
@@ -20,6 +20,7 @@
 </head>
 <body>
 <main class="wide">
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>
   <div class="kicker">MongoDB Internals · Reference</div>
   <h1>Architecture map</h1>
   <p class="subtitle">The layers a request crosses, top to bottom, with where each lives in the source. Verified against the MongoDB 9.0 manual and the server repository (Oct 2026).</p>

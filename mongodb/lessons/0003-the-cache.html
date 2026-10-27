@@ -4,11 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Lesson 3 · The Cache</title>
-<link rel="stylesheet" href="../assets/style.css">
-<link rel="stylesheet" href="../assets/quiz.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<link rel="stylesheet" href="../../assets/quiz.css">
 </head>
 <body>
 <main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>
   <div class="kicker">MongoDB Internals · Lesson 0003 · Phase 1: The engine</div>
   <h1>The cache</h1>
   <p class="subtitle">Pages live on disk. Queries only work on pages in memory. This lesson is about what moves them back and forth, and who pays when it's slow.</p>
@@ -252,9 +253,9 @@ measure(() => {})   // run again a few seconds later</code></pre>
   </nav>
 </main>
 
-<script src="../assets/cache-sim.js"></script>
+<script src="../../assets/cache-sim.js"></script>
 <script>CacheSim.mount('#sim', { capacity: 20, diskPages: 60 });</script>
-<script src="../assets/quiz.js"></script>
+<script src="../../assets/quiz.js"></script>
 <script>
 const CACHE = 'https://source.wiredtiger.com/develop/arch-cache.html';
 const EVICT = 'https://source.wiredtiger.com/develop/arch-eviction.html';

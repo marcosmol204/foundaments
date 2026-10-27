@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MongoDB Questions</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../index.html">Home</a> / <a href="index.html">MongoDB</a> / Questions</nav>
+  <div class="kicker">MongoDB Internals · Self-test</div>
+  <div id="questions"><p>Loading <a href="QUESTIONS.md">QUESTIONS.md</a>…</p></div>
+</main>
+<!-- Renders QUESTIONS.md so the file stays the single source of truth. -->
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script>
+  const el = document.getElementById('questions');
+  fetch('QUESTIONS.md')
+    .then(r => { if (!r.ok) throw new Error(r.status); return r.text(); })
+    .then(md => {
+      el.innerHTML = marked.parse(md);
+      // Lesson links in the file are written relative to mongodb/, same as this page.
+      const intro = el.querySelector('h1 + p');
+      if (intro) intro.classList.add('subtitle');
+      if (!el.querySelector('h3')) el.insertAdjacentHTML('beforeend', '<p><em>No questions logged yet.</em></p>');
+    })
+    .catch(() => {
+      el.innerHTML = '<p>Couldn\'t load the questions. Open <a href="QUESTIONS.md">QUESTIONS.md</a> directly, or serve this folder over HTTP (fetch doesn\'t work from <code>file://</code>).</p>';
+    });
+</script>
+</body>
+</html>

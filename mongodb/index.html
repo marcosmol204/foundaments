@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MongoDB Internals</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../index.html">Home</a> / MongoDB</nav>
+  <div class="kicker">Topic · MongoDB Internals</div>
+  <h1>MongoDB, from the engine up</h1>
+  <p class="subtitle">Understand MongoDB well enough to diagnose production problems, defend design choices, and teach each layer from memory.</p>
+
+  <h2>Lessons</h2>
+  <h3>Phase 1 · The storage engine</h3>
+  <ol class="index-list">
+    <li><a href="lessons/0001-diagnostic.html">
+      <span class="num">0001</span>
+      <span class="title">Where are you on the stack?</span>
+      <span class="desc">A 20-question diagnostic, from basics to hard.</span>
+    </a></li>
+    <li><a href="lessons/0002-two-lookups.html">
+      <span class="num">0002</span>
+      <span class="title">Two lookups</span>
+      <span class="desc">What an index and a collection actually are inside WiredTiger.</span>
+    </a></li>
+    <li><a href="lessons/0002-1-btrees.html">
+      <span class="num">0002.1</span>
+      <span class="title">B-trees, from first principles to WiredTiger <span class="tag layer">deep dive</span></span>
+      <span class="desc">Why databases use them, a B-tree in C, and how WiredTiger's differs.</span>
+    </a></li>
+    <li><a href="lessons/0003-the-cache.html">
+      <span class="num">0003</span>
+      <span class="title">The cache</span>
+      <span class="desc">How pages move between disk and memory, and who pays when it's slow.</span>
+    </a></li>
+    <li class="upcoming"><div>
+      <span class="num">0004</span>
+      <span>Concurrency: snapshots and write conflicts <span class="tag layer">next</span></span>
+    </div></li>
+    <li class="upcoming"><div>
+      <span class="num">0005</span>
+      <span>Durability: journal and checkpoints</span>
+    </div></li>
+    <li class="upcoming"><div>
+      <span class="num">0006</span>
+      <span>MongoDB on top: one write, end to end</span>
+    </div></li>
+  </ol>
+
+  <h2>Reference</h2>
+  <ol class="index-list">
+    <li><a href="reference/architecture-map.html">
+      <span class="num">map</span>
+      <span class="title">Architecture map</span>
+      <span class="desc">The layers a request crosses, top to bottom, and where each lives in the source.</span>
+    </a></li>
+  </ol>
+
+  <h2>Self-test</h2>
+  <ol class="index-list">
+    <li><a href="questions.html">
+      <span class="num">Q&amp;A</span>
+      <span class="title">Questions I asked</span>
+      <span class="desc">Side questions from the lessons, filed by lesson. Answer from memory, then check.</span>
+    </a></li>
+  </ol>
+</main>
+</body>
+</html>

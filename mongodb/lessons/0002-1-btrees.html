@@ -4,11 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Lesson 2.1 · B-Trees</title>
-<link rel="stylesheet" href="../assets/style.css">
-<link rel="stylesheet" href="../assets/quiz.css">
+<link rel="stylesheet" href="../../assets/style.css">
+<link rel="stylesheet" href="../../assets/quiz.css">
 </head>
 <body>
 <main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>
   <div class="kicker">MongoDB Internals · Lesson 2.1 · Phase 1: The engine</div>
   <h1>B-trees, from first principles to WiredTiger</h1>
   <p class="subtitle">Why databases use them, a 150-line B-tree in C, and four ways WiredTiger's real B-tree differs from the textbook.</p>
@@ -293,8 +294,8 @@ range [30, 60]: 30 35 40 45 50 55 60
   </nav>
 </main>
 
-<script src="../assets/btree-viz.js"></script>
-<script src="../assets/quiz.js"></script>
+<script src="../../assets/btree-viz.js"></script>
+<script src="../../assets/quiz.js"></script>
 <script>
 BTreeViz.mount('#viz', { t: 2, preset: [10, 20, 30, 40, 50, 60, 70, 80, 90, 25, 35, 45, 5, 15, 55, 65] });
 

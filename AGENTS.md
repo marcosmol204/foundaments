@@ -1,8 +1,27 @@
-# Agent instructions: MongoDB Internals teaching workspace
+# Agent instructions: Foundaments teaching workspace
 
-This is a teaching workspace (see `MISSION.md`, `NOTES.md`, and the `teach` skill in `.agents/skills/teach/`).
+This is a teaching workspace (see the `teach` skill in `.agents/skills/teach/`), published as a GitHub Pages site. It holds one folder per topic. The current topic is MongoDB Internals (`mongodb/`).
 
-## Every example uses the `reviews` collection
+## Layout: one folder per topic
+
+```
+index.html            site landing page: lists the topics
+assets/               shared components (style.css, quiz.js, widgets) for all topics
+.nojekyll             serve files as-is on GitHub Pages
+mongodb/              one topic = one folder
+  index.html          topic home: lists lessons, reference, self-test
+  questions.html      renders QUESTIONS.md in the browser
+  MISSION.md NOTES.md RESOURCES.md QUESTIONS.md
+  lessons/  reference/  learning-records/
+```
+
+- The teach skill's workspace paths (`MISSION.md`, `./lessons/`, `./reference/`, `./learning-records/`, `NOTES.md`, `RESOURCES.md`) resolve **inside the topic folder**, e.g. `mongodb/lessons/`. `./assets/` stays at the repo root and is shared.
+- Pages in `<topic>/lessons/` and `<topic>/reference/` link assets as `../../assets/…` and start with the breadcrumb:
+  `<nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>`
+- Link to `index.html` explicitly (not `./` or `../`), so pages also work when opened from disk.
+- **When you add a lesson or reference page, add a row for it in the topic's `index.html`** (and move the `next` tag on the upcoming list). When you start a new topic, create its folder with the same layout and add it to the root `index.html`.
+
+## Every MongoDB example uses the `reviews` collection
 
 Marcos wants examples that look like their real work, not random data. In **every** lesson, diagram, quiz, lab and chat answer, use this collection (database `store`):
 
@@ -14,12 +33,12 @@ Marcos wants examples that look like their real work, not random data. In **ever
 
 - Don't invent other collections such as `orders` or `events`. If a concept needs something the schema lacks (a date, a product reference, a big text field), say that you're adding a field and why. Keep the five fields as they are.
 - Typical examples: `find({rating: {$gte: 4}})`, `{verified: 1, rating: 1}` compound index, `{tags: 1}` multikey index, covered query `find({verified: true}, {_id: 0, rating: 1})`.
-- For labs, load data with `lessons/code/seed-reviews.js`. It's deterministic: `_id`s are ObjectIds for one review per second from 2026-01-01, so "reviews of a day" is an `_id` range (`ObjectId.createFromTime`). Ratings skew positive (≈45% are 5★), each review has 1–3 tags from a fixed list, ≈70% are verified, and documents average ≈165 B. Usage is in the file header. Re-measure any numbers you show on this data.
+- For labs, load data with `mongodb/lessons/code/seed-reviews.js`. It's deterministic: `_id`s are ObjectIds for one review per second from 2026-01-01, so "reviews of a day" is an `_id` range (`ObjectId.createFromTime`). Ratings skew positive (≈45% are 5★), each review has 1–3 tags from a fixed list, ≈70% are verified, and documents average ≈165 B. Usage is in the file header. Re-measure any numbers you show on this data.
 - Lessons 0002–0003 were converted to `reviews` on 2026-10-27, with numbers re-measured. 0001 (the diagnostic) has no example data.
 
 ## Log every side question in `QUESTIONS.md`
 
-When Marcos asks a side question about the material (often starting with "btw", but any question about the topic counts), answer it in the chat as usual, **and** add it to `QUESTIONS.md` so they can test themselves later.
+When Marcos asks a side question about the material (often starting with "btw", but any question about the topic counts), answer it in the chat as usual, **and** add it to the topic's `QUESTIONS.md` (e.g. `mongodb/QUESTIONS.md`; links in it are relative to the topic folder) so they can test themselves later.
 
 - File it under the heading of the lesson it relates to (`## Lesson 0003 · The cache`). Use the lesson being worked on, or the one the question is clearly about. Add a new lesson heading when needed, keeping headings in lesson order. Put questions that don't fit any lesson under `## General`.
 - Write the question so it can be answered from memory, without the chat context. Rephrase it if needed.
