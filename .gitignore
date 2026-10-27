@@ -1,3 +1,5 @@
 # compiled lab binaries
 mongodb/lessons/code/btree
 .DS_Store
+
+.claude
