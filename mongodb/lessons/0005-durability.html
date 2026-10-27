@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 5 · Durability</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<link rel="stylesheet" href="../../assets/quiz.css">
+</head>
+<body>
+<main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>
+  <div class="kicker">MongoDB Internals · Lesson 0005 · Phase 1: The engine</div>
+  <h1>Durability: journal and checkpoints</h1>
+  <p class="subtitle">Your write is acknowledged while it still lives in memory. This lesson is about the two mechanisms that make sure it survives a crash anyway, and what they cost you in latency.</p>
+
+  <p><strong>Your win today:</strong> say exactly when a review you inserted becomes crash-safe (with and without <code>j: true</code>), read the recovery lines in a <code>mongod</code> log after a <code>kill -9</code>, and use two <code>serverStatus()</code> numbers to tell "slow fsync" from "slow checkpoint".</p>
+
+  <h2>0 · Warm-up</h2>
+  <p>From memory, before reading on:</p>
+  <ol>
+    <li><em>Lesson 2.1:</em> when WiredTiger writes a changed page to disk, does it overwrite the old block? What does the old block stay useful for?</li>
+    <li><em>Lesson 3:</em> name the two things that write dirty pages out of the cache.</li>
+  </ol>
+  <p>You asked earlier where the journal fits next to a collection's B-tree (it's in <a href="../questions.html">your questions</a>). The short answer was "a separate append-only log, replayed after a crash". Today we make that precise, and there's a twist in section 5: in a replica set, the journal doesn't hold your reviews at all.</p>
+
+  <h2>1 · Why two mechanisms?</h2>
+  <p>Put lessons 2.1 and 3 together and you get a problem.</p>
+  <ul>
+    <li><strong>The cache keeps changes in memory.</strong> An insert into <code>store.reviews</code> changes a leaf page in the WiredTiger cache and marks it dirty (lesson 3). The <code>.wt</code> file doesn't have it yet.</li>
+    <li><strong>Writing the page at every commit would be expensive.</strong> A review is ~165 bytes, but the leaf page is up to 32 KB. And WiredTiger never overwrites a block: the new page image goes to a <em>new</em> block.<a class="cite" href="https://source.wiredtiger.com/develop/arch-block.html">WT block manager</a> So the parent's address for that leaf changes, so the parent must be rewritten too, and so on up to the root. One small insert would become several random page writes.</li>
+  </ul>
+  <p>So WiredTiger splits the job in two:<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a></p>
+  <table>
+    <tr><th></th><th>Journal (write-ahead log)</th><th>Checkpoint</th></tr>
+    <tr><td>What is written</td><td>A small <strong>log record</strong> per commit: "insert this review"</td><td>Every dirty page, up to a new root, for every table</td></tr>
+    <tr><td>How</td><td>Appended to the end of one file: sequential, cheap</td><td>New blocks scattered in many <code>.wt</code> files</td></tr>
+    <tr><td>How often</td><td>Synced every <strong>100 ms</strong>, or right away for <code>j: true</code><a class="cite" href="https://www.mongodb.com/docs/manual/core/journaling/">journaling</a></td><td>Every <strong>60 s</strong><a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a></td></tr>
+    <tr><td>Its job</td><td>Make each commit durable <em>quickly</em></td><td>Make a consistent copy of the data files, so the journal can be thrown away</td></tr>
+  </table>
+  <p>Neither one is enough alone. Without the journal you'd lose up to 60 s of writes on a crash. Without checkpoints the journal would grow forever, and a restart would have to replay all of it.</p>
+
+  <h2>2 · One review, step by step</h2>
+  <p>We follow one review, <strong>R</strong>, on a standalone <code>mongod</code> (the replica set version comes in section 5):</p>
+<pre><code>db.reviews.insertOne({ review: "After two weeks battery lasts for days.", rating: 5,
+                       tags: ["battery", "quality"], verified: true })</code></pre>
+
+  <figure>
+    <svg viewBox="0 0 680 250" role="img" aria-label="Timeline. Checkpoint C1 is in the data files. The journal grows after C1 and is synced every 100 milliseconds. Review R is inserted, its record is synced at the next tick. mongod is killed before checkpoint C2. Recovery opens C1 and replays the journal from C1 to the end.">
+      <defs><marker id="ah5a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+      <text class="lbl-title" x="10" y="55">Cache</text>
+      <text class="lbl-title" x="10" y="115">Journal</text>
+      <text class="lbl-title" x="10" y="175">Data files</text>
+      <!-- cache lane -->
+      <rect x="300" y="40" width="300" height="20" fill="var(--warn-bg)" stroke="var(--warn)"/>
+      <text class="lbl-sm" x="306" y="54">page P holds R: dirty</text>
+      <!-- journal lane -->
+      <rect class="box" x="150" y="100" width="300" height="20"/>
+      <path class="edge" d="M180 100 v20 M210 100 v20 M240 100 v20 M270 100 v20 M330 100 v20 M360 100 v20 M390 100 v20 M420 100 v20"/>
+      <path d="M330 96 v28" stroke="var(--accent)" stroke-width="2.5"/>
+      <rect x="300" y="100" width="30" height="20" fill="var(--accent-soft)" stroke="var(--accent)"/>
+      <text class="lbl-sm" x="150" y="138">each tick = one sync (~100 ms)</text>
+      <text class="lbl-sm" x="336" y="94" style="fill: var(--accent)">R synced: durable</text>
+      <!-- files lane -->
+      <rect class="box-accent" x="130" y="160" width="60" height="24" rx="4"/>
+      <text class="lbl" x="143" y="177">C1</text>
+      <rect class="box" x="580" y="160" width="60" height="24" rx="4" stroke-dasharray="4 3"/>
+      <text class="lbl" x="593" y="177">C2</text>
+      <text class="lbl-sm" x="560" y="200">due 60 s after C1</text>
+      <!-- events -->
+      <path class="edge" d="M300 28 V190" stroke-dasharray="3 3"/>
+      <text class="lbl-sm" x="262" y="22">insert R, ack (j:false)</text>
+      <path d="M450 28 V190" stroke="var(--bad)" stroke-width="2"/>
+      <text class="lbl-sm" x="440" y="22" style="fill: var(--bad)">kill -9</text>
+      <!-- recovery -->
+      <path class="edge-accent" d="M160 222 H448" marker-end="url(#ah5a)"/>
+      <text class="lbl-sm" x="150" y="242">recovery: open C1, then replay the journal from C1 to the end</text>
+    </svg>
+    <figcaption>Not to scale: there are ~600 journal syncs between two checkpoints. R is safe from the first tick after its insert.</figcaption>
+  </figure>
+
+  <h3>Walkthrough 1 · Commit</h3>
+  <ol>
+    <li>WiredTiger adds R to leaf page P in the cache. P is now dirty (lesson 3).</li>
+    <li>In the same commit, it builds a <strong>log record</strong> for R and copies it into an in-memory log buffer.<a class="cite" href="https://source.wiredtiger.com/develop/arch-logging.html">WT logging</a> Nothing is on disk yet.</li>
+    <li>With the default write concern (<code>w: 1</code>, no <code>j</code>), the server acknowledges now. Your app thinks R is saved, but if <code>mongod</code> dies in the next few milliseconds, R can be lost: "updates can be lost following a hard shutdown".<a class="cite" href="https://www.mongodb.com/docs/manual/core/journaling/">journaling</a></li>
+  </ol>
+
+  <h3>Walkthrough 2 · The journal sync (≤ 100 ms later)</h3>
+  <ol>
+    <li>A background thread, the <strong>JournalFlusher</strong>, wakes up every <code>commitIntervalMs</code> (default 100).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/control/journal_flusher.h#L50-L58">journal_flusher.h</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/storage_options.h#L89-L93">storage_options.h</a></li>
+    <li>It asks WiredTiger to write the log buffer to the journal file and <strong>fsync</strong> it. Now R survives a crash, even though P is still only in memory.</li>
+    <li>With <code>j: true</code>, the server doesn't wait for the timer. It requests a flush right away and acknowledges only after the sync.<a class="cite" href="https://www.mongodb.com/docs/manual/core/journaling/">journaling</a></li>
+  </ol>
+
+  <h3>Walkthrough 3 · Eviction may write P (or not)</h3>
+  <ol>
+    <li>If P gets evicted, it's reconciled and written to a new block (lesson 3). But that block isn't part of any checkpoint yet. If the server crashed now, recovery would ignore it and rebuild R from the journal.</li>
+  </ol>
+
+  <h3>Walkthrough 4 · The checkpoint (≤ 60 s later)</h3>
+  <ol>
+    <li>The checkpoint writes every dirty page, including P, plus the parents up to a new root (section 4).</li>
+    <li>When it finishes, R is in the data files. The journal records before this checkpoint aren't needed any more, and old journal files are deleted.<a class="cite" href="https://source.wiredtiger.com/develop/arch-logging.html">WT logging</a></li>
+  </ol>
+
+  <h3>Walkthrough 5 · A crash between the two</h3>
+  <ol>
+    <li>Restart opens the data files <em>as of the last checkpoint</em> (C1). R isn't there.</li>
+    <li>WiredTiger replays the journal from C1 to the end. R's record is in it, so R comes back.<a class="cite" href="https://www.mongodb.com/docs/manual/core/journaling/">journaling</a> Section 6 shows this in a real log.</li>
+  </ol>
+
+  <h2>3 · The journal up close</h2>
+  <ul>
+    <li><strong>Log records.</strong> "The unit written to the write-ahead log is a log record." Each record has a 16-byte header and is padded to a multiple of 128 bytes.<a class="cite" href="https://source.wiredtiger.com/develop/arch-logging.html">WT logging</a> A record's position is its <strong>LSN</strong> (log sequence number): a file number plus a byte offset, like <code>2/34762624</code>. You'll see LSNs in the recovery log.</li>
+    <li><strong>Files.</strong> The journal is <code>&lt;dbPath&gt;/journal/WiredTigerLog.&lt;sequence&gt;</code>, ~100 MB each.<a class="cite" href="https://www.mongodb.com/docs/manual/core/journaling/">journaling</a> WiredTiger creates the next file ahead of time (<code>WiredTigerPreplog.*</code> in the lab), so a full file doesn't stall writers.<a class="cite" href="https://source.wiredtiger.com/develop/arch-logging.html">WT logging</a></li>
+    <li><strong>Compression.</strong> Snappy by default (<code>journalCompressor</code>). Records of 128 bytes or less aren't compressed.<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a></li>
+    <li><strong>Always on.</strong> Since 6.1 you can't turn the journal off.<a class="cite" href="https://www.mongodb.com/docs/manual/core/journaling/">journaling</a></li>
+  </ul>
+
+  <h3>Group commit: why j:true isn't as bad as it sounds</h3>
+  <p>An fsync waits for the disk. If 100 clients each needed their own fsync, they'd queue. Two layers prevent that:</p>
+  <ol>
+    <li><strong>WiredTiger slots.</strong> "WiredTiger has a pool of log buffers called slots." Concurrent commits join the same slot without locks, so one write to the file carries many records.<a class="cite" href="https://source.wiredtiger.com/develop/arch-logging.html">WT logging</a></li>
+    <li><strong>MongoDB's flusher.</strong> "Asynchronously grouping data flush requests reduces the total number of flushes executed."<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/control/journal_flusher.h#L50-L58">journal_flusher.h</a> A <code>j: true</code> waiter that arrives while a sync is running just waits for the next one. In the code: "Someone else synced already since we read lastSyncTime, so we're done!"<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/wiredtiger/wiredtiger_session_cache.cpp#L317-L347">session_cache.cpp</a></li>
+  </ol>
+  <p>The same idea works inside one client: an <code>insertMany</code> of 2,000 reviews with <code>j: true</code> costs one sync, not 2,000.</p>
+
+  <h3>What I measured</h3>
+  <p><code>mongo:8.0</code> (8.0.34) in Docker on a laptop SSD, 200,000 seeded reviews, 2,000 <code>insertOne</code>s per run from <code>mongosh</code> inside the container (lab step 3):</p>
+  <table>
+    <tr><th>Write concern</th><th>p50</th><th>p99</th><th>Journal syncs during the run</th></tr>
+    <tr><td><code>{w: 1}</code> (j false), standalone</td><td>0.16–0.18 ms</td><td>0.24–0.59 ms</td><td>3–4 (the 100 ms timer)</td></tr>
+    <tr><td><code>{w: 1, j: true}</code>, standalone</td><td>0.25–0.27 ms</td><td>0.80–0.92 ms</td><td>2,001–2,002 (one per insert)</td></tr>
+    <tr><td><code>{w: 1, j: true}</code>, one-node replica set</td><td>0.36 ms</td><td>2.03 ms</td><td>2,000</td></tr>
+    <tr><td><code>insertMany</code> of 2,000, <code>j: true</code></td><td colspan="2">16 ms for the whole batch</td><td><strong>1</strong></td></tr>
+  </table>
+  <p>The average sync took about <strong>0.14 ms</strong> (<code>log sync time duration</code> ÷ <code>log sync operations</code>). That's very fast: Docker's VM disk on a laptop SSD. On a real server, especially with network-attached cloud disks, each sync can cost much more, and <code>j: true</code> latency is roughly your fsync time. Measure yours with the same two stats (section 7).</p>
+
+  <h2>4 · Checkpoints up close</h2>
+  <p>"A checkpoint is a known point in time from which WiredTiger can recover in the event of a crash or unexpected shutdown."<a class="cite" href="https://source.wiredtiger.com/develop/arch-checkpoint.html">WT checkpoint</a> Here is what one does, in order:</p>
+  <ol>
+    <li><strong>Eviction first.</strong> Before it starts, "the eviction subsystem is leveraged to reduce the dirty content in the cache", so there's less left for the checkpoint itself.<a class="cite" href="https://source.wiredtiger.com/develop/arch-checkpoint.html">WT checkpoint</a></li>
+    <li><strong>Take a snapshot.</strong> "A checkpoint is performed within the context of a snapshot isolation transaction", so "the checkpoint has a consistent view of the database from beginning to end." Writes keep going meanwhile. They're just not part of this checkpoint. (Snapshots are lesson 4.)</li>
+    <li><strong>Walk every B-tree.</strong> "All the dirty pages are reconciled." "Clean pages are skipped."<a class="cite" href="https://source.wiredtiger.com/develop/arch-checkpoint.html">WT checkpoint</a> Each written page goes to a new block, so its parent changes, up to a new root per tree. The history store (<code>WiredTigerHS.wt</code>, lesson 4) is checkpointed too.</li>
+    <li><strong>Metadata last.</strong> Each tree's new root address goes into its entry in <code>WiredTiger.wt</code>, the metadata table. "The metadata file is the last file to be checkpointed." Then the turtle file is updated to point at that new metadata checkpoint.<a class="cite" href="https://source.wiredtiger.com/develop/arch-metadata.html">WT metadata</a><a class="cite" href="https://source.wiredtiger.com/develop/arch-checkpoint.html">WT checkpoint</a></li>
+  </ol>
+
+  <figure>
+    <svg viewBox="0 0 680 260" role="img" aria-label="Two checkpoints share blocks. Checkpoint C1 has root at A, internal at B and leaves C, D, K. After review R changes leaf D, checkpoint C2 writes new leaf G, new internal E and new root F, and reuses leaves C and K. The metadata file points at F once C2 is complete.">
+      <defs><marker id="ah5b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+      <rect class="box" x="90" y="20" width="130" height="30" rx="4"/><text class="lbl" x="100" y="40">C1 root @A</text>
+      <rect class="box-accent" x="420" y="20" width="130" height="30" rx="4"/><text class="lbl" x="430" y="40">C2 root @F</text>
+      <rect class="box" x="90" y="85" width="130" height="30" rx="4"/><text class="lbl" x="100" y="105">internal @B</text>
+      <rect class="box-accent" x="420" y="85" width="130" height="30" rx="4"/><text class="lbl" x="430" y="105">internal @E</text>
+      <rect class="box" x="20" y="160" width="110" height="30" rx="4"/><text class="lbl" x="30" y="180">leaf @C</text>
+      <rect class="box" x="170" y="160" width="110" height="30" rx="4"/><text class="lbl" x="180" y="180">leaf @D</text>
+      <rect class="box-accent" x="330" y="160" width="140" height="30" rx="4"/><text class="lbl" x="340" y="180">leaf @G (+R)</text>
+      <rect class="box" x="530" y="160" width="110" height="30" rx="4"/><text class="lbl" x="540" y="180">leaf @K</text>
+      <path class="edge" d="M155 50 V85"/>
+      <path class="edge" d="M130 115 L75 160 M155 115 L225 160 M190 115 L560 160"/>
+      <path class="edge-accent" d="M485 50 V85"/>
+      <path class="edge-accent" d="M450 115 L110 160 M485 115 L400 160 M520 115 L585 160"/>
+      <text class="lbl-sm" x="20" y="222">C1 still uses @A, @B, @D. C2 wrote only @G, @E, @F and shares @C and @K.</text>
+      <text class="lbl-sm" x="20" y="240">C2 becomes live when WiredTiger.wt (written last) says "reviews → @F" and the turtle file</text>
+      <text class="lbl-sm" x="20" y="256">points at that metadata. Until then, a crash simply recovers from C1.</text>
+    </svg>
+    <figcaption>A checkpoint is a consistent root. The new root is built next to the old one, then a pointer switches. That's lesson 2.1's no-overwrite rule paying off.</figcaption>
+  </figure>
+
+  <p>The manual says it plainly: "During the write of a new checkpoint, the previous checkpoint is still valid." The new one "becomes accessible and permanent when WiredTiger's metadata table is atomically updated to reference the new checkpoint."<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a> After that, blocks only the old checkpoint used (here @A, @B, @D) are freed for reuse.</p>
+
+  <h3>Who starts it, and when</h3>
+  <p>A MongoDB thread, the <strong>Checkpointer</strong>, sleeps <code>syncdelay</code> seconds (default 60, config name <code>storage.syncPeriodSecs</code>), then asks WiredTiger for a checkpoint.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/checkpointer.cpp#L102-L139">checkpointer.cpp</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/storage_options.h#L105-L113">storage_options.h</a> The wait starts after the previous one finishes, so a checkpoint that takes 40 s is followed by the next one 60 s later, not 20.</p>
+
+  <h3>What I measured</h3>
+  <p>In the lab, the first checkpoint came at ~60 s of uptime. Every checkpoint took <strong>12–14 ms</strong> (<code>most recent time (msecs)</code>). I then tagged all ~214,000 reviews with <code>$addToSet: {tags: "moderated"}</code>: dirty data jumped to 9.1%, but eviction workers brought it down to ~3% within a second (lesson 3's 5% dirty target). The next checkpoint still took 12 ms, and a steady stream of ~6,000 inserts/s showed no latency change around it (p99 0.2–0.5 ms most seconds; the few outliers didn't line up with the checkpoint). On a small cache and a fast SSD, there's little to write. Section 7 explains when that changes.</p>
+
+  <h2>5 · The stable timestamp (and the twist)</h2>
+  <p>Everything above is a standalone server. A replica set adds one rule. Keep this light for now: lesson 6 does replication properly.</p>
+  <ul>
+    <li>In lesson 4 you saw that each update in an update chain carries a <strong>timestamp</strong>. The replication layer tells WiredTiger a <strong>stable timestamp</strong>: roughly, the newest point that a majority of members have, so it can never be rolled back.<a class="cite" href="https://github.com/mongodb/mongo/blob/master/src/mongo/db/repl/README.md">repl README</a> "The stable timestamp defines the point that divides the stable part of the time window from the unstable part."<a class="cite" href="https://source.wiredtiger.com/develop/arch-timestamp.html">WT timestamps</a></li>
+    <li>MongoDB takes <strong>stable checkpoints</strong>: WiredTiger sets "the <code>checkpoint_timestamp</code> to be the current <code>stable_timestamp</code>".<a class="cite" href="https://source.wiredtiger.com/develop/arch-checkpoint.html">WT checkpoint</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/wiredtiger/wiredtiger_kv_engine.cpp#L2063-L2128">kv_engine.cpp</a> Updates newer than that stay out of the checkpoint, even if they're committed. <em>Why:</em> a write a majority doesn't have yet might be rolled back after a failover. The data files should never contain something that might have to be undone.</li>
+  </ul>
+
+  <div class="callout">
+    <p><strong>The twist.</strong> In a replica set, <code>store.reviews</code> is created with <code>log=(enabled=false)</code>: its changes are <em>not</em> journaled. Only the <code>local</code> database is, which includes the oplog.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/wiredtiger/wiredtiger_util.cpp#L1015-L1048">wiredtiger_util.cpp</a> Every write to <code>reviews</code> also writes an oplog entry in the same transaction, so the journaled oplog <em>is</em> the write-ahead log for your reviews. "The user writes themselves, however, on a --replSet server, do not need to be written out to disk."<a class="cite" href="https://github.com/mongodb/mongo/blob/master/src/mongo/db/storage/README.md">storage README</a></p>
+  </div>
+
+  <table>
+    <tr><th></th><th>Standalone</th><th>Replica set member</th></tr>
+    <tr><td>Journaled tables</td><td>All</td><td><code>local.*</code> (oplog), not <code>store.reviews</code></td></tr>
+    <tr><td>Checkpoint</td><td>Everything committed</td><td>Up to the stable timestamp</td></tr>
+    <tr><td>After a crash</td><td>Last checkpoint + WiredTiger journal replay</td><td>Stable checkpoint + journal (oplog is back) + <strong>oplog replay</strong> from the stable timestamp</td></tr>
+  </table>
+  <p>I checked the first row in the lab: on a one-node replica set, <code>db.reviews.stats().wiredTiger.creationString</code> contains <code>log=(enabled=false)</code>, and the oplog's contains <code>log=(enabled=true)</code>.</p>
+
+  <h2>6 · Crash recovery</h2>
+  <p>The manual's three steps: find the last checkpoint in the data files, find its position in the journal, and "apply the operations in the journal files since the last checkpoint".<a class="cite" href="https://www.mongodb.com/docs/manual/core/journaling/">journaling</a> WiredTiger finds the last checkpoint through the turtle file: "Using the turtle file, WiredTiger can read the latest checkpoint information."<a class="cite" href="https://source.wiredtiger.com/develop/arch-metadata.html">WT metadata</a> After replay, it runs <strong>rollback to stable</strong>, which removes anything newer than the stable timestamp from non-logged tables, then takes a fresh checkpoint.<a class="cite" href="https://source.wiredtiger.com/develop/arch-rts.html">WT RTS</a></p>
+
+  <p>Here's what the log said in the lab, on a standalone. I inserted 50,000 reviews with <code>{w: 1}</code>, one marker review with <code>j: true</code>, then one more with <code>j: false</code>, and ran <code>docker kill --signal=KILL</code> right away (lab step 5; lines trimmed):</p>
+<pre class="output"><code>Detected unclean shutdown - Lock file is not empty
+Recovering data from the last clean checkpoint.
+Main recovery loop: starting at 2/34762624 to 3/256
+recovery log replay has successfully finished and ran for 404 milliseconds
+Set global recovery timestamp: (0, 0)
+recovery rollback to stable has successfully finished and ran for 0 milliseconds
+recovery checkpoint has successfully finished and ran for 14 milliseconds
+recovery was completed successfully and took 418ms, including 404ms for the log replay, ...</code></pre>
+  <ul>
+    <li><code>2/34762624</code> is the checkpoint's LSN: file <code>WiredTigerLog.0000000002</code>, byte 34,762,624. Replay ran from there to the end of the journal, about 40 MB, in 404 ms.</li>
+    <li>Recovery timestamp <code>(0, 0)</code>: a standalone has no stable timestamp, so its checkpoints aren't timestamped.</li>
+    <li>All 50,002 reviews were there after restart, <em>both</em> markers included. The <code>j: false</code> one survived because the kill came ~180 ms later, after a timer sync. That's luck, not a guarantee.</li>
+  </ul>
+  <p>The same crash on a one-node replica set added the replication part after WiredTiger's own recovery:</p>
+<pre class="output"><code>Set global recovery timestamp: (1793099803, 1)
+recovery was completed successfully and took 176ms, including 156ms for the log replay, ...
+Recovering from stable timestamp  {stableTimestamp: (1793099803, 1), topOfOplog: (1793099821, 815)}
+Replaying stored operations from startPoint (exclusive) to endPoint (inclusive)
+Completed oplog application for recovery  {numOpsApplied: 4517, numBatches: 66}</code></pre>
+  <p>The stable checkpoint was 18 seconds behind the top of the oplog, so the server re-applied 18 s of oplog (4,517 entries) to bring <code>store.reviews</code> up to date. The repl README describes this as "startup recovery".<a class="cite" href="https://github.com/mongodb/mongo/blob/master/src/mongo/db/repl/README.md#startup-recovery">repl README</a></p>
+
+  <h3>On disk</h3>
+  <p>The <code>dbPath</code> of the lab container, ~25 s after start, <em>before</em> the first checkpoint:</p>
+<pre><code>WiredTiger                    text: "WiredTiger 11.3.0" (the engine version)
+WiredTiger.lock               only one process may open this directory
+WiredTiger.turtle             where the metadata's latest checkpoint is
+WiredTiger.wt                 metadata table: one entry per table, with its checkpoint root
+WiredTigerHS.wt               history store (lesson 4)
+_mdb_catalog.wt, sizeStorer.wt   MongoDB's catalog and its count/size cache
+collection-7-….wt   7.0 MB   store.reviews
+index-8-….wt        3.1 MB   its _id index
+journal/WiredTigerLog.0000000001     100 MB (preallocated)
+journal/WiredTigerPreplog.0000000001 100 MB (the next one, ready)
+mongod.lock                   non-empty while running: that's how "unclean shutdown" is detected</code></pre>
+  <p>Look at the collection file: <strong>7 MB</strong>, while <code>db.reviews.stats()</code> said 33 MB of data. Most of the 200,000 reviews existed only in the cache and the journal (10.4 MB of log written). Before the first checkpoint, the turtle file even showed <code>checkpoint=,checkpoint_lsn=</code>: empty.</p>
+
+  <h2>7 · So in production you should…</h2>
+  <div class="callout">
+    <p><strong>Rule: <code>j: true</code> latency is your fsync latency, and checkpoint cost is your dirty data. Watch both, and put the data on a disk that syncs fast.</strong></p>
+  </div>
+
+  <h3>The stats</h3>
+  <p>All in <code>db.serverStatus().wiredTiger</code>. Take two snapshots and use the difference, as in lesson 3. Names checked on 8.0.34.</p>
+  <table>
+    <tr><th>Stat</th><th>What it tells you</th></tr>
+    <tr><td><code>log["log sync time duration (usecs)"]</code> ÷ <code>log["log sync operations"]</code></td><td>Average fsync time. Roughly what each <code>j: true</code> write waits.</td></tr>
+    <tr><td><code>log["log bytes written"]</code></td><td>Journal write volume. With a long checkpoint, this tells you how much replay a crash would cost.</td></tr>
+    <tr><td><code>checkpoint["most recent time (msecs)"]</code>, <code>checkpoint["max time (msecs)"]</code></td><td>How long checkpoints take. Approaching 60 000 means checkpoints run back to back.</td></tr>
+    <tr><td><code>checkpoint["total succeed number of checkpoints"]</code></td><td>Should go up about once a minute. If it stalls, the journal can't be trimmed.</td></tr>
+    <tr><td><code>cache["tracked dirty bytes in the cache"]</code> (lesson 3)</td><td>How much the next checkpoint will have to write.</td></tr>
+  </table>
+
+  <h3>Diagnosis table</h3>
+  <table>
+    <tr><th>Symptom</th><th>Mechanism</th><th>Proof</th></tr>
+    <tr><td>p99 write latency blips about once a minute</td><td>Checkpoint writing a burst of dirty pages, competing for the disk</td><td>Blips line up with <code>total succeed number of checkpoints</code> going up; <code>most recent time</code> is seconds, not ms</td></tr>
+    <tr><td><code>j: true</code> or <code>w: "majority"</code> writes are slow, <code>w: 1</code> is fine</td><td>Slow fsync on the journal disk</td><td>Average log sync time is high</td></tr>
+    <tr><td>Restart after a crash takes minutes</td><td>Long journal (or oplog) replay since an old checkpoint</td><td>Recovery lines in the log: "log replay … ran for", "numOpsApplied"</td></tr>
+    <tr><td>Journal directory keeps growing</td><td>Checkpoints too slow or stuck; old log files can't be removed until a checkpoint completes<a class="cite" href="https://source.wiredtiger.com/develop/arch-logging.html">WT logging</a></td><td>Checkpoint count not increasing, <code>max time</code> huge</td></tr>
+  </table>
+
+  <ol>
+    <li><strong>Know what <code>j: false</code> means.</strong> With <code>{w: 1}</code>, an acknowledged review can disappear on a hard crash, up to ~100 ms of them. If a lost review is unacceptable, use <code>j: true</code>, or in a replica set <code>w: "majority"</code>, which implies <code>j: true</code> by default (<code>writeConcernMajorityJournalDefault</code>).<a class="cite" href="https://www.mongodb.com/docs/manual/core/journaling/">journaling</a> Lesson 6 covers why majority is the real answer.</li>
+    <li><strong>Batch durable writes.</strong> One <code>insertMany</code> of 2,000 reviews with <code>j: true</code> cost one sync in the lab. 2,000 separate <code>insertOne</code>s cost 2,000.</li>
+    <li><strong>Size checkpoints by the dirty cache, not by write rate.</strong> Eviction workers keep dirty data near 5% of the cache (lesson 3). With a 30 GB cache, that's ~1.5 GB a checkpoint may have to write in one burst. A disk that writes 100 MB/s needs 15 s for it, and your reads and journal syncs share that disk the whole time. The lab's 12 ms checkpoints wrote a few MB to an SSD.</li>
+    <li><strong>Leave <code>syncPeriodSecs</code> and <code>commitIntervalMs</code> alone.</strong> The source comment on <code>syncdelay</code>: "In almost every situation you should not set this value and use the default setting."<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/storage_parameters.idl#L36-L46">storage_parameters.idl</a> Fix the disk instead.</li>
+    <li><strong>Keep free disk space for the journal.</strong> Files are preallocated in 100 MB steps, and "If you do not set aside enough disk space for your journal files, the MongoDB server will crash."<a class="cite" href="https://www.mongodb.com/docs/manual/core/journaling/">journaling</a></li>
+  </ol>
+
+  <div class="lab">
+    <p>About 15 minutes. These are the steps I ran. Your latencies will differ, especially on Linux with a real disk. The helper file is <a href="code/0005-durability-lab.js"><code>lessons/code/0005-durability-lab.js</code></a>.</p>
+    <ol>
+      <li>Start a standalone server, seed it, and copy in the helpers:
+<pre class="terminal"><code>docker run -d --name mongo-lab5 -m 2g mongo:8.0
+docker cp lessons/code/seed-reviews.js mongo-lab5:/seed-reviews.js
+docker cp lessons/code/0005-durability-lab.js mongo-lab5:/lab5.js
+docker exec mongo-lab5 mongosh store --eval 'const N = 200000' --file /seed-reviews.js</code></pre></li>
+      <li><strong>Quickly</strong>, within a minute of starting, before the first checkpoint: look at the files. <strong>Predict:</strong> is the collection file as big as the data?
+<pre class="terminal"><code>docker exec mongo-lab5 sh -c 'ls -la /data/db /data/db/journal; cat /data/db/WiredTiger.turtle'</code></pre>
+      Compare the size of the big <code>collection-*.wt</code> with <code>db.reviews.stats().size</code>. Mine: 7.0 MB vs 33 MB. Run the <code>ls</code> again two minutes later and watch the file grow as checkpoints write the pages.</li>
+      <li>Compare write concerns. <strong>Predict</strong> the number of journal syncs for each run first.
+<pre class="terminal"><code>docker exec -it mongo-lab5 mongosh store</code></pre>
+<pre><code>load("/lab5.js")
+timeInserts(2000, { w: 1, j: false })
+timeInserts(2000, { w: 1, j: true })
+timeBatch(2000)</code></pre>
+<pre class="output"><code>{ wc: '{"w":1,"j":false}', n: 2000, avgMs: 0.17, p50: 0.16, p99: 0.24, max: 2.5, logSyncs: 3 }
+{ wc: '{"w":1,"j":true}', n: 2000, avgMs: 0.29, p50: 0.25, p99: 0.92, max: 3.1, logSyncs: 2002 }
+{ n: 2000, totalMs: 16, logSyncs: 1 }</code></pre></li>
+      <li>Watch a checkpoint happen. Run <code>durability()</code>, wait a bit over a minute, run it again:
+<pre class="output"><code>{ logSyncs: 6071, logSyncMs: 836, logMB: 13.4, checkpoints: 1, lastCheckpointMs: 14, maxCheckpointMs: 14, dirtyPct: 1.3 }</code></pre>
+      <code>checkpoints</code> should go up by one per minute. Divide <code>logSyncMs</code> by <code>logSyncs</code> for your average fsync (mine: ~0.14 ms).</li>
+      <li>Crash it. Insert a batch, a <code>j: true</code> marker, then kill <code>mongod</code> with no chance to clean up:
+<pre><code>db.reviews.insertMany(Array.from({ length: 50000 }, newReview), { writeConcern: { w: 1 } })
+db.reviews.insertOne({ _id: "marker-j-true", review: "crash test", rating: 5, tags: ["battery"], verified: true },
+                     { writeConcern: { w: 1, j: true } })
+db.reviews.countDocuments()</code></pre>
+<pre class="terminal"><code>docker kill --signal=KILL mongo-lab5 &amp;&amp; docker start mongo-lab5
+docker logs mongo-lab5 2&gt;&amp;1 | grep -E 'unclean|clean checkpoint|WTRECOV' | grep -o '"msg":"[^"]*"' | grep -v 'WiredTiger message'</code></pre>
+      You should see the lines from section 6. Then check <code>countDocuments()</code> and the marker. Which LSN did replay start from? How long did it take?</li>
+      <li>Optional, the replica set twist: <code>docker rm -f mongo-lab5</code>, start again with <code>mongo:8.0 --replSet rs0</code>, run <code>rs.initiate()</code> in mongosh, seed, and compare:
+<pre><code>db.reviews.stats().wiredTiger.creationString.match(/log=\([^)]*\)/)[0]                       // 'log=(enabled=false)'
+db.getSiblingDB("local").oplog.rs.stats().wiredTiger.creationString.match(/log=\([^)]*\)/)[0] // 'log=(enabled=true)'</code></pre>
+      Repeat step 5 and look for <code>Recovering from stable timestamp</code> and <code>Completed oplog application for recovery</code> in <code>docker logs</code>.</li>
+      <li>Clean up: <code>docker rm -f mongo-lab5</code></li>
+    </ol>
+  </div>
+
+  <h2>8 · Check yourself</h2>
+  <p>From memory. The first two questions come from earlier lessons on purpose.</p>
+  <div id="quiz"></div>
+
+  <h2>Where this fits</h2>
+  <ol>
+    <li><s>Organise: collections and indexes are B-tree tables</s> ✓</li>
+    <li><s>Cache: how pages move between disk and memory</s> ✓</li>
+    <li><s>Concurrency: snapshots, update chains, write conflicts</s> ✓</li>
+    <li><s>Durability: journal and checkpoints</s> ✓ (today)</li>
+    <li><strong>MongoDB on top:</strong> one write traced end to end, including where write concern waits</li>
+  </ol>
+
+  <div class="callout source">
+    <p><a href="https://source.wiredtiger.com/develop/arch-checkpoint.html">WiredTiger Architecture Guide: Checkpoint</a>, then <a href="https://source.wiredtiger.com/develop/arch-logging.html">Logging</a>. Both are short. In Checkpoint, find the sentence about which file is checkpointed last, and why. For the MongoDB side, read <a href="https://www.mongodb.com/docs/manual/core/journaling/">Journaling</a> in the manual (9.0): it lists every event that triggers a journal sync.</p>
+  </div>
+
+  <div class="callout ask">
+    <p>What does your production app use as its default write concern? Paste me <code>db.serverStatus().wiredTiger.log</code> and <code>.checkpoint</code> from a real server (two snapshots a minute apart) and we'll work out your fsync time and checkpoint cost together. Ask me anything that's unclear.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="0004-concurrency.html">← Lesson 4: Concurrency</a>
+    <a href="../reference/architecture-map.html">Reference: architecture map</a>
+    <a href="0006-one-write.html">Lesson 6: One write, end to end →</a>
+  </nav>
+</main>
+
+<script src="../../assets/quiz.js"></script>
+<script>
+const LOG = 'https://source.wiredtiger.com/develop/arch-logging.html';
+const CKPT = 'https://source.wiredtiger.com/develop/arch-checkpoint.html';
+const META = 'https://source.wiredtiger.com/develop/arch-metadata.html';
+const JOURNAL = 'https://www.mongodb.com/docs/manual/core/journaling/';
+const BLOCK = 'https://source.wiredtiger.com/develop/arch-block.html';
+const BTREE = 'https://source.wiredtiger.com/develop/arch-btree.html';
+const EVICT = 'https://source.wiredtiger.com/develop/arch-eviction.html';
+const FLUSHER = 'https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/control/journal_flusher.h#L50-L58';
+const TABLELOG = 'https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/wiredtiger/wiredtiger_util.cpp#L1015-L1048';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0005-durability',
+  questions: [
+    { layer: 'review',
+      q: '<em>From lesson 2.1:</em> a full leaf page of <code>store.reviews</code> splits. The leaf is not the root. What happens to the tree\'s height?',
+      options: ['It grows by one', 'It stays the same', 'It shrinks by one', 'It doubles right away'], answer: 1,
+      explain: `The leaf splits in two and the median key moves up into the parent. The height only grows when the <em>root</em> splits and a new root is created above it.${c(BTREE, 'WT B-trees')}` },
+
+    { layer: 'review',
+      q: '<em>From lesson 3:</em> during a backfill, dirty data in the cache reaches 20%. What happens?',
+      options: ['The journal stops syncing', 'A checkpoint gets skipped', 'Reads bypass the cache', 'Application threads must evict'], answer: 3,
+      explain: `That's <code>eviction_dirty_trigger</code>. Past it, application threads are forced to do eviction work before they can read or write, so your requests pay for it.${c(EVICT, 'WT eviction')}` },
+
+    { layer: 'durability',
+      q: 'Why doesn\'t WiredTiger write the changed leaf page to its <code>.wt</code> file at every commit?',
+      options: ['Whole pages and parents get rewritten', 'The disk refuses small random writes', 'Commits only happen during each checkpoint', 'Leaf pages live in the journal'], answer: 0,
+      explain: `A 165-byte review would cost a whole page write, and because blocks are never overwritten, the parent's address changes too, up to the root. A small sequential log record is far cheaper. Checkpoints write the pages in bulk later.${c(BLOCK, 'WT block manager')}` },
+
+    { layer: 'durability',
+      q: 'A standalone acknowledges your <code>insertOne</code> with <code>{w: 1}</code> (no <code>j</code>). <code>mongod</code> is killed 30 ms later. Is the review guaranteed to be there after restart?',
+      options: ['Yes, the checkpoint wrote it', 'Yes, eviction always writes first', 'No, it may be unsynced', 'No, w:1 skips the journal'], answer: 2,
+      explain: `The log record is in the journal <em>buffer</em>, but the timer sync (every 100 ms) may not have run yet. "Updates can be lost following a hard shutdown." With <code>j: true</code> the ack waits for the sync.${c(JOURNAL, 'journaling')}` },
+
+    { layer: 'durability',
+      q: '100 clients insert reviews at the same time, all with <code>j: true</code>. <code>log sync operations</code> rises much less than one per insert. Why?',
+      options: ['j:true is ignored under load', 'Waiting writers share one sync', 'Inserts skip the journal entirely', 'Checkpoints replace the journal syncs'], answer: 1,
+      explain: `Group commit: concurrent records join the same WiredTiger log slot, and MongoDB's JournalFlusher groups flush requests, so one fsync covers everyone waiting.${c(FLUSHER, 'journal_flusher.h')}${c(LOG, 'WT logging')}` },
+
+    { layer: 'durability',
+      q: 'During a checkpoint, which file is written <strong>last</strong>, making the new checkpoint live?',
+      options: ['Each collection .wt file', 'The newest journal file', 'The history store file', 'The metadata, then turtle'], answer: 3,
+      explain: `Each tree's new root goes into <code>WiredTiger.wt</code>, and "the metadata table is the last file to be checkpointed". The turtle file then points at the new metadata checkpoint. Until that switch, a crash recovers from the previous checkpoint.${c(META, 'WT metadata')}${c(CKPT, 'WT checkpoint')}` },
+
+    { layer: 'durability',
+      q: 'In a replica set, <code>store.reviews</code> has <code>log=(enabled=false)</code>. After a crash, how do the latest reviews come back?',
+      options: ['Stable checkpoint, then oplog replay', 'Journal replay of reviews table', 'Secondaries resend every lost page', 'They are lost until resync'], answer: 0,
+      explain: `Only <code>local</code> (with the oplog) is journaled. Recovery opens the stable checkpoint, the journal restores the oplog, and the server re-applies oplog entries from the stable timestamp. In the lab: 4,517 entries.${c(TABLELOG, 'wiredtiger_util.cpp')}` },
+
+    { layer: 'durability',
+      q: 'Writes with <code>j: true</code> got slow, but <code>w: 1</code> writes are fine. Which stat (with its pair) shows the cause?',
+      options: ['pages read into cache', 'bytes currently in the cache', 'log sync time duration (usecs)', 'log records too small to compress'], answer: 2,
+      explain: `Divide the difference in <code>log sync time duration (usecs)</code> by the difference in <code>log sync operations</code>: that's your average fsync time, which every <code>j: true</code> write waits for.${c(LOG, 'WT logging')}` },
+
+    { layer: 'durability',
+      q: 'Why does MongoDB checkpoint a replica set member only up to the stable timestamp?',
+      options: ['So the journal can be skipped', 'So it never saves rollback-able writes', 'So eviction never writes dirty pages', 'So reads never see stale data'], answer: 1,
+      explain: `Writes newer than the stable timestamp aren't on a majority yet, so a failover could roll them back. The data files only hold what can never be undone. Newer writes are recovered from the oplog.${c(CKPT, 'WT checkpoint')}` }
+  ]
+});
+</script>
+</body>
+</html>

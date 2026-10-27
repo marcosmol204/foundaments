@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 6 · One Write, End to End</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<link rel="stylesheet" href="../../assets/quiz.css">
+<style>
+  /* Lesson-local: annotated byte map of one OP_MSG */
+  table.bytes td:first-child { font: .78rem 'JetBrains Mono', monospace; color: var(--muted); white-space: nowrap; }
+  table.bytes td:nth-child(2) { font: .78rem 'JetBrains Mono', monospace; white-space: nowrap; }
+  table.bytes tr.hdr td:nth-child(2) { color: var(--tier-1); }
+  table.bytes tr.msg td:nth-child(2) { color: var(--warn); }
+  table.bytes tr.doc td:nth-child(2) { color: var(--accent); }
+  table.bytes tr.drv td:nth-child(2) { color: var(--tier-3); }
+  .hop { display: inline-block; min-width: 1.5em; text-align: center; font: 600 .78rem/1.5 'JetBrains Mono', monospace; color: var(--accent); border: 1px solid var(--accent); border-radius: 50%; margin-right: .3rem; }
+  .table-scroll { overflow-x: auto; }
+</style>
+</head>
+<body>
+<main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>
+  <div class="kicker">MongoDB Internals · Lesson 0006 · Phase 1: The engine (wrap-up)</div>
+  <h1>One write, end to end</h1>
+  <p class="subtitle">You know the engine's parts now: B-trees, the cache, snapshots, the journal. This lesson follows one <code>insertOne</code> through all of them, and through the layers above them, until the reply comes back.</p>
+
+  <p><strong>Your win today:</strong> trace one <code>db.reviews.insertOne(…, {w: "majority"})</code> through nine hops from memory, and, given its slow-query log line, say which hop the time went to. This is the "trace one write end to end" goal from your <a href="../MISSION.md">mission</a>.</p>
+
+  <h2>0 · Warm-up from lessons 2 to 5</h2>
+  <p>From memory, before reading on. <code>store.reviews</code> has three indexes: <code>_id</code>, <code>{verified: 1, rating: 1}</code> and <code>{tags: 1}</code>. You insert one review with three different tags.</p>
+  <ol>
+    <li>How many WiredTiger tables does the insert touch, and how many keys does it add to the indexes? (lesson 2)</li>
+    <li>When the insert returns with <code>w: 1</code>, is the review in the <code>.wt</code> file yet? Is it in the journal? (lessons 3 and 5)</li>
+  </ol>
+  <p>Keep your answers. Section 2 counts them, and the lab shows the server's own count.</p>
+
+  <h2>1 · The nine hops</h2>
+  <p>Here is the whole trip. The <a href="../reference/architecture-map.html">architecture map</a> shows the same layers as a stack. This lesson walks them in the order one write crosses them.</p>
+  <ol>
+    <li><span class="hop">1</span><strong>Driver:</strong> build the command as BSON, pick the primary, borrow a connection.</li>
+    <li><span class="hop">2</span><strong>Wire:</strong> send it as one OP_MSG message.</li>
+    <li><span class="hop">3</span><strong>Transport:</strong> the connection's <code>SessionWorkflow</code> turns bytes into a request.</li>
+    <li><span class="hop">4</span><strong>Command dispatch:</strong> find the <code>insert</code> command and run it.</li>
+    <li><span class="hop">5</span><strong>One storage transaction:</strong> collection record + index keys + oplog entry, committed together.</li>
+    <li><span class="hop">6</span><strong>WiredTiger:</strong> snapshot, dirty pages in cache, a journal record.</li>
+    <li><span class="hop">7</span><strong>Secondaries pull</strong> the oplog entry, apply it, and report back.</li>
+    <li><span class="hop">8</span><strong>Majority commit point</strong> moves past the write; the waiting thread wakes up.</li>
+    <li><span class="hop">9</span><strong>Reply:</strong> one OP_MSG back to the driver.</li>
+  </ol>
+  <p>Hops 1–6 happen on the primary in well under a millisecond. Hops 7–8 are what <code>w: "majority"</code> adds. Everything below was measured on <code>mongo:8.0</code> (8.0.34), a 3-node replica set in Docker on one laptop, with 100,000 seeded reviews.</p>
+
+  <h2>2 · The walkthrough</h2>
+  <p>The review we send (the same one you'll insert in the lab):</p>
+<pre><code>db.reviews.insertOne(
+  { review: "After two weeks battery lasts for days.", rating: 5,
+    tags: ["battery", "quality", "durability"], verified: true },
+  { writeConcern: { w: "majority" } })</code></pre>
+
+  <h3><span class="hop">1</span>Driver: BSON, a primary, a connection</h3>
+  <ol>
+    <li><strong>The driver makes the <code>_id</code>.</strong> Your document has none, so the driver creates an ObjectId: 4 bytes of time, 5 random bytes, a 3-byte counter.<a class="cite" href="https://www.mongodb.com/docs/manual/reference/bson-types/">BSON types</a> In my capture it began <code>6a e0 87 d4</code>, which is the second the insert ran.</li>
+    <li><strong>It wraps the review in an <code>insert</code> command</strong> and adds its own fields: <code>lsid</code> and <code>txnNumber</code> (this makes it a <em>retryable write</em>), <code>$clusterTime</code>, and <code>$db: "store"</code>.<a class="cite" href="https://specifications.readthedocs.io/en/latest/retryable-writes/retryable-writes/">retryable writes spec</a></li>
+    <li><strong>Server selection.</strong> The driver keeps a picture of the replica set from its monitoring. Writes can only go to the primary, so it picks <code>m1</code>.<a class="cite" href="https://specifications.readthedocs.io/en/latest/server-selection/server-selection/">server selection spec</a></li>
+    <li><strong>Connection pool.</strong> It checks out an idle connection to <code>m1</code> from that server's pool, or opens one if none is free.<a class="cite" href="https://specifications.readthedocs.io/en/latest/connection-monitoring-and-pooling/connection-monitoring-and-pooling/">CMAP spec</a> A full pool means your request waits here, before MongoDB sees anything.</li>
+  </ol>
+
+  <h3 id="bytes"><span class="hop">2</span>Wire: the actual bytes</h3>
+  <p>I captured this insert with <code>tcpdump</code> inside the primary's container and decoded it (lab step 6 shows how). It is <strong>483 bytes</strong>. Every number is little-endian.<a class="cite" href="https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/">wire protocol</a></p>
+  <div class="table-scroll">
+  <table class="bytes">
+    <tr><th>Offset</th><th>Bytes</th><th>Meaning</th></tr>
+    <tr class="hdr"><td>0–3</td><td>e3 01 00 00</td><td><code>messageLength</code> = 483. The receiver reads exactly this many bytes.</td></tr>
+    <tr class="hdr"><td>4–7</td><td>0b 00 00 00</td><td><code>requestID</code> = 11, chosen by the driver</td></tr>
+    <tr class="hdr"><td>8–11</td><td>00 00 00 00</td><td><code>responseTo</code> = 0: this is a request</td></tr>
+    <tr class="hdr"><td>12–15</td><td>dd 07 00 00</td><td><code>opCode</code> = 2013, <strong>OP_MSG</strong></td></tr>
+    <tr class="msg"><td>16–19</td><td>00 00 00 00</td><td><code>flagBits</code>: none. No <code>checksumPresent</code>, so no CRC-32C at the end. No <code>moreToCome</code>, so a reply is expected.</td></tr>
+    <tr class="msg"><td>20</td><td>00</td><td>Section kind 0: the command <em>body</em>, one BSON document</td></tr>
+    <tr class="msg"><td>21–24</td><td>ce 01 00 00</td><td>BSON document length = 462</td></tr>
+    <tr class="doc"><td>25–44</td><td>02 69 6e 73 65 72 74 00 …</td><td><code>insert: "reviews"</code>. The first field names the command.</td></tr>
+    <tr class="doc"><td>45–219</td><td>04 64 6f 63 75 6d 65 6e …</td><td><code>documents: [ … ]</code>. Our review is <strong>156 bytes</strong> of BSON. The driver appended <code>_id</code> as its <em>last</em> field (offset 201).</td></tr>
+    <tr class="doc"><td>220–264</td><td>08 6f 72 64 65 72 65 64 …</td><td><code>ordered: true</code>, <code>writeConcern: {w: "majority"}</code></td></tr>
+    <tr class="drv"><td>265–319</td><td>03 6c 73 69 64 00 …</td><td><code>lsid</code> (session id) and <code>txnNumber: 1</code>, added by the driver</td></tr>
+    <tr class="drv"><td>320–466</td><td>03 24 63 6c 75 73 74 65 …</td><td><code>$clusterTime</code>, and <code>$readPreference</code> (mongosh sends one even for a write)</td></tr>
+    <tr class="doc"><td>467–482</td><td>02 24 64 62 00 … 00 00</td><td><code>$db: "store"</code>, then the document's closing <code>00</code></td></tr>
+  </table>
+  </div>
+  <p>Three things to notice:</p>
+  <ul>
+    <li><strong>One section, not two.</strong> OP_MSG also allows a kind 1 section, a <em>document sequence</em>, so big batches don't have to be nested inside the body.<a class="cite" href="https://specifications.readthedocs.io/en/latest/message/OP_MSG/">OP_MSG spec</a> mongosh 2.13 put the review inside the body instead. 16 + 4 + 1 + 462 = 483, so there is nothing else.</li>
+    <li><strong>The review is less than a third of the message.</strong> 156 of 483 bytes. The rest is the command, the write concern, and driver bookkeeping. That fixed cost per message is one reason <code>insertMany</code> beats a loop of <code>insertOne</code>.</li>
+    <li><strong>The checksum is optional.</strong> When a peer sets <code>checksumPresent</code>, mongod checks a CRC-32C, and it computes it with WiredTiger's CRC function.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/rpc/op_msg.cpp#L99">op_msg.cpp</a></li>
+  </ul>
+
+  <h3><span class="hop">3</span>Transport: Session → ServiceEntryPoint → SessionWorkflow</h3>
+  <p>When mongod accepted this connection, it created a <code>Session</code> object for it. The <code>ServiceEntryPoint</code> gave the session a <code>SessionWorkflow</code>. The workflow reads one message, turns it into a <code>WorkItem</code>, and passes it to <code>ServiceEntryPoint::handleRequest</code>. "A <code>SessionWorkflow</code> can only have one <code>WorkItem</code> in progress at a time."<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/README.md">transport README</a> Each connection gets "a new dedicated thread".<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/docs/command_dispatch.md">command dispatch</a></p>
+  <p><strong>So one connection runs one command at a time.</strong> While our insert waits for the majority (hop 8), that connection is busy. Your driver needs other pooled connections for other requests. That's why <code>w: "majority"</code> under load needs a bigger pool than <code>w: 1</code>.</p>
+
+  <h3><span class="hop">4</span>Command dispatch: find <code>insert</code>, run it, then wait</h3>
+  <p>The first field of the body, <code>insert</code>, names the command. Commands are registered at startup in a global <code>CommandRegistry</code>. The request is parsed into an invocation of that command.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/docs/command_dispatch.md">command dispatch</a> For inserts, that's <code>CmdInsert</code>, which calls <code>write_ops_exec::performInserts</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/commands/write_commands.cpp#L339">write_commands.cpp</a></p>
+  <p>Before writing, the server fixes the document: <code>fixDocumentForInsert</code> moves <code>_id</code> to the <em>front</em>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/ops/insert.cpp#L175">insert.cpp</a> On the wire <code>_id</code> came last. In the stored document and the oplog entry, it's first.</p>
+  <p>The same code path that runs the command then waits for the write concern, in the same thread (<code>RunCommandAndWaitForWriteConcern</code>).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L1327">entry point</a> Hold on to that: hop 8 happens <em>here</em>, after the write has already committed.</p>
+
+  <h3><span class="hop">5</span>One storage transaction, five tables</h3>
+  <p>This is lesson 2 meeting replication. <code>insertDocumentsAtomically</code> opens one <code>WriteUnitOfWork</code> (WUOW) and commits it at the end.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/ops/write_ops_exec.cpp#L393">write_ops_exec.cpp</a> "All writes in the scope of a WUOW are transactional; they are either all committed or all rolled-back."<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/catalog/README.md#writeunitofwork">catalog README</a> Inside it, step by step:<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/catalog/collection_write_path.cpp#L336">collection_write_path.cpp</a></p>
+
+  <figure>
+    <svg viewBox="0 0 680 300" role="img" aria-label="One WriteUnitOfWork writes five WiredTiger tables: one record into the reviews collection table, one key into the _id index, one key into the verified-rating index, three keys into the tags index, and one entry into the oplog. Then it commits once.">
+      <defs><marker id="ah6" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+      <rect class="box-accent" x="20" y="20" width="640" height="232" rx="8" fill="none"/>
+      <text class="lbl-title" x="36" y="44">WriteUnitOfWork = one WiredTiger transaction</text>
+      <rect class="box" x="36" y="60" width="190" height="56" rx="5"/>
+      <text class="lbl" x="48" y="82">① collection table</text>
+      <text class="lbl-sm" x="48" y="102">+1 record: RecordId → BSON</text>
+      <rect class="box" x="246" y="60" width="190" height="56" rx="5"/>
+      <text class="lbl" x="258" y="82">② _id_ index</text>
+      <text class="lbl-sm" x="258" y="102">+1 key: ObjectId('6ae0…')</text>
+      <rect class="box" x="456" y="60" width="190" height="56" rx="5"/>
+      <text class="lbl" x="468" y="82">③ verified_1_rating_1</text>
+      <text class="lbl-sm" x="468" y="102">+1 key: {true, 5}</text>
+      <rect class="box" x="36" y="132" width="400" height="56" rx="5"/>
+      <text class="lbl" x="48" y="154">④ tags_1 (multikey)</text>
+      <text class="lbl-sm" x="48" y="174">+3 keys: "battery", "durability", "quality"</text>
+      <rect class="box-accent" x="456" y="132" width="190" height="56" rx="5"/>
+      <text class="lbl" x="468" y="154">⑤ local.oplog.rs</text>
+      <text class="lbl-sm" x="468" y="174">+1 entry { op: "i", … }</text>
+      <text class="lbl-sm" x="36" y="214">keysInserted = 1 + 1 + 3 = 5 · every table is its own B-tree (lesson 2)</text>
+      <text class="lbl-sm" x="36" y="236">all five become visible together at commit, or none of them do</text>
+      <path class="edge-accent" d="M340 252 L340 276" marker-end="url(#ah6)"/>
+      <text class="lbl" x="352" y="290">commit → journal record (lesson 5)</text>
+    </svg>
+    <figcaption>One insert, five B-trees, one commit. The slow-query log in the lab reports <code>ninserted: 1, keysInserted: 5</code>.</figcaption>
+  </figure>
+
+  <ol>
+    <li><strong>Collection table.</strong> <code>RecordStore::insertRecords</code> adds RecordId → document to the collection's B-tree.</li>
+    <li><strong>Index tables.</strong> <code>indexRecords</code> generates keys for each index and inserts them. A multikey index gets <em>one key per distinct array element</em>, so three tags = three keys. "Collection write operations … perform storage engine writes to both the collection's RecordStore and relevant index's SortedDataInterface in the same storage transaction."<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/catalog/README.md#collection-and-index-writes">catalog README</a></li>
+    <li><strong>Oplog entry.</strong> Then the <code>OpObserver</code> is called (<code>onInserts</code>), and it writes the oplog entry with <code>logOp</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/catalog/collection_write_path.cpp#L428">collection_write_path.cpp</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/oplog.cpp#L525">oplog.cpp</a> The oplog is just another collection, <code>local.oplog.rs</code>, so this is the fifth table, still inside the same WUOW. Because this is a retryable write, the primary also records the session's progress in <code>config.transactions</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README_sessions_and_transactions.md">sessions README</a></li>
+    <li><strong>Commit.</strong> All of it becomes visible at once. There is never a moment when the review exists but its oplog entry doesn't. That's why a secondary can never miss a committed write.</li>
+  </ol>
+  <p>The oplog entry I read back from <code>local.oplog.rs</code>:</p>
+<pre class="output"><code>{ lsid: { id: UUID('871d…'), uid: … }, txnNumber: Long('2'),
+  op: 'i', ns: 'store.reviews',
+  ui: UUID('08ef8368-…'),                         // the collection's UUID
+  o: { _id: ObjectId('6ae0879de0450d3666115619'),
+       review: 'After two weeks battery lasts for days.', rating: 5,
+       tags: [ 'battery', 'quality', 'durability' ], verified: true },
+  o2: { _id: ObjectId('6ae0879de0450d3666115619') },   // the document key
+  stmtId: 0, ts: Timestamp({ t: 1793099677, i: 2 }), t: Long('1'), v: Long('2'),
+  wall: ISODate('2026-10-27T11:14:37.664Z'),
+  prevOpTime: { ts: Timestamp({ t: 0, i: 0 }), t: Long('-1') } }</code></pre>
+  <p><code>op: 'i'</code> is an insert. <code>o</code> is the whole document, <code>_id</code> first. <code>o2</code> is the document key: <code>_id</code>, plus the shard key on a sharded collection.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/op_observer/op_observer_impl.cpp#L647">op_observer_impl.cpp</a> <code>ts</code> + <code>t</code> (term) form the <strong>OpTime</strong>, the write's position in history.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md">repl README</a> <code>lsid</code>, <code>txnNumber</code>, <code>stmtId</code> and <code>prevOpTime</code> are there because it's a retryable write: they let the server answer a retry without inserting twice.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README_sessions_and_transactions.md">sessions README</a></p>
+
+  <h3><span class="hop">6</span>WiredTiger: transaction, cache, journal</h3>
+  <p>You know this part. Briefly, in the order it happens:</p>
+  <ul>
+    <li><strong>Transaction (lesson 4).</strong> The WUOW is a WiredTiger transaction with its own snapshot. Each insert goes into the in-memory update structures of a leaf page. If another writer changed the same key first, WiredTiger reports a write conflict, and MongoDB retries the whole unit. See <a href="0004-concurrency.html">lesson 4</a>.</li>
+    <li><strong>Cache (lesson 3).</strong> At least one leaf page in each of the five trees is now dirty. The slow log reports the bytes this transaction dirtied as <code>txnBytesDirty</code>. If the cache were past the dirty trigger, this thread would evict before writing. See <a href="0003-the-cache.html">lesson 3</a>.</li>
+    <li><strong>Journal (lesson 5).</strong> On commit, the changes go into a journal record in memory. With <code>w: 1</code> and no <code>j</code>, the insert does not wait for that record to reach disk; a background sync does it within 100 ms. With <code>j: true</code>, or with <code>w: "majority"</code>, the write forces a sync (section 3). The <code>.wt</code> files only get the change later, at eviction or the next checkpoint. See <a href="0005-durability.html">lesson 5</a>.</li>
+  </ul>
+  <p>With <code>w: 1</code>, the trip ends here: jump to hop 9. Answer to warm-up question 2: when <code>w: 1</code> returns, the review is in the cache and in the in-memory journal buffer, but maybe not on disk anywhere yet.</p>
+
+  <h3><span class="hop">7</span>–<span class="hop">8</span>Secondaries pull; the commit point moves</h3>
+
+  <figure>
+    <svg viewBox="0 0 680 340" role="img" aria-label="Sequence diagram. The client sends the insert to the primary m1. m1 commits the write, its oplog entry and syncs the journal; a w:1 reply would be sent here. Secondaries m2 and m3 already have a getMore waiting on m1's oplog; m1 returns the new entry to both. Each secondary writes and applies it, then sends replSetUpdatePosition back to m1. Once 2 of 3 members are durable at the write's OpTime, the commit point moves and m1 replies to the client.">
+      <defs><marker id="ah7" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+      <text class="lbl-title" x="38" y="22">client</text><text class="lbl-title" x="218" y="22">m1 (primary)</text>
+      <text class="lbl-title" x="460" y="22">m2</text><text class="lbl-title" x="610" y="22">m3</text>
+      <path class="edge" d="M60 32 L60 330"/><path class="edge" d="M260 32 L260 330"/>
+      <path class="edge" d="M470 32 L470 330"/><path class="edge" d="M620 32 L620 330"/>
+      <path class="edge-accent" d="M60 52 L256 52" marker-end="url(#ah7)"/>
+      <text class="lbl-sm" x="70" y="46">② insert (OP_MSG)</text>
+      <rect class="box-accent" x="190" y="62" width="140" height="44" rx="4"/>
+      <text class="lbl-sm" x="198" y="80">③–⑥ commit WUOW</text><text class="lbl-sm" x="198" y="97">+ journal sync</text>
+      <path class="edge" d="M186 120 L64 120" marker-end="url(#ah7)" stroke-dasharray="4 3"/>
+      <text class="lbl-sm" x="70" y="114">w:1 replies here</text>
+      <text class="lbl-sm" x="340" y="128">getMore was waiting</text>
+      <path class="edge-accent" d="M264 146 L466 146" marker-end="url(#ah7)"/>
+      <path class="edge-accent" d="M264 158 L616 158" marker-end="url(#ah7)"/>
+      <text class="lbl-sm" x="340" y="174">⑦ batch: [entry]</text>
+      <rect class="box" x="410" y="184" width="120" height="40" rx="4"/>
+      <text class="lbl-sm" x="418" y="201">write oplog,</text><text class="lbl-sm" x="418" y="216">apply, journal</text>
+      <rect class="box" x="560" y="184" width="112" height="40" rx="4"/>
+      <text class="lbl-sm" x="566" y="201">write oplog,</text><text class="lbl-sm" x="566" y="216">apply, journal</text>
+      <path class="edge" d="M466 242 L264 242" marker-end="url(#ah7)"/>
+      <text class="lbl-sm" x="280" y="236">replSetUpdatePosition</text>
+      <text class="lbl-sm" x="280" y="258">(lastWritten, lastDurable)</text>
+      <rect class="box-accent" x="190" y="268" width="140" height="36" rx="4"/>
+      <text class="lbl-sm" x="198" y="284">⑧ 2 of 3 durable:</text><text class="lbl-sm" x="198" y="298">commit point moves</text>
+      <path class="edge-accent" d="M186 318 L64 318" marker-end="url(#ah7)"/>
+      <text class="lbl-sm" x="70" y="312">⑨ reply {n: 1}</text>
+    </svg>
+    <figcaption>The <code>w: "majority"</code> path. The primary counts itself, so with 3 members it needs <em>one</em> secondary. m3's report arrives later and changes nothing for this write.</figcaption>
+  </figure>
+
+  <ol>
+    <li><strong>Pull, not push.</strong> "Secondaries drive oplog replication via a pull process." Each secondary's <code>OplogFetcher</code> keeps a tailable <code>find</code>/<code>getMore</code> cursor open on its sync source's oplog, with <code>awaitData</code>, so the getMore waits on the primary until new entries appear.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md">repl README</a> The primary only lets readers see entries with no "holes" behind them, so a secondary can't skip a slower concurrent write.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/catalog/README.md#oplog-visibility">oplog visibility</a></li>
+    <li><strong>Apply.</strong> The secondary writes the batch to its own oplog and applies it: the same five-table insert as hop 5, on its own copy.</li>
+    <li><strong>Report.</strong> The secondary sends <code>replSetUpdatePosition</code> to its sync source with its <code>lastWritten</code> and <code>lastDurable</code> OpTimes.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md">repl README</a></li>
+    <li><strong>Commit point.</strong> The <em>majority commit point</em> is the newest OpTime that a majority of members have. The primary moves it forward when it learns of new progress, then "any threads blocking on a writeConcern are woken up". By default it counts <code>lastDurable</code>, so "the server acknowledges a write operation after a majority has written to the on-disk journal."<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md">repl README</a> Our thread was waiting in <code>waitForWriteConcern</code> → <code>awaitReplication</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/write_concern.cpp#L401">write_concern.cpp</a></li>
+  </ol>
+
+  <h3><span class="hop">9</span>Reply</h3>
+  <p>The reply is another OP_MSG: <strong>230 bytes</strong>, with <code>responseTo = 11</code>, the request's <code>requestID</code>. That's how the driver matches the reply to the request. Its body is <code>{n: 1, electionId, opTime: {ts, t}, ok: 1, $clusterTime, operationTime}</code>. The slow-query log for this insert reported <code>reslen: 230</code>, the same number. The <code>opTime</code> in the reply is the oplog entry's <code>ts</code> and <code>t</code>.</p>
+
+  <h2>3 · What <code>w</code> and <code>j</code> change</h2>
+  <p>The work in hops 1–6 is the same for every write concern. Only the <em>waiting</em> after the commit changes.<a class="cite" href="https://www.mongodb.com/docs/manual/reference/write-concern/">write concern</a> Measured on the lab replica set: 500 inserts per setting, run twice, p50 latency as seen by mongosh, and journal syncs on the primary per 100 inserts (<code>wiredTiger.log["log sync operations"]</code>).</p>
+  <table>
+    <tr><th>Write concern</th><th>Returns after</th><th>p50</th><th>Syncs / 100</th></tr>
+    <tr><td><code>{w: 1}</code></td><td>Primary committed in memory</td><td>0.36–0.51 ms</td><td>0–2</td></tr>
+    <tr><td><code>{w: 1, j: true}</code></td><td>Primary's journal synced to disk</td><td>0.80–0.86 ms</td><td>100</td></tr>
+    <tr><td><code>{w: "majority"}</code> <em>(default)</em></td><td>Majority have it in their on-disk journal</td><td>0.94–1.20 ms</td><td>100</td></tr>
+    <tr><td><code>{w: "majority", j: false}</code></td><td>Same as above: <code>j: false</code> is ignored</td><td>0.92–1.10 ms</td><td>n/a</td></tr>
+  </table>
+  <ul>
+    <li><strong><code>w: "majority"</code> is the default.</strong> The lab's <code>getDefaultRWConcern</code> showed <code>{w: "majority"}</code> with source <code>implicit</code>.<a class="cite" href="https://www.mongodb.com/docs/manual/reference/write-concern/">write concern</a> If your code never sets a write concern, it already pays for hops 7–8.</li>
+    <li><strong>"Majority" already means "journaled".</strong> With <code>writeConcernMajorityJournalDefault: true</code> (the default), majority writes wait for the journal "even if <code>j: false</code> is set". A write concern that "includes or implies <code>j: true</code> causes an immediate journal synchronization."<a class="cite" href="https://www.mongodb.com/docs/manual/reference/write-concern/">write concern</a> That's the 100 syncs per 100 writes.</li>
+    <li><strong>These gaps are tiny here because all three nodes share one laptop.</strong> In production, <code>w: "majority"</code> adds at least one network round trip to the nearest secondary, plus that secondary's journal sync. Across availability zones, that wait can be bigger than all of hops 1–6 together.</li>
+  </ul>
+
+  <h3>When the majority can't answer</h3>
+  <p>In the lab I paused both secondaries with <code>db.fsyncLock()</code> and inserted a review with <code>{w: "majority", wtimeout: 2000}</code>. After 2 seconds:</p>
+<pre class="output"><code>MongoWriteConcernError: waiting for replication timed out   (code 64, WriteConcernFailed)
+result: { n: 1, opTime: { ts: Timestamp({ t: 1793099705, i: 1 }), t: 1 },
+          writeConcernError: { code: 64, errInfo: { wtimeout: true, … } }, ok: 1 }</code></pre>
+  <p><strong><code>n: 1</code> and <code>ok: 1</code>.</strong> The review <em>was</em> inserted and stays inserted. The wait timed out, nothing else. A normal read on the primary found it. A read with <code>readConcern: "majority"</code> on the same primary returned nothing, because the primary reads from its own majority-committed snapshot, and the write wasn't in it. After <code>fsyncUnlock()</code>, the majority read returned it. A majority read doesn't ask other nodes anything. "Read concern majority reads do not wait for anything to be committed; they just use different snapshots from local reads."<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#read-concern">repl README</a></p>
+  <p>And if the primary had crashed before any secondary got the write? Another node would become primary without it, and the old primary would <em>roll back</em> the review when it rejoined. That is the risk <code>w: 1</code> accepts, and what <code>w: "majority"</code> protects you from.<a class="cite" href="https://www.mongodb.com/docs/manual/core/replica-set-rollbacks/">rollbacks</a></p>
+
+  <h2>4 · Where you can see each hop</h2>
+  <p>The slow-query log line is the best single view. Here is the real one for our <code>w: "majority"</code> insert, trimmed:<a class="cite" href="https://www.mongodb.com/docs/manual/reference/log-messages/">log messages</a></p>
+<pre class="output"><code>"msg":"Slow query", "attr":{ "type":"command", "ns":"store.reviews", "appName":"mongosh 2.13.0",
+  "command":{ "insert":"reviews", "documents":[…], "writeConcern":{"w":"majority"}, "lsid":…, "txnNumber":2, … },
+  "totalOplogSlotDurationMicros":38, "ninserted":1, "keysInserted":5,
+  "writeConcern":{"w":"majority","wtimeout":0,"provenance":"clientSupplied"},
+  "waitForWriteConcernDurationMillis":1,
+  "storage":{"data":{"txnBytesDirty":1540}}, "remote":"127.0.0.1:40078", "protocol":"op_msg",
+  "queues":{"execution":{"admissions":2},"ingress":{"admissions":1}},
+  "workingMillis":1, "durationMillis":1 }</code></pre>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Hop</th><th>Slow-query log</th><th><code>serverStatus()</code> (diff two snapshots)</th></tr>
+    <tr><td>1 Driver</td><td><code>appName</code>, <code>remote</code></td><td><code>connections.current</code>, <code>.totalCreated</code>. Pool waits show only in driver events (CMAP).</td></tr>
+    <tr><td>2 Wire</td><td><code>protocol: "op_msg"</code>, <code>reslen</code></td><td><code>network.bytesIn</code>, <code>.numRequests</code></td></tr>
+    <tr><td>3–4 Transport, dispatch</td><td><code>queues</code> (admissions)</td><td><code>metrics.commands.insert.total</code> / <code>.failed</code>, <code>opcounters.insert</code></td></tr>
+    <tr><td>5 WUOW</td><td><code>ninserted</code>, <code>keysInserted</code>, <code>totalOplogSlotDurationMicros</code></td><td>n/a</td></tr>
+    <tr><td>6 WiredTiger</td><td><code>storage.data</code> (<code>txnBytesDirty</code>, read time)</td><td><code>wiredTiger.cache</code> (lesson 3), <code>wiredTiger.log["log sync operations"]</code></td></tr>
+    <tr><td>7 Secondaries</td><td>n/a</td><td>On a secondary: <code>opcountersRepl.insert</code>, <code>metrics.repl.apply.ops</code>. Anywhere: <code>rs.status()</code> member optimes.</td></tr>
+    <tr><td>8 Majority wait</td><td><code>waitForWriteConcernDurationMillis</code></td><td><code>metrics.getLastError.wtime</code> (<code>num</code>, <code>totalMillis</code>), <code>.wtimeouts</code></td></tr>
+    <tr><td>9 Whole command</td><td><code>durationMillis</code> (and <code>workingMillis</code>)</td><td><code>opLatencies.writes</code> (<code>latency</code> in µs ÷ <code>ops</code>)</td></tr>
+  </table>
+  </div>
+  <p>The useful split: <strong><code>durationMillis</code> − <code>waitForWriteConcernDurationMillis</code></strong> is roughly the time on the primary (hops 3–6). If most of a slow insert is the write-concern wait, the primary is fine and replication is the problem.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/curop.cpp#L1361">curop.cpp</a><a class="cite" href="https://www.mongodb.com/docs/manual/reference/command/serverStatus/">serverStatus</a></p>
+
+  <h2>5 · Read the path in the source</h2>
+  <p>The whole primary path, at tag <code>r8.0.34</code> (the version in the lab). Open each link and find the named line. It's about ten minutes of reading, and afterwards the nine hops are code you've seen, not boxes.</p>
+  <ol>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/README.md"><code>transport/README.md</code></a>: Session, ServiceEntryPoint, SessionWorkflow. Short; read it all.</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/commands/write_commands.cpp#L339"><code>db/commands/write_commands.cpp</code> L339</a>: <code>CmdInsert</code> calls <code>performInserts</code>.</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/ops/write_ops_exec.cpp#L370"><code>db/ops/write_ops_exec.cpp</code> L370–416</a>: <code>insertDocumentsAtomically</code>. Find <code>WriteUnitOfWork wuow</code> and <code>wuow.commit()</code>.</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/catalog/collection_write_path.cpp#L231"><code>db/catalog/collection_write_path.cpp</code> L231</a>: <code>insertDocumentsImpl</code>. In order: <code>insertRecords</code> (L336), <code>indexRecords</code> (L411), <code>onInserts</code> (L428). That's hop 5.</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/op_observer/op_observer_impl.cpp#L724"><code>db/op_observer/op_observer_impl.cpp</code> L724</a>: <code>OpObserverImpl::onInserts</code> builds the oplog entries.</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L1327"><code>db/service_entry_point_common.cpp</code> L1327</a>: <code>_waitForWriteConcern</code>, after the command ran.</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/write_concern.cpp#L299"><code>db/write_concern.cpp</code> L299</a>: <code>waitForWriteConcern</code> → <code>awaitReplication</code>. Hop 8.</li>
+  </ol>
+
+  <h2>6 · So in production you should…</h2>
+  <div class="callout">
+    <p><strong>Rule: keep <code>w: "majority"</code> for data you can't lose, always bound the wait with <code>wtimeout</code> or a timeout, and treat a write-concern timeout as "written, not yet safe", never as "failed".</strong></p>
+  </div>
+  <ol>
+    <li><strong>Make retries safe.</strong> After a <code>writeConcernError</code>, the review is already on the primary. If you retry blindly, you insert it twice, unless the <code>_id</code> is fixed. Generate the <code>_id</code> in your app (the driver already does) and keep it across retries. Then a retry fails with a duplicate-key error, which you can treat as success. Keep retryable writes on (driver default): they cover one retry after a network error or failover.<a class="cite" href="https://specifications.readthedocs.io/en/latest/retryable-writes/retryable-writes/">retryable writes spec</a></li>
+    <li><strong>Use <code>w: 1</code> only where losing a write on failover is acceptable</strong>, like view counters or analytics events about reviews. Acknowledged <code>w: 1</code> writes can be rolled back.</li>
+    <li><strong>Count your index keys.</strong> Every index is another B-tree insert inside the same transaction. A multikey index adds one key per array element: a review with 3 tags costs 3 keys in <code>{tags: 1}</code>. Watch <code>keysInserted</code> in the slow log and drop indexes no query uses.</li>
+    <li><strong>Batch writes.</strong> Each <code>insertOne</code> pays for one message, one dispatch, one transaction commit, one journal sync and one replication wait. <code>insertMany</code> pays those once per batch. In the lab, the request was 483 bytes for a 156-byte review.</li>
+    <li><strong>Size the pool for the wait.</strong> A connection is busy for the whole majority wait (hop 3). If replication slows down, the pool fills up and requests queue in the <em>driver</em>, where the server's metrics can't see them.</li>
+  </ol>
+
+  <h3>Diagnosis table</h3>
+  <table>
+    <tr><th>Symptom</th><th>Hop</th><th>Proof</th></tr>
+    <tr><td>Slow inserts; most of <code>durationMillis</code> is <code>waitForWriteConcernDurationMillis</code></td><td>7–8: secondaries behind</td><td>Member optimes in <code>rs.status()</code> trail the primary</td></tr>
+    <tr><td><code>writeConcernError</code> code 64, <code>wtimeout: true</code></td><td>8: no majority in time</td><td><code>metrics.getLastError.wtimeouts</code> rising; the write is still there</td></tr>
+    <tr><td>Slow inserts, short write-concern wait, high <code>keysInserted</code></td><td>5: too many index keys</td><td>Slow log; <code>getIndexes()</code> shows many or multikey indexes</td></tr>
+    <tr><td>Slow inserts during a bulk load, short write-concern wait</td><td>6: dirty cache</td><td>Dirty share near 20%, app-thread eviction (lesson 3)</td></tr>
+    <tr><td>App sees high latency, server's <code>durationMillis</code> is low</td><td>1: pool or network</td><td>Driver CMAP events: long checkout times</td></tr>
+  </table>
+
+  <div class="lab">
+    <p>About 20 minutes. Run these from the <code>mongodb/</code> folder. Your ids and times will differ; the counts (5 keys, 483 bytes, ~100 syncs) should match.</p>
+    <ol>
+      <li>Start a 3-node replica set on its own Docker network:
+<pre class="terminal"><code>docker network create lab6
+for i in 1 2 3; do
+  docker run -d --name lab6-m$i --hostname m$i --network lab6 mongo:8.0 --replSet rs0 --bind_ip_all
+done
+docker exec lab6-m1 mongosh --quiet --eval 'rs.initiate({_id: "rs0", members: [
+  {_id: 0, host: "m1:27017", priority: 2}, {_id: 1, host: "m2:27017"}, {_id: 2, host: "m3:27017"}]})'
+sleep 15
+docker exec lab6-m1 mongosh --quiet --eval 'rs.status().members.map(m => m.name + " " + m.stateStr)'</code></pre>
+<pre class="output"><code>[ 'm1:27017 PRIMARY', 'm2:27017 SECONDARY', 'm3:27017 SECONDARY' ]</code></pre></li>
+      <li>Seed reviews, add the two indexes, and log every operation as "slow":
+<pre class="terminal"><code>docker cp lessons/code/seed-reviews.js lab6-m1:/seed-reviews.js
+docker exec lab6-m1 mongosh store --quiet --eval 'const N = 100000' --file /seed-reviews.js
+docker exec -it lab6-m1 mongosh store</code></pre>
+<pre><code>db.reviews.createIndex({ verified: 1, rating: 1 }); db.reviews.createIndex({ tags: 1 })
+db.setProfilingLevel(0, { slowms: -1 })                        // log every op on this node
+db.adminCommand({ getDefaultRWConcern: 1 }).defaultWriteConcern  // { w: 'majority', wtimeout: 0 }</code></pre></li>
+      <li>Insert the review with <code>w: 1</code> and with <code>w: "majority"</code>. <strong>Predict <code>keysInserted</code> first.</strong>
+<pre><code>const doc = () => ({ review: "After two weeks battery lasts for days.", rating: 5,
+                     tags: ["battery", "quality", "durability"], verified: true })
+db.reviews.insertOne(doc(), { writeConcern: { w: 1 } })
+const r = db.reviews.insertOne(doc(), { writeConcern: { w: "majority" } })
+db.getSiblingDB("local").oplog.rs.find({ "o._id": r.insertedId }).toArray()</code></pre>
+      Then, in another terminal, read the two log lines and compare <code>keysInserted</code> and <code>waitForWriteConcernDurationMillis</code>:
+<pre class="terminal"><code>docker logs lab6-m1 2>&amp;1 | grep '"Slow query"' | grep '"insert":"reviews"' | tail -2</code></pre></li>
+      <li>Find the same oplog entry on a secondary. Same <code>ts</code>, same <code>o</code>:
+<pre class="terminal"><code>docker exec lab6-m2 mongosh local --quiet --eval 'db.oplog.rs.find({ns: "store.reviews"}).sort({$natural: -1}).limit(1).toArray()'</code></pre></li>
+      <li>Count journal syncs per write concern. <strong>Predict the three numbers first.</strong>
+<pre><code>const syncs = () => db.serverStatus().wiredTiger.log["log sync operations"]
+function count(wc) { const a = syncs(); for (let i = 0; i &lt; 100; i++) db.reviews.insertOne(doc(), { writeConcern: wc }); return syncs() - a }
+[count({ w: 1 }), count({ w: 1, j: true }), count({ w: "majority" })]</code></pre>
+<pre class="output"><code>[ 0, 101, 100 ]   // w: 1 only sees the background sync (my runs: 0–2)</code></pre></li>
+      <li>Optional: capture the OP_MSG bytes. Start <code>tcpdump</code> in a helper container that shares <code>m1</code>'s network, insert from <code>m1</code>'s own mongosh (so it goes over loopback), then decode with the lesson's script:
+<pre class="terminal"><code>docker run -d --name lab6-dump --net container:lab6-m1 -v "$PWD":/cap alpine:3.20 \
+  sh -c 'apk add -q tcpdump &amp;&amp; tcpdump -i lo -s 0 -U -w /cap/insert.pcap "tcp port 27017"'
+sleep 8
+docker exec lab6-m1 mongosh store --quiet --eval 'db.reviews.insertOne({ review: "After two weeks battery lasts for days.", rating: 5, tags: ["battery", "quality", "durability"], verified: true }, { writeConcern: { w: "majority" } })'
+docker rm -f lab6-dump
+python3 lessons/code/0006-opmsg.py insert.pcap</code></pre>
+<pre class="output"><code>=== 52248 -> 27017, 483 bytes
+MsgHeader  messageLength=483  requestID=11  responseTo=0  opCode=2013
+flagBits   00 00 00 00  (none)
+section    kind 0 (body), BSON document of 462 B at offset 21
+   25    0x02 insert: 'reviews'  (20 B)  02 69 6e 73 65 72 74 00 …
+   …
+=== 27017 -> 52248, 230 bytes
+MsgHeader  messageLength=230  requestID=41660  responseTo=11  opCode=2013</code></pre>
+      Wireshark opens the same <code>insert.pcap</code> and has a built-in MongoDB decoder.</li>
+      <li>Break the majority. Pause both secondaries, insert with a timeout, and check what's on the primary:
+<pre class="terminal"><code>for m in 2 3; do docker exec lab6-m$m mongosh --quiet --eval 'db.fsyncLock()'; done</code></pre>
+<pre><code>const id = ObjectId()
+try { db.reviews.insertOne({ _id: id, review: "Honestly support never answered.", rating: 1, tags: ["support"], verified: false },
+                           { writeConcern: { w: "majority", wtimeout: 2000 } }) }
+catch (e) { printjson({ codeName: e.codeName, n: e.result.n, ok: e.result.ok }) }
+db.reviews.find({ _id: id }).toArray()                          // local read: found
+db.reviews.find({ _id: id }).readConcern("majority").toArray()  // majority read: []</code></pre>
+<pre class="terminal"><code>for m in 2 3; do docker exec lab6-m$m mongosh --quiet --eval 'db.fsyncUnlock()'; done</code></pre>
+      Run the majority read again: now it finds the review. Unlock right away in real life: a locked secondary falls further behind every second.</li>
+      <li>Clean up: <code>docker rm -f lab6-m1 lab6-m2 lab6-m3 &amp;&amp; docker network rm lab6 &amp;&amp; rm -f insert.pcap</code></li>
+    </ol>
+  </div>
+
+  <h2>7 · Check yourself</h2>
+  <p>From memory. The first question comes from lesson 2.1 on purpose.</p>
+  <div id="quiz"></div>
+
+  <h2>Where this fits</h2>
+  <ol>
+    <li><s>Organise: collections and indexes are B-tree tables</s> ✓</li>
+    <li><s>Cache: how pages move between disk and memory</s> ✓</li>
+    <li><s>Concurrency: snapshots, update chains, write conflicts</s> ✓</li>
+    <li><s>Durability: journal and checkpoints</s> ✓</li>
+    <li><s>MongoDB on top: one write traced end to end</s> ✓ (today). <strong>Phase 1 is done.</strong></li>
+    <li><strong>Next, Phase 2: transport and wire.</strong> Hops 1–4 in depth: the thread model, OP_MSG flags (<code>moreToCome</code>, <code>exhaustAllowed</code>), compression, and how the driver's pool and monitoring work.</li>
+  </ol>
+
+  <div class="callout source">
+    <p>Read two sections of the server's own docs at <code>r8.0.34</code>. First, <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/catalog/README.md#writeunitofwork">catalog README: WriteUnitOfWork, Collection and Index Writes, and Oplog Visibility</a>. That's hop 5 and the "no holes" rule. Then <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#commit-point-propagation">replication README: Commit Point Propagation and Update Position Commands</a>. That's hops 7–8. For the bytes, keep the <a href="https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/">wire protocol</a> page (manual 9.0) open next to your own capture.</p>
+  </div>
+
+  <div class="callout ask">
+    <p>Try it on your own system: take one slow insert from your production logs and split its <code>durationMillis</code> into primary time and write-concern wait. Paste me the line (remove the document values) and we'll find the hop together. Ask me anything that's unclear.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="0005-durability.html">← Lesson 5: Durability</a>
+    <a href="../reference/architecture-map.html">Reference: architecture map</a>
+    <span>Phase 2: Transport (next)</span>
+  </nav>
+</main>
+
+<script src="../../assets/quiz.js"></script>
+<script>
+const R = 'https://github.com/mongodb/mongo/blob/r8.0.34/';
+const BTREE = 'https://source.wiredtiger.com/develop/arch-btree.html';
+const WIRE = 'https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/';
+const WC = 'https://www.mongodb.com/docs/manual/reference/write-concern/';
+const REPL = R + 'src/mongo/db/repl/README.md';
+const CATALOG = R + 'src/mongo/db/catalog/README.md';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0006-one-write',
+  questions: [
+    { layer: 'review',
+      q: '<em>From lesson 2.1:</em> inserts into <code>{tags: 1}</code> fill a <strong>non-root</strong> leaf page, and it splits. What happens to the height of the tree?',
+      options: ['It stays the same', 'It grows by one level', 'It shrinks by one level', 'It doubles, then rebalances'], answer: 0,
+      explain: `The leaf splits in two and the median key moves up into the parent. The tree only gets taller when the <em>root</em> splits, because then a new root is created above it.${c(BTREE, 'WT B-trees')}` },
+
+    { layer: 'storage',
+      q: '<code>store.reviews</code> has indexes <code>_id</code>, <code>{verified: 1, rating: 1}</code> and <code>{tags: 1}</code>. You insert one review with 3 different tags. What does the slow log show as <code>keysInserted</code>?',
+      options: ['3', '5', '4', '7'], answer: 1,
+      explain: `1 key in <code>_id_</code> + 1 in <code>verified_1_rating_1</code> + 3 in the multikey <code>tags_1</code> (one per array element) = 5. The lab's log line says <code>keysInserted: 5</code>.${c(CATALOG + '#collection-and-index-writes', 'catalog README')}` },
+
+    { layer: 'wire',
+      q: 'The reply to the insert has <code>responseTo = 11</code> in its MsgHeader. What is 11?',
+      options: ['The reply\'s byte length', 'The oplog entry\'s term', 'The insert\'s requestID', 'The pool\'s connection number'], answer: 2,
+      explain: `<code>responseTo</code> holds the <code>requestID</code> of the message being answered. That's how the driver matches a reply to its request. The length is the first field, <code>messageLength</code>.${c(WIRE, 'wire protocol')}` },
+
+    { layer: 'storage',
+      q: 'What does one <code>WriteUnitOfWork</code> for an <code>insertOne</code> commit, all at once?',
+      options: ['The collection record only', 'The record, then later its keys', 'The index keys, then the record', 'The record, keys and oplog entry'], answer: 3,
+      explain: `Collection and index writes happen "in the same storage transaction", and the oplog entry is written by the OpObserver inside the same unit. So a committed write always has its oplog entry, and a secondary can't miss it.${c(CATALOG + '#collection-and-index-writes', 'catalog README')}` },
+
+    { layer: 'repl',
+      q: 'An insert with <code>{w: "majority", wtimeout: 2000}</code> fails after 2 s with <code>writeConcernError</code> code 64. What happened to the review on the primary?',
+      options: ['It was rolled back already', 'It was inserted (n: 1)', 'It was never written at all', 'It was queued for a retry'], answer: 1,
+      explain: `The write committed before the wait started. The timeout only ends the <em>wait</em>. The reply says <code>n: 1, ok: 1</code> plus a <code>writeConcernError</code>. Retry only with the same <code>_id</code>, so the retry can't insert a second copy.${c(WC, 'write concern')}` },
+
+    { layer: 'observe',
+      q: 'Which slow-query log field shows how long an insert waited for the secondaries?',
+      options: ['durationMillis', 'workingMillis', 'totalOplogSlotDurationMicros', 'waitForWriteConcernDurationMillis'], answer: 3,
+      explain: `<code>waitForWriteConcernDurationMillis</code> is the hop 8 wait. <code>durationMillis</code> is the whole command. Subtract one from the other to get the time spent on the primary itself.${c(R + 'src/mongo/db/curop.cpp#L1361', 'curop.cpp')}` },
+
+    { layer: 'repl',
+      q: 'Right after a <code>w: 1</code> insert, before any secondary has it, you read that review <em>on the primary</em> with <code>readConcern: "majority"</code>. What do you get?',
+      options: ['Nothing: it is not committed yet', 'The review: the primary has it', 'An error: no quorum of replies', 'The review, after a quorum read'], answer: 0,
+      explain: `A majority read doesn't ask other nodes. It reads from this node's snapshot at the majority commit point, and the new review is past that point: "they just use different snapshots from local reads." The lab showed <code>[]</code> until the secondaries caught up.${c(REPL + '#read-concern', 'repl README')}` },
+
+    { layer: 'repl',
+      q: 'How does the new oplog entry get from the primary to the secondaries?',
+      options: ['The primary pushes it on commit', 'The driver sends it to each node', 'The secondaries pull it with getMore', 'A checkpoint copies the files over'], answer: 2,
+      explain: `"Secondaries drive oplog replication via a pull process." Each secondary's OplogFetcher keeps a tailable <code>find</code>/<code>getMore</code> cursor with <code>awaitData</code> on its sync source's oplog.${c(REPL, 'repl README')}` },
+
+    { layer: 'durability',
+      q: 'In the lab, which write concerns made the primary sync its journal once per insert?',
+      options: ['Only {w: 1, j: true}', 'Only {w: "majority"}', 'Both of those two', 'Neither of those two'], answer: 2,
+      explain: `About 100 syncs per 100 inserts for both, versus 0–2 for plain <code>w: 1</code>. A write concern that "includes or implies <code>j: true</code> causes an immediate journal synchronization", and majority implies it by default (<code>writeConcernMajorityJournalDefault</code>).${c(WC, 'write concern')}` }
+  ]
+});
+</script>
+</body>
+</html>

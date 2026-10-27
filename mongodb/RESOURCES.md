@@ -66,3 +66,23 @@
   Default eviction thresholds: target 80, trigger 95, dirty target 5, dirty trigger 20; updates target/trigger default to half the dirty ones. Use for: exact threshold numbers.
 - [Source: `wiredtiger_kv_engine.cpp` (r8.0.4), wiredtiger_open config](https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/wiredtiger/wiredtiger_kv_engine.cpp#L384)
   What MongoDB actually passes to WiredTiger: cache_size, 4 eviction threads, optional dirty target/trigger overrides. Use for: "which WT defaults does MongoDB change?"
+
+### Durability (added 2026-10-27)
+- WiredTiger arch guide pages: [Checkpoint](https://source.wiredtiger.com/develop/arch-checkpoint.html), [Logging](https://source.wiredtiger.com/develop/arch-logging.html), [Metadata](https://source.wiredtiger.com/develop/arch-metadata.html) (turtle file), [Timestamps](https://source.wiredtiger.com/develop/arch-timestamp.html), [Rollback to Stable](https://source.wiredtiger.com/develop/arch-rts.html). Use for: lesson 5 and crash-recovery questions.
+- [Source: `journal_flusher.h`](https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/control/journal_flusher.h), [`checkpointer.cpp`](https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/checkpointer.cpp), [`WiredTigerUtil::useTableLogging`](https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/wiredtiger/wiredtiger_util.cpp#L1015-L1048) (r8.0.4)
+  The 100 ms flusher and its grouping, the 60 s checkpoint loop, and why replica set user tables aren't journaled (only `local`/oplog). Use for: "when is my write durable?"
+
+### Concurrency & MVCC (added 2026-10-27)
+- WiredTiger arch guide: [Snapshots](https://source.wiredtiger.com/develop/arch-snapshot.html) (min/max/concurrent IDs, the 4-step visibility rule), [Transactions](https://source.wiredtiger.com/develop/arch-transaction.html) (update chains, read/oldest/stable timestamps), [History Store](https://source.wiredtiger.com/develop/arch-hs.html) (old versions moved out at reconciliation). Use for: lesson 4 and any MVCC question.
+- [Docs: Concurrency FAQ (MongoDB Manual)](https://www.mongodb.com/docs/manual/faq/concurrency/) and [Production Considerations for transactions](https://www.mongodb.com/docs/manual/core/transactions-production-consideration/)
+  Lock modes (IS/IX/S/X, shown as r/w/R/W), intent locks only for CRUD; 60 s transaction lifetime, write conflicts between transactions and plain writes, cache-pressure aborts. Use for: lock and transaction behaviour.
+- Source: [`exception_util.h` (r8.0.4)](https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/concurrency/exception_util.h) (`writeConflictRetry`: unlimited retries with backoff, not inside a WUOW), [`wiredtiger_util.cpp` (r8.0.4)](https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/wiredtiger/wiredtiger_util.cpp#L214) (WT_ROLLBACK → WriteConflict / TemporarilyUnavailable / TransactionTooLargeForCache), WiredTiger [`txn_inline.h`](https://github.com/wiredtiger/wiredtiger/blob/develop/src/include/txn_inline.h) (`__txn_modify_block`, the write-conflict check). Use for: source-reading exercises on conflicts.
+
+### Write path, end to end (added 2026-10-27)
+- [Source: Catalog README (`src/mongo/db/catalog/README.md`, r8.0.34)](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/catalog/README.md#writeunitofwork)
+  WriteUnitOfWork, "Collection and Index Writes" (record + index keys in one storage transaction), Oplog Visibility (no-holes point). Use for: what one write commits atomically.
+- [Docs: Write Concern (Manual 9.0)](https://www.mongodb.com/docs/manual/reference/write-concern/)
+  Implicit default `w: "majority"`, `writeConcernMajorityJournalDefault`, "includes or implies j: true causes an immediate journal synchronization", wtimeout. Use for: what each write concern waits for.
+- Driver specs: [Server Selection](https://specifications.readthedocs.io/en/latest/server-selection/server-selection/), [Connection Monitoring and Pooling (CMAP)](https://specifications.readthedocs.io/en/latest/connection-monitoring-and-pooling/connection-monitoring-and-pooling/), [Retryable Writes](https://specifications.readthedocs.io/en/latest/retryable-writes/retryable-writes/). Use for: the client side of hop 1 (lesson 6), and Phase 2.
+- [Source: Sessions and transactions README (`src/mongo/db/s/README_sessions_and_transactions.md`)](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README_sessions_and_transactions.md)
+  Why retryable-write oplog entries carry `lsid`, `txnNumber`, `stmtId`, `prevOpTime`, and the `config.transactions` record. Use for: reading oplog entries.

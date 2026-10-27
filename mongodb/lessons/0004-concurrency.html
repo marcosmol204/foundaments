@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 4 · Concurrency</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<link rel="stylesheet" href="../../assets/quiz.css">
+<style>
+  /* Lesson-local: colour marks inside the update-chain diagram */
+  svg .ok { fill: var(--ok); font: 600 11px 'JetBrains Mono', monospace; }
+  svg .no { fill: var(--bad); font: 600 11px 'JetBrains Mono', monospace; }
+  svg .box-warn { fill: var(--warn-bg); stroke: var(--warn); stroke-width: 1.2; stroke-dasharray: 4 3; }
+</style>
+</head>
+<body>
+<main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>
+  <div class="kicker">MongoDB Internals · Lesson 0004 · Phase 1: The engine</div>
+  <h1>Concurrency: snapshots and write conflicts</h1>
+  <p class="subtitle">Many clients read and write the same reviews at once. Nobody waits for a lock on the collection, and no vote is lost. This lesson is about how, and about the bill that comes later.</p>
+
+  <p><strong>Your win today:</strong> look at a <code>writeConflicts</code> counter that's climbing, or a cache that fills up while one transaction sits idle, and name the mechanism behind it and the metric that proves it.</p>
+
+  <h2>0 · Warm-up from lesson 3</h2>
+  <p>From memory, before reading on: when eviction writes a <em>dirty</em> page, the latest values go to the data file. <em>Where do the older versions go, and who still needs them?</em> Lesson 3 left the "who" open. This lesson answers it.</p>
+
+  <p><strong>One new field.</strong> Our examples need a number that many clients change at once, so I'm adding <code>helpful: number</code> to <code>store.reviews</code>: the "was this review helpful?" vote counter. The five standard fields stay as they are. The lab adds it with <code>$inc</code>.</p>
+
+  <h2>1 · Two layers, two kinds of concurrency control</h2>
+  <p>Lesson 2 split <code>mongod</code> into the MongoDB layer and WiredTiger. Each one controls concurrency in its own way:<a class="cite" href="https://www.mongodb.com/docs/manual/faq/concurrency/">concurrency FAQ</a></p>
+  <table>
+    <tr><th>Layer</th><th>What it protects</th><th>How</th></tr>
+    <tr><td>MongoDB</td><td>global, database, collection</td><td><strong>Locks</strong>. For normal reads and writes, only <em>intent</em> locks.</td></tr>
+    <tr><td>WiredTiger</td><td>each document (each key in a table)</td><td><strong>No locks.</strong> Snapshots for reads, conflict detection for writes. This is <em>optimistic</em> concurrency control.</td></tr>
+  </table>
+  <p>An intent lock says "I'm going to work on something <em>inside</em> this". Reads take <strong>IS</strong> (intent shared) and writes take <strong>IX</strong> (intent exclusive) on the global, database and collection levels. IX is compatible with IX, so any number of writers can be inside <code>store.reviews</code> at once. "For most read and write operations, WiredTiger uses optimistic concurrency control. WiredTiger uses only intent locks at the global, database and collection levels."<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a> Full <strong>S</strong> and <strong>X</strong> locks are for rare operations. For example, <code>renameCollection</code> can need an exclusive database lock.<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a></p>
+  <p>In <code>serverStatus().locks</code> and <code>currentOp</code>, the modes are written as letters: <code>r</code> = IS, <code>w</code> = IX, <code>R</code> = S, <code>W</code> = X.<a class="cite" href="https://www.mongodb.com/docs/manual/faq/concurrency/">concurrency FAQ</a> In the lab, an idle transaction and a blocked update on the <em>same</em> review both held <code>Collection: "w"</code> at the same time. So the collection lock was not what blocked anything. The rest of the lesson is what did.</p>
+
+  <h2>2 · A snapshot is three numbers</h2>
+  <p>WiredTiger uses MVCC (multi-version concurrency control): "At the start of an operation, WiredTiger provides a point-in-time snapshot of the data to the operation."<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a> A snapshot is not a copy of the data. It is a small record of <em>which transactions count as done</em>:<a class="cite" href="https://source.wiredtiger.com/develop/arch-snapshot.html">WT snapshot</a></p>
+  <ul>
+    <li>Every write transaction gets a <strong>transaction ID</strong> from a global counter that only goes up.</li>
+    <li>A snapshot stores the <strong>max</strong> ID seen when it was taken, the <strong>list of concurrent</strong> transactions (still running at that moment), and the <strong>min</strong> ID.</li>
+  </ul>
+  <p>To decide whether a change made by transaction <em>t</em> is visible, WiredTiger checks in this order:<a class="cite" href="https://source.wiredtiger.com/develop/arch-snapshot.html">WT snapshot</a></p>
+  <ol>
+    <li><em>t</em> ≥ max → <strong>invisible</strong> (it started after the snapshot).</li>
+    <li><em>t</em> &lt; min → <strong>visible</strong> (it finished before the snapshot).</li>
+    <li><em>t</em> is in the concurrent list → <strong>invisible</strong> (it wasn't committed yet).</li>
+    <li>Otherwise → <strong>visible</strong>.</li>
+  </ol>
+  <p>That's the whole rule. Readers never wait for writers, and writers never wait for readers: a reader just skips the versions it isn't allowed to see.</p>
+
+  <h2>3 · One review's update chain, step by step</h2>
+  <p>Where do the versions live? Lesson 2.1 showed that each in-memory leaf page keeps changes in <strong>update lists</strong>. "The in-memory updates in WiredTiger are organized as a singly linked list with the newest update at the head."<a class="cite" href="https://source.wiredtiger.com/develop/arch-transaction.html">WT transactions</a> Each update carries the ID of the transaction that wrote it (the <code>WT_UPDATE</code> struct in <a href="https://github.com/wiredtiger/wiredtiger/blob/develop/src/include/btmem.h">btmem.h</a>). We follow one review, <strong>R</strong>, the first one in the seed data: <code>{_id: ObjectId('6955b900…'), rating: 4, verified: true, helpful: 1}</code>.</p>
+
+  <h3>Walkthrough 1 · A reader takes a snapshot</h3>
+  <ol>
+    <li>R's <code>helpful: 1</code> was written long ago. It's in the on-disk image of the page.</li>
+    <li>Transaction <strong>104</strong> (someone's vote) runs <code>$inc: {helpful: 1}</code>. It hasn't committed yet. R's chain is now <code>[104: helpful 2]</code> → disk value <code>helpful 1</code>.</li>
+    <li>A moderation dashboard starts reading. Its snapshot <strong>S</strong> is <code>{min 104, max 106, concurrent [104]}</code>.</li>
+    <li>104 commits. S doesn't care: 104 is in its concurrent list, so S still skips it and reads <code>helpful: 1</code>. S sees the same R for its whole life, which is what snapshot isolation means.<a class="cite" href="https://source.wiredtiger.com/develop/arch-transaction.html">WT transactions</a></li>
+  </ol>
+
+  <h3>Walkthrough 2 · A second voter, a second reader</h3>
+  <ol>
+    <li>Transaction <strong>107</strong> votes too: <code>helpful 3</code>, not committed yet. It goes at the head of the chain.</li>
+    <li>A new reader <strong>T</strong> starts: <code>{min 107, max 108, concurrent [107]}</code>. It skips 107 (concurrent) and reaches 104. 104 &lt; min, so it's visible: T reads <code>helpful: 2</code>.</li>
+    <li>S reads R again. 107 ≥ its max, 104 is concurrent: still <code>helpful: 1</code>. If no version on the chain is visible, the reader falls back to the on-disk value.<a class="cite" href="https://source.wiredtiger.com/develop/arch-transaction.html">WT transactions</a></li>
+  </ol>
+
+  <h3>Walkthrough 3 · A third voter hits a write conflict</h3>
+  <ol>
+    <li>Transaction <strong>108</strong> wants to <code>$inc</code> R as well. Before it adds an update, WiredTiger looks at the head of the chain: 107, which is <em>not visible</em> to 108, because it isn't committed.</li>
+    <li>If 108 wrote <code>helpful 3</code> on top, 107's vote would be lost. So WiredTiger refuses: it returns <code>WT_ROLLBACK</code> with the reason "Write conflict between concurrent operations" and counts it in the <code>update conflicts</code> stat.<a class="cite" href="https://github.com/wiredtiger/wiredtiger/blob/develop/src/include/txn_inline.h">txn_inline.h</a></li>
+    <li>The same happens if the head is <em>committed</em> but committed after 108's snapshot was taken. The rule is "the newest version must be visible to me". So the first writer wins, and the second one has to start over.</li>
+  </ol>
+
+  <figure>
+    <svg viewBox="0 0 680 270" role="img" aria-label="Review R's update chain, newest first: txn 107 helpful 3 uncommitted, txn 104 helpful 2 committed, on-disk value helpful 1. Reader S skips 107 and 104 and sees 1. Reader T skips 107 and sees 2. Writer 108 finds 107 at the head, not visible, and gets WT_ROLLBACK.">
+      <defs><marker id="ah4" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+      <text class="lbl-sm" x="150" y="20">update chain of review R, newest first →</text>
+      <rect class="box" x="20" y="34" width="110" height="70" rx="6"/>
+      <text class="lbl-title" x="32" y="58">review R</text>
+      <text class="lbl-sm" x="32" y="78">key in a leaf</text>
+      <text class="lbl-sm" x="32" y="93">page</text>
+      <rect class="box-warn" x="160" y="34" width="150" height="70" rx="6"/>
+      <text class="lbl" x="172" y="56">txn 107</text>
+      <text class="lbl-sm" x="172" y="76">helpful: 3</text>
+      <text class="lbl-sm" x="172" y="93">uncommitted</text>
+      <rect class="box-accent" x="340" y="34" width="150" height="70" rx="6"/>
+      <text class="lbl" x="352" y="56">txn 104</text>
+      <text class="lbl-sm" x="352" y="76">helpful: 2</text>
+      <text class="lbl-sm" x="352" y="93">committed</text>
+      <rect class="box" x="520" y="34" width="145" height="70" rx="6"/>
+      <text class="lbl" x="532" y="56">on-disk value</text>
+      <text class="lbl-sm" x="532" y="76">helpful: 1</text>
+      <text class="lbl-sm" x="532" y="93">in the page image</text>
+      <path class="edge-accent" d="M132 69 L157 69" marker-end="url(#ah4)"/>
+      <path class="edge-accent" d="M312 69 L337 69" marker-end="url(#ah4)"/>
+      <path class="edge-accent" d="M492 69 L517 69" marker-end="url(#ah4)"/>
+
+      <line class="edge" x1="20" y1="122" x2="665" y2="122"/>
+      <text class="lbl" x="20" y="150">reader S</text>
+      <text class="lbl-sm" x="20" y="164">104 · 106 · [104]</text>
+      <text class="no" x="172" y="156">✗ 107 ≥ max</text>
+      <text class="no" x="352" y="156">✗ in concurrent</text>
+      <text class="ok" x="532" y="156">✓ reads 1</text>
+
+      <text class="lbl" x="20" y="196">reader T</text>
+      <text class="lbl-sm" x="20" y="210">107 · 108 · [107]</text>
+      <text class="no" x="172" y="202">✗ in concurrent</text>
+      <text class="ok" x="352" y="202">✓ reads 2</text>
+      <text class="lbl-sm" x="532" y="202">not reached</text>
+
+      <text class="lbl" x="20" y="244">writer 108</text>
+      <text class="lbl-sm" x="20" y="258">wants to $inc</text>
+      <text class="no" x="172" y="248">✗ head not visible</text>
+      <text class="no" x="352" y="248">→ WT_ROLLBACK: write conflict</text>
+    </svg>
+    <figcaption>Snapshots are written as min · max · [concurrent]. Readers walk the chain until they find a version they may see. A writer only checks the head.</figcaption>
+  </figure>
+
+  <h3>Timestamps, briefly</h3>
+  <p>MongoDB adds a second clock on top of transaction IDs. Writes are labelled with a commit <strong>timestamp</strong>, and a snapshot can be opened at a timestamp. It then sees "all data committed with a timestamp less than or equal to the snapshot's timestamp".<a class="cite" href="https://github.com/mongodb/mongo/blob/master/src/mongo/db/storage/README.md#timestamps">storage README</a> (Where MongoDB gets those timestamps is part of lesson 6.) WiredTiger says the same thing from below: "A transaction can only see updates with timestamps smaller or equal to its read timestamp."<a class="cite" href="https://source.wiredtiger.com/develop/arch-transaction.html">WT transactions</a> Two global timestamps matter:</p>
+  <ul>
+    <li><strong>Oldest timestamp</strong>: "the timestamp that should be visible by all concurrent transactions". Nobody may read before it, so versions older than it can be thrown away.<a class="cite" href="https://source.wiredtiger.com/develop/arch-transaction.html">WT transactions</a> MongoDB moves it forward, but keeps at least <code>minSnapshotHistoryWindowInSeconds</code> of history, <strong>300 s</strong> by default, so that snapshot reads at a past cluster time still work.<a class="cite" href="https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.minSnapshotHistoryWindowInSeconds">params</a></li>
+    <li><strong>Stable timestamp</strong>: used by checkpoints and recovery. That's durability, <a href="0005-durability.html">lesson 5</a>.</li>
+  </ul>
+
+  <h2>4 · From WT_ROLLBACK to your app</h2>
+  <p>WiredTiger only says "roll back". MongoDB decides what to do with it. The storage layer turns <code>WT_ROLLBACK</code> into a <code>WriteConflictException</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/wiredtiger/wiredtiger_util.cpp#L214">wiredtiger_util.cpp</a> Then it depends on whether you're in a multi-document transaction:</p>
+  <table>
+    <tr><th>Your operation</th><th>What happens on a write conflict</th></tr>
+    <tr><td>Plain write: <code>updateOne</code>, <code>insertOne</code>…</td><td>Retried <strong>inside the server</strong> by <code>writeConflictRetry</code>, with backoff, with no upper limit. Each retry adds 1 to <code>writeConflicts</code>. Your app just sees success, a bit later.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/concurrency/exception_util.h#L136">exception_util.h</a></td></tr>
+    <tr><td>Inside a transaction</td><td><strong>Not</strong> retried. The transaction aborts and you get <code>WriteConflict</code> with the label <code>TransientTransactionError</code>. Your code (or the driver's <code>withTransaction</code>) must retry the <em>whole</em> transaction.<a class="cite" href="https://github.com/mongodb/mongo/blob/master/src/mongo/db/storage/README.md">storage README</a></td></tr>
+  </table>
+  <p>The storage README calls this design "optimistic concurrency control because it allows un-contended writes to commit quickly".<a class="cite" href="https://github.com/mongodb/mongo/blob/master/src/mongo/db/storage/README.md">storage README</a> No lock is taken in the normal case. The cost only shows up when two writers really touch the same document.</p>
+  <p>One case looks like waiting, but isn't. "If a transaction is in progress and has taken a lock to modify a document, when a write outside the transaction tries to modify the same document, the write waits until the transaction ends."<a class="cite" href="https://www.mongodb.com/docs/manual/core/transactions-production-consideration/#std-label-transactions-write-conflicts">txn docs</a> Under the hood, the plain write keeps hitting the uncommitted head of the chain and keeps retrying. In the lab, a write stuck behind an open transaction for 2 s retried <strong>204 times</strong>, and <code>currentOp</code> showed <code>waitingForLock: false</code>.</p>
+
+  <h2>5 · The bill: long snapshots pin history</h2>
+  <p>When can WiredTiger throw away <code>[104: helpful 2]</code>? Only when <em>no</em> snapshot could ever need it again. That means every running snapshot, and the oldest timestamp, must be past it. The oldest snapshot still open sets the limit for the whole server, for <em>every</em> collection, not just the documents it read.<a class="cite" href="https://source.wiredtiger.com/develop/arch-hs.html">WT history store</a></p>
+  <ol>
+    <li>Your reporting job opens a transaction, reads one review, then waits on something slow.</li>
+    <li>Meanwhile, normal traffic writes 300,000 votes. Each one adds a version to some update chain. None of the old versions can be dropped, because the report might still read them.</li>
+    <li>The chains grow, and the pages holding them are dirty. That's lesson 3's dirty share going up.</li>
+    <li>When those pages are reconciled, the old versions are moved to the <strong>history store</strong>, <code>WiredTigerHS.wt</code>: "All older updates are added to the history store table assuming they are not yet obsolete."<a class="cite" href="https://source.wiredtiger.com/develop/arch-hs.html">WT history store</a> That's more writes, and the history store is one more table in the cache.</li>
+    <li>The report ends. Everything it pinned becomes obsolete at once and can be cleaned up.</li>
+  </ol>
+  <p>MongoDB puts two limits on this. A transaction older than <code>transactionLifetimeLimitSeconds</code> (<strong>60 s</strong> by default) is aborted by a periodic cleanup, which "helps relieve storage cache pressure".<a class="cite" href="https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.transactionLifetimeLimitSeconds">params</a> And when the cache is under pressure, the transaction holding the oldest snapshot can be rolled back for eviction. You'll see a <code>WriteConflict</code> (or <code>TransactionTooLargeForCache</code>) for a transaction that never touched a contended document.<a class="cite" href="https://www.mongodb.com/docs/manual/core/transactions-production-consideration/">txn docs</a></p>
+  <p><strong>Lab result</strong> (100,000 reviews, history window set to 0 to isolate the effect, 3 passes of <code>$inc: {helpful: 1}</code> over every review):</p>
+  <table>
+    <tr><th>Run</th><th><code>transaction range of IDs currently pinned</code></th><th><code>history store table insert calls</code> (Δ)</th></tr>
+    <tr><td>No open snapshot (2 runs)</td><td>0 and 5,558</td><td>49,363 and 14,353</td></tr>
+    <tr><td>One idle snapshot transaction (2 runs)</td><td><strong>300,018</strong> both times</td><td><strong>273,108</strong> and <strong>291,321</strong></td></tr>
+    <tr><td>Default 300 s window, no open snapshot</td><td>0</td><td>253,467</td></tr>
+  </table>
+  <p>The idle transaction pinned exactly the 300,000 updates that ran after it, plus a few internal ones, and it pushed 6–20× more versions into the history store. The last row is a surprise worth remembering: on a replica set, the default 300 s window pins history <em>even with no open transaction</em>. Five seconds after the transaction was aborted, the pinned range was back to 0.</p>
+
+  <h2>6 · So in production you should…</h2>
+  <div class="callout">
+    <p><strong>Rule: keep transactions short, and keep hot single documents rare.</strong> A long snapshot makes the whole server keep history. A document that every request updates turns parallel writers into a retry loop.</p>
+  </div>
+  <ol>
+    <li><strong>Avoid hot-spot documents.</strong> Two clients voting on the <em>same</em> review conflicted about once every 6 updates in the lab. Two clients voting on <em>different</em> reviews conflicted 0 times. If one document takes all the writes (a global counter, a "stats" document), spread the writes out, for example one counter document per bucket, added up at read time.</li>
+    <li><strong>Keep transactions short, and never wait on users or network calls inside one.</strong> Read what you need, write, commit. Always abort transactions you abandon.<a class="cite" href="https://www.mongodb.com/docs/manual/core/transactions-production-consideration/">txn docs</a></li>
+    <li><strong>Retry whole transactions on <code>TransientTransactionError</code>.</strong> Use the driver's <code>withTransaction</code> callback API, which does it for you. Single writes don't need this: the server already retries them.</li>
+    <li><strong>Don't raise <code>minSnapshotHistoryWindowInSeconds</code> or <code>transactionLifetimeLimitSeconds</code> without a reason.</strong> Both make WiredTiger keep more history. The manual warns that a bigger window "increases disk usage".<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a></li>
+  </ol>
+
+  <h3>Metrics</h3>
+  <table>
+    <tr><th>Where</th><th>Stat</th><th>What it tells you</th></tr>
+    <tr><td><code>serverStatus().metrics.operation</code></td><td><code>writeConflicts</code></td><td>Server-side retries after a write conflict. Compare snapshots: a steady rise means hot documents.</td></tr>
+    <tr><td><code>serverStatus().wiredTiger.transaction</code></td><td><code>update conflicts</code></td><td>The same thing seen from WiredTiger. It matched <code>writeConflicts</code> exactly in the lab.</td></tr>
+    <tr><td>slow query log, <code>currentOp</code></td><td><code>writeConflicts</code> per operation</td><td>Which operation and which collection. The lab's blocked write logged <code>writeConflicts: 204</code>.</td></tr>
+    <tr><td><code>serverStatus().wiredTiger.transaction</code></td><td><code>transaction range of IDs currently pinned</code></td><td>How many transactions' worth of history the oldest snapshot is holding. Large and growing = a long-running snapshot.</td></tr>
+    <tr><td><code>serverStatus().wiredTiger.cache</code></td><td><code>history store table insert calls</code>, <code>bytes belonging to the history store table in the cache</code>, <code>history store table on-disk size</code></td><td>How much old-version data is being written out and kept.</td></tr>
+    <tr><td><code>serverStatus().transactions</code></td><td><code>currentOpen</code>, <code>totalAborted</code></td><td>Transactions open right now, and how many were aborted (including the 60 s cleanup).</td></tr>
+  </table>
+
+  <h3>Diagnosis table</h3>
+  <table>
+    <tr><th>Symptom</th><th>Mechanism</th><th>Proof</th></tr>
+    <tr><td>One endpoint's writes get slow under load, CPU up, no disk I/O</td><td>Hot document: writers retry each other</td><td><code>writeConflicts</code> rising; slow log shows high <code>writeConflicts</code> on one <code>_id</code></td></tr>
+    <tr><td>A plain update hangs for seconds</td><td>An open transaction holds the document</td><td><code>currentOp</code>: <code>writeConflicts</code> climbing, <code>waitingForLock: false</code>; look for an idle transaction</td></tr>
+    <tr><td>Dirty cache and history store grow while traffic is normal</td><td>A long snapshot pins history</td><td><code>transaction range of IDs currently pinned</code> large; <code>transactions.currentOpen</code> &gt; 0</td></tr>
+    <tr><td>Transactions fail with <code>WriteConflict</code> but touch different documents</td><td>Rolled back for cache pressure, or 60 s limit</td><td>Cache near triggers (lesson 3); <code>transactions.totalAborted</code> rising</td></tr>
+  </table>
+
+  <div class="lab">
+    <p>About 20 minutes. You need <strong>two terminals</strong>, A and B. Transactions need a replica set, so this server is a one-node replica set. The lab helpers are in <a href="code/0004-concurrency-lab.js"><code>lessons/code/0004-concurrency-lab.js</code></a>.</p>
+    <ol>
+      <li>Start the server, seed 100,000 reviews and copy the helpers in (run from the <code>mongodb/</code> folder):
+<pre class="terminal"><code>docker run -d --name mongo-lab4 -m 2g mongo:8.0 --replSet rs0 --wiredTigerCacheSizeGB 0.25
+docker exec mongo-lab4 mongosh --quiet --eval 'rs.initiate()'      # wait ~5 s before the next line
+docker cp lessons/code/seed-reviews.js mongo-lab4:/seed-reviews.js
+docker exec mongo-lab4 mongosh store --file /seed-reviews.js         # ~3 s
+docker cp lessons/code/0004-concurrency-lab.js mongo-lab4:/lab.js</code></pre></li>
+      <li><strong>The race.</strong> Two shells each add 5,000 helpful votes to review R at the same time. <strong>Predict first:</strong> what will <code>helpful</code> be at the end? Will <code>writeConflicts</code> go up?
+<pre class="terminal"><code>docker exec mongo-lab4 mongosh store --quiet --eval 'db.reviews.updateMany({}, {$set: {helpful: 0}})'
+docker exec mongo-lab4 mongosh store --quiet --eval 'const RACE = 5000' --file /lab.js &amp; \
+docker exec mongo-lab4 mongosh store --quiet --eval 'const RACE = 5000' --file /lab.js &amp; wait
+docker exec mongo-lab4 mongosh store --quiet --eval 'db.reviews.findOne({_id: ObjectId("6955b9000000000000000000")}, {helpful: 1})'</code></pre>
+<pre class="output"><code>5000 updates on 6955b9000000000000000000 in 2831 ms; writeConflicts (whole server) +1678
+5000 updates on 6955b9000000000000000000 in 2833 ms; writeConflicts (whole server) +1678
+{ _id: ObjectId('6955b9000000000000000000'), helpful: 10000 }</code></pre>
+      Exactly 10,000: no vote lost, even with ~1,700 conflicts (I got 1,648 to 1,802 over three runs). Both lines show the same number because the counter is for the whole server.</li>
+      <li><strong>The control.</strong> Same race, but the second shell votes on a <em>different</em> review (<code>WHICH = 1</code>):
+<pre class="terminal"><code>docker exec mongo-lab4 mongosh store --quiet --eval 'const RACE = 5000' --file /lab.js &amp; \
+docker exec mongo-lab4 mongosh store --quiet --eval 'const RACE = 5000, WHICH = 1' --file /lab.js &amp; wait</code></pre>
+<pre class="output"><code>5000 updates on 6955b9010000000000000001 in 2924 ms; writeConflicts (whole server) +0
+5000 updates on 6955b9000000000000000000 in 2920 ms; writeConflicts (whole server) +0</code></pre>
+      Same collection, same time, zero conflicts. That's document-level concurrency.</li>
+      <li><strong>Snapshot isolation.</strong> Open a shell in each terminal and load the helpers in both: <code>docker exec -it mongo-lab4 mongosh store</code>, then <code>load('/lab.js')</code>.
+<pre><code>// A: open a snapshot transaction and read R
+const sA = db.getMongo().startSession(), A = sA.getDatabase('store').reviews
+sA.startTransaction({ readConcern: { level: 'snapshot' } })
+A.findOne({ _id: REVIEW }).rating          // 4
+
+// B: change R outside any transaction
+db.reviews.updateOne({ _id: REVIEW }, { $set: { rating: 1 } })
+db.reviews.findOne({ _id: REVIEW }).rating // 1
+
+// A: read again, then try to write R
+A.findOne({ _id: REVIEW }).rating          // still 4: same snapshot
+A.updateOne({ _id: REVIEW }, { $set: { verified: false } })
+sA.abortTransaction()</code></pre>
+<pre class="output"><code>MongoServerError[WriteConflict]: …        // codeName WriteConflict
+// e.errorLabels: [ 'TransientTransactionError' ]</code></pre>
+      The newest version of R (B's update) was committed after A's snapshot, so it isn't visible to A. A can't write on top of it.</li>
+      <li><strong>A plain write behind an open transaction.</strong>
+<pre><code>// A: change R in a transaction and leave it open
+sA.startTransaction(); A.updateOne({ _id: REVIEW }, { $set: { rating: 5 } })
+
+// B: this will hang
+db.reviews.updateOne({ _id: REVIEW }, { $set: { rating: 2 } })
+
+// A: watch B retry (the db variable is outside the session)
+const w0 = wc(); sleep(2000); wc() - w0   // I got 204 in 2 s
+db.getSiblingDB('admin').aggregate([{ $currentOp: {} }, { $match: { ns: 'store.reviews', op: 'update' } },
+  { $project: { locks: 1, writeConflicts: 1, waitingForLock: 1 } }])
+sA.commitTransaction()   // B returns right away</code></pre>
+      In my run, <code>currentOp</code> showed <code>writeConflicts: 212</code> after 3 s, <code>waitingForLock: false</code> and <code>Collection: "w"</code>. B is not waiting on a lock. It's retrying.</li>
+      <li><strong>Pinned history.</strong> In A, switch off the 300 s window so only your transaction pins history. Then compare churn with and without an open snapshot. <strong>Do it within 60 s</strong>, or the cleanup aborts your transaction (try it if you want to see that).
+<pre><code>// A
+db.adminCommand({ setParameter: 1, minSnapshotHistoryWindowInSeconds: 0 })
+churn()                                   // baseline: nobody is holding a snapshot
+sA.startTransaction({ readConcern: { level: 'snapshot' } }); A.findOne({ _id: REVIEW })
+
+// B
+churn()
+
+// A
+sA.abortTransaction(); sleep(5000); pinStats()
+db.adminCommand({ setParameter: 1, minSnapshotHistoryWindowInSeconds: 300 })   // put it back</code></pre>
+<pre class="output"><code>{ ms: 1819, pinnedIds: 0, hsInserts: 49363, hsCacheMB: 6, dirtyPct: 2.3 }          // A, baseline
+{ ms: 1679, pinnedIds: 300018, hsInserts: 273108, hsCacheMB: 8.3, dirtyPct: 10.2 } // B, with A's snapshot open
+{ pinnedIds: 0, hsInserts: …, hsCacheMB: 0.3, dirtyPct: 2.4 }                       // A, 5 s after abort</code></pre>
+      <code>hsInserts</code> and <code>dirtyPct</code> are noisy, because checkpoints and eviction decide when history is written. <code>pinnedIds</code> is not: it's always about 300,000 with the snapshot open.</li>
+      <li>Clean up: <code>docker rm -f mongo-lab4</code></li>
+    </ol>
+  </div>
+
+  <h2>7 · Check yourself</h2>
+  <p>From memory. The first three questions come from lessons 2.1 and 3 on purpose.</p>
+  <div id="quiz"></div>
+
+  <h2>Where this fits</h2>
+  <ol>
+    <li><s>Organise: collections and indexes are B-tree tables</s> ✓</li>
+    <li><s>Cache: how pages move between disk and memory</s> ✓</li>
+    <li><s>Concurrency: snapshots, update chains, the history store, and write conflicts</s> ✓ (today)</li>
+    <li><strong>Durability:</strong> journal and checkpoints, or what survives a crash (<a href="0005-durability.html">lesson 5</a>)</li>
+    <li><strong>MongoDB on top:</strong> one write traced end to end through every layer (<a href="0006-one-write.html">lesson 6</a>)</li>
+  </ol>
+
+  <div class="callout source">
+    <p><a href="https://source.wiredtiger.com/develop/arch-snapshot.html">WiredTiger Architecture Guide: Snapshots</a> (very short: the four-step rule), then <a href="https://source.wiredtiger.com/develop/arch-transaction.html">Transactions</a> and <a href="https://source.wiredtiger.com/develop/arch-hs.html">History Store</a>. For the MongoDB side, read the "Concurrency Control" and "WriteConflictException" parts of the <a href="https://github.com/mongodb/mongo/blob/master/src/mongo/db/storage/README.md">Storage Engine API README</a>. If you want source code, <code>__txn_modify_block</code> in <a href="https://github.com/wiredtiger/wiredtiger/blob/develop/src/include/txn_inline.h">txn_inline.h</a> is the write-conflict check from Walkthrough 3, in about 60 lines.</p>
+  </div>
+
+  <div class="callout ask">
+    <p>Does your app have a document that every request updates, or a transaction that calls another service before committing? Tell me in the terminal and we'll work out what it costs. Ask me anything that's unclear.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="0003-the-cache.html">← Lesson 3: The cache</a>
+    <a href="../reference/architecture-map.html">Reference: architecture map</a>
+    <a href="0005-durability.html">Lesson 5: Durability →</a>
+  </nav>
+</main>
+
+<script src="../../assets/quiz.js"></script>
+<script>
+const SNAP = 'https://source.wiredtiger.com/develop/arch-snapshot.html';
+const TXN = 'https://source.wiredtiger.com/develop/arch-transaction.html';
+const HS = 'https://source.wiredtiger.com/develop/arch-hs.html';
+const EVICT = 'https://source.wiredtiger.com/develop/arch-eviction.html';
+const FAQ = 'https://www.mongodb.com/docs/manual/faq/concurrency/';
+const STORAGE = 'https://github.com/mongodb/mongo/blob/master/src/mongo/db/storage/README.md';
+const TXNDOCS = 'https://www.mongodb.com/docs/manual/core/transactions-production-consideration/';
+const PARAMS = 'https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.minSnapshotHistoryWindowInSeconds';
+const COMER = 'https://users.cs.utah.edu/~pandey/courses/cs6530/fall24/papers/trees/p121-comer.pdf';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0004-concurrency',
+  questions: [
+    { layer: 'review',
+      q: '<em>From lesson 3:</em> eviction reconciles a dirty page of <code>store.reviews</code>. Where do older versions that a reader still needs go?',
+      options: ['The journal file', 'The history store', 'The OS cache', 'The oplog collection'], answer: 1,
+      explain: `The newest value goes to the data file, and older versions still needed go to <code>WiredTigerHS.wt</code>. Today's "who needs them": any snapshot that can't see the newer versions.${c(HS, 'WT history store')}` },
+
+    { layer: 'review · b-tree',
+      q: '<em>From lesson 2.1:</em> a tiny B-tree (max 3 keys per page) holds review RecordIds: root <code>[20]</code> over leaves <code>[10]</code> and <code>[30 40 50]</code>. You insert review <code>60</code>. The leaf it belongs in is full, and it is <strong>not</strong> the root. What happens?',
+      options: ['New root added; height becomes 3', 'Whole tree rebuilt; height becomes 3', 'Median moves up; height stays 2', 'Page simply grows to four keys'], answer: 2,
+      explain: `The full leaf splits: its median <code>40</code> moves up into the root, giving <code>[20 40]</code> over <code>[10] [30] [50 60]</code>. The parent had room, so the height doesn't change. A non-root split never adds a level.${c(COMER, 'Comer')}` },
+
+    { layer: 'review · b-tree',
+      q: '<em>From lesson 2.1:</em> the <code>_id</code> index of <code>store.reviews</code> has height 3. You load a million more reviews and hundreds of leaf pages split. In the classic B-tree, what single event makes it height 4?',
+      options: ['A leaf page splits twice', 'The root page itself splits', 'An internal page gets full', 'The checkpoint rewrites every page'], answer: 1,
+      explain: `A B-tree grows from the top. Only a root split creates a new root above it, which pushes every leaf one level deeper at once. Leaf and internal splits just push a median up into a parent that has room.${c(COMER, 'Comer')}` },
+
+    { layer: 'snapshots',
+      q: 'A snapshot was taken with <strong>min 105, max 115, concurrent [112]</strong>. By now all four transactions below have committed and updated the same review. Whose update can this snapshot see?',
+      options: ['Txn 112', 'Txn 118', 'Txn 115', 'Txn 108'], answer: 3,
+      explain: `115 and 118 are ≥ max: they started after the snapshot. 112 is in the concurrent list: it wasn't committed when the snapshot was taken. 108 is in range and not concurrent, so it's visible. Committing later doesn't change what an old snapshot sees.${c(SNAP, 'WT snapshot')}` },
+
+    { layer: 'conflicts',
+      q: 'Two app servers run <code>updateOne({_id: R}, {$inc: {helpful: 1}})</code> on the same review at the same moment, no transaction. What does your app see?',
+      options: ['Both succeed, helpful +2', 'One gets WriteConflict error', 'One update silently lost', 'Collection lock serializes them'], answer: 0,
+      explain: `WiredTiger rejects the second writer with <code>WT_ROLLBACK</code>, MongoDB turns that into a <code>WriteConflictException</code>, and <code>writeConflictRetry</code> retries it inside the server. Both succeed; only <code>writeConflicts</code> shows it happened. In the lab: 10,000 votes, ~1,700 conflicts, helpful = 10,000.${c(STORAGE, 'storage README')}` },
+
+    { layer: 'conflicts',
+      q: 'Inside a multi-document transaction, your update hits a review that another, still-open transaction already changed. What happens?',
+      options: ['MongoDB retries the update internally', 'Your update waits for commit', 'Transaction aborts; retry whole transaction', 'Both changes are merged together'], answer: 2,
+      explain: `Inside a transaction there's no server-side retry. You get <code>WriteConflict</code> with the <code>TransientTransactionError</code> label, and your code or <code>withTransaction</code> retries the whole transaction. In the lab it failed in about 1 ms.${c(TXNDOCS + '#std-label-transactions-write-conflicts', 'txn docs')}` },
+
+    { layer: 'conflicts',
+      q: 'A transaction updated review R and is still open. A plain <code>updateOne</code> on R (no transaction) arrives. What happened in the lab?',
+      options: ['It failed immediately with WriteConflict', 'It overwrote the transaction\'s change', 'It took an exclusive lock', 'It kept retrying until commit'], answer: 3,
+      explain: `The docs say the write "waits until the transaction ends". It does that by retrying: 204 write conflicts in 2 s, <code>waitingForLock: false</code>, collection lock still only IX (<code>w</code>).${c(TXNDOCS + '#std-label-transactions-write-conflicts', 'txn docs')}` },
+
+    { layer: 'locks',
+      q: 'An <code>updateOne</code> on <code>store.reviews</code> holds the collection lock in which mode?',
+      options: ['Mode X, exclusive', 'Mode IX, intent-exclusive', 'Mode S, shared', 'Mode IS, intent-shared'], answer: 1,
+      explain: `WiredTiger "uses only intent locks at the global, database and collection levels" for normal reads and writes. IX is compatible with IX, so many writers work in the collection at once, and WiredTiger handles each document. It shows as <code>w</code> in <code>serverStatus().locks</code>.${c(FAQ, 'concurrency FAQ')}` },
+
+    { layer: 'history',
+      q: 'A report opens a snapshot transaction, reads one review, and sits idle while 300,000 votes are written. Which stat jumps?',
+      options: ['Pinned transaction ID range', 'Pages read into cache', 'Write conflicts per second', 'Read tickets available now'], answer: 0,
+      explain: `<code>transaction range of IDs currently pinned</code> went from ~0 to 300,018 in the lab. The votes didn't touch the review the report read, so there were no conflicts. But the report <em>could</em> read any of them, so no old version could be thrown away.${c(HS, 'WT history store')}` },
+
+    { layer: 'history',
+      q: 'Why does that idle transaction put pressure on the cache?',
+      options: ['It holds an exclusive lock', 'It re-reads every page constantly', 'Old versions cannot be discarded', 'It disables the eviction threads'], answer: 2,
+      explain: `Update chains keep growing and their pages stay dirty. Reconciliation then has to write the old versions to the history store. MongoDB's 60 s <code>transactionLifetimeLimitSeconds</code> exists partly "to relieve storage cache pressure".${c(TXNDOCS, 'txn docs')}` },
+
+    { layer: 'history',
+      q: 'A replica set has <strong>no</strong> open transactions. By default, how long does MongoDB keep old versions of a review?',
+      options: ['Not at all', 'About 60 seconds', 'About 300 seconds', 'Until next checkpoint'], answer: 2,
+      explain: `<code>minSnapshotHistoryWindowInSeconds</code> defaults to 300, so snapshot reads at a past cluster time keep working. In the lab, the default window wrote about as much to the history store as an open transaction did.${c(PARAMS, 'params')}` }
+  ]
+});
+</script>
+</body>
+</html>

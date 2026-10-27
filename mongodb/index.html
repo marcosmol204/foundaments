@@ -36,18 +36,21 @@
       <span class="title">The cache</span>
       <span class="desc">How pages move between disk and memory, and who pays when it's slow.</span>
     </a></li>
-    <li class="upcoming"><div>
+    <li><a href="lessons/0004-concurrency.html">
       <span class="num">0004</span>
-      <span>Concurrency: snapshots and write conflicts <span class="tag layer">next</span></span>
-    </div></li>
-    <li class="upcoming"><div>
+      <span class="title">Concurrency: snapshots and write conflicts</span>
+      <span class="desc">How snapshots let readers and writers share a document, why two writers conflict, and why one idle transaction makes the server keep history.</span>
+    </a></li>
+    <li><a href="lessons/0005-durability.html">
       <span class="num">0005</span>
-      <span>Durability: journal and checkpoints</span>
-    </div></li>
-    <li class="upcoming"><div>
+      <span class="title">Durability: journal and checkpoints</span>
+      <span class="desc">When a write becomes crash-safe, how checkpoints build a new root, and reading crash recovery in the log.</span>
+    </a></li>
+    <li><a href="lessons/0006-one-write.html">
       <span class="num">0006</span>
-      <span>MongoDB on top: one write, end to end</span>
-    </div></li>
+      <span class="title">MongoDB on top: one write, end to end</span>
+      <span class="desc">One majority insert through the driver, the real OP_MSG bytes, one storage transaction, the oplog and the commit point.</span>
+    </a></li>
   </ol>
 
   <h2>Reference</h2>
