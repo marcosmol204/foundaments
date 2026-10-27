@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 1 · Diagnostic</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="../assets/quiz.css">
+</head>
+<body>
+<main>
+  <div class="kicker">MongoDB Internals · Lesson 0001</div>
+  <h1>Where are you on the stack?</h1>
+  <p class="subtitle">A 20-question diagnostic, from basics to hard, so every later lesson lands in your zone.</p>
+
+  <p>MongoDB is a stack of layers. A request goes in through the <strong>wire protocol</strong> and the <strong>transport</strong> layer, gets dispatched as a command, passes through the query and replication layers, and reaches the <strong>storage engine</strong>, WiredTiger, which handles caching, durability and the bytes on disk. The full picture is in the <a href="../reference/architecture-map.html">architecture map</a>. Keep it open in another tab.</p>
+
+  <p>This quiz samples every layer at three difficulty tiers. It is <em>not</em> graded. It's a probe. Two rules make it useful:</p>
+  <ol>
+    <li><strong>Don't guess.</strong> If you don't know, press <em>"Don't know: show me"</em>. A lucky guess hides a gap I should teach.</li>
+    <li><strong>Read every explanation</strong>, even when you're right. Each one cites the source it comes from.</li>
+  </ol>
+
+  <div id="quiz"></div>
+
+  <h2>Part 2 · Free recall (answer in the terminal)</h2>
+  <p>Multiple choice tests recognition. These test whether you can <em>produce</em> the knowledge, which is what your mission needs (debugging, designing, teaching). Write a few sentences each, from memory, no searching. Paste them to me with your results.</p>
+  <ol>
+    <li><strong>Trace a write.</strong> Your app calls <code>insertOne(doc)</code> with <code>{ w: "majority" }</code>. List every layer and step you can think of, from the driver until the app gets its acknowledgement.</li>
+    <li><strong>Explain to a junior.</strong> In three sentences, what is the difference between a <em>checkpoint</em> and the <em>journal</em>, and why does MongoDB need both?</li>
+    <li><strong>Defend a decision.</strong> MongoDB secondaries <em>pull</em> the oplog instead of the primary pushing it. What do you think this buys, and what does it cost?</li>
+  </ol>
+  <p>Blank answers are useful too. They tell me where to start.</p>
+
+  <div class="callout source">
+    <p><a href="https://github.com/mongodb/mongo/blob/master/src/mongo/db/storage/README.md">Storage Engine API README: <code>src/mongo/db/storage/README.md</code></a>, in the MongoDB server repository.</p>
+    <p>We start at the engine, and this is where the server meets it. MongoDB engineers point to these READMEs as the most up-to-date source on internals.<a class="cite" href="https://www.mongodb.com/community/forums/t/is-there-any-one-stop-source-to-learn-the-internals-of-mongodb/209578">forum</a> Skim the section headings now (10 minutes). Don't try to understand all of it yet.</p>
+  </div>
+
+  <div class="callout ask">
+    <p>Any explanation unclear? A distractor that seemed just as right? Ask me in the terminal. I'm your teacher for this whole course, and "why is B wrong?" is a great question.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="../reference/architecture-map.html">Reference: architecture map</a>
+    <a href="0002-two-lookups.html">Lesson 0002: Two lookups →</a>
+  </nav>
+</main>
+
+<script src="../assets/quiz.js"></script>
+<script>
+const WT = 'https://www.mongodb.com/docs/manual/core/wiredtiger/';
+const JOURNAL = 'https://www.mongodb.com/docs/manual/core/journaling/';
+const WIRE = 'https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/';
+const STORAGE = 'https://github.com/mongodb/mongo/blob/master/src/mongo/db/storage/README.md';
+const REPL = 'https://github.com/mongodb/mongo/blob/master/src/mongo/db/repl/README.md';
+const TRANSPORT = 'https://github.com/mongodb/mongo/tree/master/src/mongo/transport';
+const BALANCER = 'https://www.mongodb.com/docs/manual/core/sharding-balancer-administration/';
+const EVICTION = 'https://source.wiredtiger.com/develop/arch-eviction.html';
+const NSDI = 'https://www.usenix.org/conference/nsdi21/presentation/zhou';
+const JEPSEN = 'https://jepsen.io/analyses/mongodb-4.2.6';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0001-diagnostic',
+  allowSkip: true,
+  questions: [
+    // ---------- Tier 1: Basics ----------
+    { tier: 1, layer: 'engine',
+      q: 'Which storage engine has been MongoDB\'s default since version 3.2?',
+      options: ['MMAPv1', 'WiredTiger', 'RocksDB', 'InMemory'], answer: 1,
+      explain: `WiredTiger is the default engine.${c('https://www.mongodb.com/docs/v3.2/core/wiredtiger/', '3.2 docs')} MMAPv1 was the original engine. Most of this course is about WiredTiger's design: MVCC snapshots, a cache with eviction, a journal, and checkpoints.${c(WT, 'docs')}` },
+
+    { tier: 1, layer: 'transport',
+      q: 'In what format are documents encoded on the wire?',
+      options: ['JSON', 'Protobuf', 'MessagePack', 'BSON'], answer: 3,
+      explain: `BSON. In the wire protocol, an OP_MSG body section is a single BSON object, and document sequences are BSON objects placed back to back.${c(WIRE, 'wire protocol')} JSON is what you <em>see</em> in mongosh. The server and drivers send binary BSON.` },
+
+    { tier: 1, layer: 'engine',
+      q: 'What is the finest granularity at which WiredTiger lets concurrent writes proceed?',
+      options: ['Per document', 'Per collection', 'Per database', 'Per instance'], answer: 0,
+      explain: `Document-level concurrency. WiredTiger uses <strong>optimistic</strong> concurrency control and takes only intent locks at the global, database and collection levels. When two writes touch the same document, one gets a <em>write conflict</em> and MongoDB retries it transparently.${c(WT, 'docs')}${c(STORAGE, 'storage README')}` },
+
+    { tier: 1, layer: 'engine',
+      q: 'What does the journal (write-ahead log) protect?',
+      options: ['Index definitions for every collection', 'Query plans cached by optimizer', 'Writes made since last checkpoint', 'User credentials and role grants'], answer: 2,
+      explain: `The journal persists every change made between checkpoints. After an unclean shutdown, MongoDB loads the last checkpoint and replays the journal from there.${c(WT, 'docs')}${c(JOURNAL, 'journaling')}` },
+
+    { tier: 1, layer: 'replication',
+      q: 'Secondaries replicate by reading which collection from their sync source?',
+      options: ['admin.system.users', 'local.oplog.rs', 'config.chunks', 'local.startup_log'], answer: 1,
+      explain: `The oplog, <code>local.oplog.rs</code>, is a capped collection.${c(STORAGE, 'storage README')} A secondary's <em>OplogFetcher</em> reads it from the sync source with an exhaust cursor and buffers the entries so they can be applied.${c(REPL, 'repl README')}` },
+
+    { tier: 1, layer: 'transport',
+      q: 'Since MongoDB 5.1, which opcode carries almost every client request and server reply?',
+      options: ['OP_QUERY', 'OP_INSERT', 'OP_REPLY', 'OP_MSG'], answer: 3,
+      explain: `OP_MSG (opcode 2013) carries both requests and replies. The legacy opcodes (OP_QUERY, OP_INSERT, OP_REPLY, …) were deprecated in 5.0 and removed in 5.1. One exception remains: OP_QUERY still works for <code>hello</code>/<code>isMaster</code> during the connection handshake.${c(WIRE, 'wire protocol')}` },
+
+    // ---------- Tier 2: Intermediate ----------
+    { tier: 2, layer: 'engine',
+      q: 'A dedicated server has 16 GB RAM. What is WiredTiger\'s default internal cache size?',
+      options: ['7.5 GB', '8 GB', '12 GB', '4 GB'], answer: 0,
+      explain: `The default is the larger of 50% of (RAM − 1 GB) or 0.256 GB, so 0.5 × (16 − 1) = 7.5 GB. The rest of RAM isn't wasted: the OS filesystem cache holds the <em>compressed</em> data files. This is why MongoDB effectively caches data twice, in two formats.${c(WT, 'docs')}` },
+
+    { tier: 2, layer: 'engine',
+      q: 'On disk, how does WiredTiger store a collection that has three indexes in total (including <code>_id</code>)?',
+      options: ['One file holding all structures', 'One file per database namespace', 'Four separate WiredTiger table files', 'Interleaved pages within one file'], answer: 2,
+      explain: `Each collection and each index is its own WiredTiger table, called an <em>ident</em>, with its own <code>.wt</code> file: <code>collection-&lt;id&gt;</code> and <code>index-&lt;id&gt;</code>. Index entries point to documents through a <strong>RecordId</strong>, so changing a RecordId is expensive.${c(STORAGE, 'storage README')}` },
+
+    { tier: 2, layer: 'engine',
+      q: '<code>mongod</code> crashes halfway through writing a new checkpoint. Recovery starts from:',
+      options: ['A secondary\'s oplog copy', 'The partial new checkpoint', 'The oldest journal file', 'The previous valid checkpoint'], answer: 3,
+      explain: `The previous checkpoint stays valid until the new one is fully committed. Recovery finds the last checkpoint, locates the matching journal record, and replays everything after it.${c(WT, 'docs')}${c(JOURNAL, 'journaling')} This "never overwrite the last good state" idea comes up again and again in database design.` },
+
+    { tier: 2, layer: 'engine',
+      q: 'By default, how often does WiredTiger sync buffered journal records to disk (current docs)?',
+      options: ['50 milliseconds', '100 milliseconds', '60 seconds', '1 second'], answer: 1,
+      explain: `Every 100 ms (<code>storage.journal.commitIntervalMs</code>). Very old docs said 50 ms. Checkpoints are the 60 s cycle. A write with <code>j: true</code> forces a journal sync before it is acknowledged. Without it, a hard crash can lose up to one interval of acknowledged writes.${c(JOURNAL, 'journaling')}` },
+
+    { tier: 2, layer: 'replication',
+      q: 'Why does the oplog record an <code>$inc</code> update as a <code>$set</code> of the final value?',
+      options: ['So reapplying is safe', 'So documents compress better', 'So indexes skip updates', 'So locks are avoided'], answer: 0,
+      explain: `Oplog entries are rewritten to be <strong>idempotent</strong>: applying one twice gives the same result as applying it once. Replaying <code>$inc: 1</code> twice would double-count. Replaying <code>$set: 43</code> twice is harmless. Recovery and initial sync rely on this.${c(REPL, 'repl README')}` },
+
+    { tier: 2, layer: 'transport',
+      q: 'What is an OP_MSG "kind 1" section for?',
+      options: ['Encrypt each document with separate keys', 'Mark documents for the change stream', 'Let secondaries pull documents in order', 'Stream many documents outside the body'], answer: 3,
+      explain: `A kind 1 section is a <em>document sequence</em>: BSON documents placed back to back that stand in for one field of the body. Each document must fit within <code>maxBSONObjectSize</code>, but the sequence as a whole is not limited to that size. This makes large batches efficient without building one giant BSON array.${c(WIRE, 'wire protocol')}` },
+
+    { tier: 2, layer: 'sharding',
+      q: 'Which process runs the sharded-cluster balancer?',
+      options: ['Each mongos router independently', 'The config server primary', 'The largest shard\'s primary', 'A dedicated arbiter node'], answer: 1,
+      explain: `The balancer is a background process on the <strong>config server replica set (CSRS) primary</strong>. Even the balancing window is read in the CSRS primary's local time zone.${c(BALANCER, 'balancer docs')}` },
+
+    // ---------- Tier 3: Hard ----------
+    { tier: 3, layer: 'sharding',
+      q: 'With the default 128 MB range size, how large must the data difference between two shards be (for one collection) before the balancer migrates?',
+      options: ['128 MB', '256 MB', '384 MB', '1 GB'], answer: 2,
+      explain: `A collection counts as balanced while the difference between shards is under 3 × the range size, which is 384 MB here. Each shard can take part in only one migration at a time, and a cluster with <em>n</em> shards runs at most ⌊n/2⌋ migrations at once.${c(BALANCER, 'balancer docs')}` },
+
+    { tier: 3, layer: 'replication',
+      q: 'Where is a <code>readConcern: "majority"</code> read served from?',
+      options: ['The node\'s majority-committed snapshot', 'A quorum of secondaries', 'The primary\'s latest writes', 'The journal before flushing'], answer: 0,
+      explain: `A common misconception is that the server queries several nodes. It doesn't. A single node does a <em>timestamped read</em> at its committed snapshot: the point up to which every write has reached a majority. That data cannot be rolled back. This depends on WiredTiger keeping old versions (MVCC). That's an engine feature showing up in replication semantics.${c(REPL, 'repl README')}` },
+
+    { tier: 3, layer: 'engine',
+      q: 'Production symptom: p99 latency spikes whenever the WiredTiger cache nears full. Most likely engine mechanism?',
+      options: ['Checkpoint locks the entire collection', 'Journal switches to synchronous mode', 'Application threads forced into eviction', 'Oplog stops accepting new entries'], answer: 2,
+      explain: `Below <code>eviction_trigger</code>, background eviction workers keep the cache in check. Above it, <strong>application threads</strong>, the ones running your queries, have to evict pages before they can read or write. When dirty data reaches <code>eviction_dirty_trigger</code>, they get throttled. Your request ends up doing housekeeping, and tail latency spikes.${c(EVICTION, 'WT arch guide')}` },
+
+    { tier: 3, layer: 'replication',
+      q: 'How does MongoDB\'s consensus protocol differ from textbook Raft?',
+      options: ['Primary pushes entries to followers', 'Commits need every node acknowledging', 'Elections never increment a term', 'Secondaries pull entries from peers'], answer: 3,
+      explain: `PV1 is built on Raft, but replication is <strong>pull-based</strong>. Any node can sync from any other node, which allows chained topologies and cheaper cross-datacenter traffic. In vanilla Raft, the leader pushes.${c(NSDI, 'NSDI \'21')}${c(REPL, 'repl README')}` },
+
+    { tier: 3, layer: 'replication',
+      q: 'Concurrent writes can leave "holes" in the oplog. Why?',
+      options: ['Network drops lose some oplog entries', 'Commits finish out of timestamp order', 'Deletes leave gaps in capped collections', 'Small entries are skipped by compression'], answer: 1,
+      explain: `Writes get oplog timestamps <em>before</em> they commit, and a later timestamp can commit first. For a moment, an earlier slot is still empty. Readers moving forward through the oplog, such as secondaries, must not read past that hole or they'd skip an entry forever. MongoDB tracks a visibility point (<code>oplogReadTimestamp</code>) for this reason.${c(STORAGE, 'storage README')}` },
+
+    { tier: 3, layer: 'transport',
+      q: 'How many request/response WorkItems can one server-side <code>SessionWorkflow</code> have in progress at once?',
+      options: ['One at a time', 'Up to four concurrently', 'One per open cursor', 'Unlimited, fully pipelined requests'], answer: 0,
+      explain: `"A SessionWorkflow can only have one WorkItem in progress at a time."${c(TRANSPORT, 'transport README')} One connection carries one in-flight operation (exhaust replies are a special case). The practical consequence: concurrency comes from <em>many connections</em>, which is why connection pool sizing matters so much in production.` },
+
+    { tier: 3, layer: 'transactions',
+      q: 'A transaction uses <code>readConcern: "snapshot"</code>. Its snapshot guarantee holds only if it commits with:',
+      options: ['w: 1', 'w: 0', 'w: majority', 'j: false'], answer: 2,
+      explain: `Snapshot guarantees hold only when the transaction commits with <code>writeConcern: "majority"</code>, even for read-only transactions. Jepsen's 2020 analysis of 4.2.6 highlighted exactly this kind of trap in the defaults.${c(JEPSEN, 'Jepsen')} Mastery means knowing what each knob <em>actually</em> guarantees.` }
+  ]
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 2 · Two Lookups</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="../assets/quiz.css">
+</head>
+<body>
+<main>
+  <div class="kicker">MongoDB Internals · Lesson 0002 · Phase 1: The engine</div>
+  <h1>Two lookups</h1>
+  <p class="subtitle">You already use indexes. Here is what an index and a collection actually <em>are</em> inside the storage engine.</p>
+
+  <p><strong>Your win today:</strong> look at an <code>explain()</code> plan and describe, in engine terms, exactly which data structures MongoDB touched and how many times.</p>
+
+  <h2>1 · Two layers inside one <code>mongod</code></h2>
+  <p>A single <code>mongod</code> process holds two very different pieces of software:</p>
+  <ul>
+    <li><strong>The MongoDB layer</strong> understands documents, query filters, aggregation, replication and sharding. Everything you've used so far lives here.</li>
+    <li><strong>The storage engine</strong>, WiredTiger, understands much less: <em>tables</em> of sorted <em>keys</em> and <em>values</em>, plus transactions, caching and durability.<a class="cite" href="https://source.wiredtiger.com/develop/arch-btree.html">WT B-trees</a></li>
+  </ul>
+  <p>They talk through a small, fixed interface, the <strong>storage engine API</strong>. Its two main pieces map onto things you know:<a class="cite" href="https://github.com/mongodb/mongo/blob/master/src/mongo/db/storage/README.md">storage README</a></p>
+  <table>
+    <tr><th>You know it as</th><th>MongoDB layer calls it</th><th>WiredTiger stores it as</th></tr>
+    <tr><td>a collection</td><td><code>RecordStore</code></td><td>a table: <strong>RecordId → BSON document</strong></td></tr>
+    <tr><td>an index</td><td><code>SortedDataInterface</code></td><td>a table: <strong>index key → RecordId</strong></td></tr>
+  </table>
+  <p>A <strong>RecordId</strong> is the storage engine's internal address for a document. Indexes point to RecordIds, so changing a document's RecordId would be expensive: every index entry for that document would have to change.<a class="cite" href="https://github.com/mongodb/mongo/blob/master/src/mongo/db/storage/README.md">storage README</a> Each table is its own file on disk, called an <em>ident</em>: <code>collection-&lt;id&gt;.wt</code> or <code>index-&lt;id&gt;.wt</code>. You'll see them in the lab.</p>
+
+  <h2>2 · Every table is a B-tree</h2>
+  <p>WiredTiger keeps each table as a <strong>B-tree</strong>, a tree of <em>pages</em>. "The root and internal pages only store keys and references to other pages, while leaf pages store keys and values." Records are kept <em>sorted by key</em>.<a class="cite" href="https://source.wiredtiger.com/develop/arch-btree.html">WT arch guide</a></p>
+  <p>Two operations follow from that shape:</p>
+  <ul>
+    <li><strong>Seek:</strong> walk from the root down to the one leaf where a key belongs. This takes only a few page hops, even for huge tables.</li>
+    <li><strong>Range scan:</strong> once at a leaf, read keys in sorted order until they stop matching.</li>
+  </ul>
+  <p>Take your <code>reviews</code> collection with a compound index <code>{verified: 1, rating: 1}</code>. Its keys are sorted by <code>verified</code> first (<code>false</code> before <code>true</code>), then by <code>rating</code>. So all the <code>{verified: true, rating: 5}</code> entries sit next to each other. That is the real reason prefix rules exist: the engine can seek to <code>verified: true</code> because <code>verified</code> comes first. It can't seek straight to <code>rating: 5</code>, because those entries are split between the <code>false</code> part and the <code>true</code> part of the tree. In the lab, the planner chose a full collection scan for <code>find({rating: 5})</code>.</p>
+
+  <h2>2b · B-tree concepts, step by step <span class="tag layer">added after your feedback</span></h2>
+  <p>Before the two-tree picture, here is <em>one</em> tree, slowly: the <code>reviews</code> collection table. Its keys are RecordIds. To keep it simple, there are only nine reviews, with RecordIds <code>1</code> … <code>9</code>.</p>
+
+  <h3>The vocabulary</h3>
+  <table>
+    <tr><th>Term</th><th>What it is</th></tr>
+    <tr><td><strong>Page</strong></td><td>A block of sorted entries. It is the unit WiredTiger reads from disk, keeps in memory, and writes back. A tree is made of pages.</td></tr>
+    <tr><td><strong>Leaf page</strong></td><td>The bottom level. It holds the <em>real data</em>: key/value pairs in sorted order. In a collection table, a leaf holds RecordId → document. In an index table, it holds index key → RecordId.</td></tr>
+    <tr><td><strong>Internal page</strong></td><td>A signpost. It holds only <em>separator keys</em> and <em>pointers to child pages</em>, never the data itself. "Keys below 4, go left."</td></tr>
+    <tr><td><strong>Root page</strong></td><td>The top internal page. Every search starts here.</td></tr>
+    <tr><td><strong>Depth</strong></td><td>The number of levels from root to leaf. A seek visits one page per level.</td></tr>
+    <tr><td><strong>Split</strong></td><td>When a page reaches its size limit, it splits in two. That's how the tree grows.<a class="cite" href="https://source.wiredtiger.com/develop/arch-btree.html">WT B-trees</a></td></tr>
+  </table>
+
+  <figure>
+    <svg viewBox="0 0 680 250" role="img" aria-label="A two-level B-tree of the reviews collection. The root holds separator keys 4 and 7 and three child pointers. Three leaf pages hold RecordIds 1 to 3, 4 to 6, and 7 to 9, each with its review document. The path to RecordId 8 is highlighted.">
+      <text class="lbl-sm" x="20" y="38">ROOT</text><text class="lbl-sm" x="20" y="52">(internal page)</text>
+      <rect class="box" x="230" y="20" width="220" height="44" rx="4"/>
+      <circle cx="255" cy="42" r="5" fill="var(--muted)"/><text class="lbl" x="282" y="47">4</text>
+      <circle cx="340" cy="42" r="5" fill="var(--muted)"/><text class="lbl" x="367" y="47">7</text>
+      <circle cx="425" cy="42" r="6" fill="var(--accent)"/>
+      <path class="edge" d="M255 47 L115 150"/><path class="edge" d="M340 47 L340 150"/><path class="edge-accent" d="M425 48 L565 150"/>
+      <text class="lbl-sm" x="128" y="108">&lt; 4</text><text class="lbl-sm" x="348" y="108">4 … 6</text><text class="lbl-sm" x="508" y="108" style="fill: var(--accent)">≥ 7</text>
+      <text class="lbl-sm" x="20" y="174">LEAVES</text>
+      <rect class="box" x="20" y="150" width="190" height="44" rx="4"/><text class="lbl" x="66" y="177">1   2   3</text>
+      <rect class="box" x="245" y="150" width="190" height="44" rx="4"/><text class="lbl" x="291" y="177">4   5   6</text>
+      <rect class="box-accent" x="470" y="150" width="190" height="44" rx="4"/><text class="lbl" x="516" y="177">7   <tspan font-weight="700" style="fill: var(--accent)">8</tspan>   9</text>
+      <text class="lbl-sm" x="20" y="214">Each leaf entry is RecordId → the review document, sorted left → right.</text>
+      <text class="lbl-sm" x="20" y="232">e.g. 8 → { review: "Overall best purchase this year…", rating: 5, tags: […], verified: true }</text>
+    </svg>
+    <figcaption>A two-level tree: one root, three leaves. The highlighted path is a seek for the review with RecordId <code>8</code>.</figcaption>
+  </figure>
+
+  <h3>Walkthrough 1 · Seek for RecordId <code>8</code></h3>
+  <ol>
+    <li>Start at the root. It has separators <code>4</code> and <code>7</code>, which split the key space into three ranges.</li>
+    <li>Compare: <code>8 ≥ 7</code>, so follow the third pointer.</li>
+    <li>You land on the third leaf. Search inside that page and find <code>8</code> along with its value, the review document.</li>
+  </ol>
+  <p>That's <strong>2 page visits</strong> (2 levels). Internal pages hold many separators each, so trees stay shallow even when they're large. Our 200,000-document lab collection had a depth of just <strong>3</strong>.</p>
+
+  <h3>Walkthrough 2 · Range scan from <code>4</code> to <code>8</code></h3>
+  <ol>
+    <li>Seek to <code>4</code> (root → middle leaf).</li>
+    <li>Read <code>4, 5, 6</code> in order. The page ends, so the cursor moves on to the next leaf in key order.</li>
+    <li>Read <code>7, 8</code>. The next key, <code>9</code>, is past the end, so stop.</li>
+  </ol>
+  <p>This is exactly what <code>IXSCAN</code> does in an index tree: <strong>one seek, then read in sorted order</strong>. Every key it reads counts toward <code>keysExamined</code>. A <code>COLLSCAN</code> is the same walk over <em>every</em> leaf of the collection tree.</p>
+
+  <h3>Real numbers from your lab server</h3>
+  <p>I ran this on <code>mongo:8.0</code> with 200,000 reviews (about 164 bytes each). You can repeat it with <code>db.reviews.stats({indexDetails: true})</code>: look at <code>wiredTiger.creationString</code> and <code>wiredTiger.btree</code>.</p>
+  <table>
+    <tr><th></th><th>Collection table</th><th>Index table (<code>verified_1_rating_1</code>)</th></tr>
+    <tr><td>Leaf entry</td><td>RecordId → BSON document</td><td>index key → RecordId</td></tr>
+    <tr><td>Max leaf page</td><td>32 KB</td><td>16 KB</td></tr>
+    <tr><td>Max internal page</td><td>4 KB</td><td>16 KB</td></tr>
+    <tr><td>Compression</td><td>snappy (block)</td><td>prefix compression<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a></td></tr>
+    <tr><td>Tree depth (200k docs)</td><td>3</td><td>n/a (stat not yet populated)</td></tr>
+  </table>
+
+  <h3>Pages live in two places</h3>
+  <p>Every page has an <strong>on-disk</strong> form, compressed inside the <code>.wt</code> file, and an <strong>in-memory</strong> form that WiredTiger reads into its cache.<a class="cite" href="https://source.wiredtiger.com/develop/arch-btree.html">WT B-trees</a> When you update a document, WiredTiger doesn't rewrite the page on the spot. It chains the change onto the in-memory page, in a list called the <em>update list</em>.<a class="cite" href="https://source.wiredtiger.com/develop/arch-btree.html">WT B-trees</a> Changed pages are written back to disk later. Lesson 3 (the cache) is about that "later".</p>
+
+  <div class="callout">
+    <p><strong>Where does the journal fit? It doesn't. It isn't part of any B-tree.</strong></p>
+    <p>The B-tree <code>.wt</code> files are the <em>organised</em> copy of your data. WiredTiger writes a consistent copy of them to disk at each <strong>checkpoint</strong>, every 60 seconds.<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a> The <strong>journal</strong> is a separate, append-only log (<code>journal/WiredTigerLog.*</code>, ~100 MB files). It records every change made <em>since</em> the last checkpoint and is synced to disk every 100 ms.<a class="cite" href="https://www.mongodb.com/docs/manual/core/journaling/">journaling</a></p>
+    <p>An analogy: the B-tree is a printed book, reprinted every 60 seconds. The journal is a diary of edits since the last printing. After a crash: take the last printing, then replay the diary. That's lesson 5.</p>
+  </div>
+
+  <h3>Counting files (you missed Q6, so here it is once more)</h3>
+  <p><strong>One table per collection + one table per index.</strong> <code>store.reviews</code> has the <code>_id</code> index (always created) and <code>verified_1_rating_1</code>. That's 1 + 2 = <strong>3 files</strong>: <code>collection-7</code>, <code>index-8</code>, <code>index-9</code>. With three indexes in total, it would be four.</p>
+
+  <h2>2c · Now, two trees together</h2>
+  <p>The picture below is just <strong>two</strong> of the trees above, side by side. On the left is the index table for <code>{verified: 1, rating: 1}</code>. Its keys are pairs, <code>(true, 5)</code>, meaning <em>verified true, rating 5</em>, sorted by verified and then by rating. Equal keys are allowed, since many reviews are verified 5★. Each key points to a RecordId (<code>→ 58</code>). On the right is the collection table. Its keys are RecordIds, and each points to the full review. The arrows show how a RecordId found in the index leads to a document in the collection.</p>
+
+  <figure>
+    <svg viewBox="0 0 680 310" role="img" aria-label="An index B-tree on verified and rating whose leaf entries map keys to RecordIds, with arrows into the reviews collection B-tree that maps RecordIds to review documents">
+      <text class="lbl-title" x="20" y="20">index-9-….wt · verified_1_rating_1</text>
+      <text class="lbl-title" x="400" y="20">collection-7-….wt · store.reviews</text>
+      <!-- index tree -->
+      <rect class="box" x="60" y="34" width="180" height="30" rx="4"/><text class="lbl-sm" x="78" y="54">root: keys + child refs</text>
+      <path class="edge" d="M70 64 C 4 70, 4 132, 20 132"/><path class="edge" d="M70 64 C 0 90, 0 232, 20 232"/>
+      <rect class="box" x="20" y="90" width="260" height="84" rx="4"/>
+      <text class="lbl" x="34" y="114">(true, 4) → 7</text><text class="lbl" x="34" y="138">(true, 4) → 57</text><text class="lbl" x="34" y="162">(true, 4) → 107</text>
+      <rect class="box-accent" x="20" y="190" width="260" height="84" rx="4"/>
+      <text class="lbl" x="34" y="214">(true, 5) → 8</text><text class="lbl" x="34" y="238">(true, 5) → 58</text><text class="lbl" x="34" y="262">(true, 5) → 108</text>
+      <!-- collection tree -->
+      <rect class="box" x="440" y="34" width="180" height="30" rx="4"/><text class="lbl-sm" x="458" y="54">root: keys + child refs</text>
+      <path class="edge" d="M610 64 C 676 70, 676 132, 660 132"/><path class="edge" d="M610 64 C 680 90, 680 232, 660 232"/>
+      <rect class="box" x="400" y="90" width="260" height="84" rx="4"/>
+      <text class="lbl" x="414" y="114">7   → { rating: 4, … }</text><text class="lbl" x="414" y="138">8   → { rating: 5, … }</text><text class="lbl" x="414" y="162">57  → { rating: 4, … }</text>
+      <rect class="box" x="400" y="190" width="260" height="84" rx="4"/>
+      <text class="lbl" x="414" y="214">58  → { rating: 5, … }</text><text class="lbl" x="414" y="238">107 → { rating: 4, … }</text><text class="lbl" x="414" y="262">108 → { rating: 5, … }</text>
+      <!-- fetch arrows -->
+      <defs><marker id="ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+      <path class="edge-accent" d="M282 210 C 340 210, 340 134, 398 134" marker-end="url(#ah)"/>
+      <path class="edge-accent" d="M282 234 C 340 234, 340 210, 398 210" marker-end="url(#ah)"/>
+      <path class="edge-accent" d="M282 258 L 398 258" marker-end="url(#ah)"/>
+      <text class="lbl-sm" x="20" y="298">IXSCAN: seek to (true, 5), scan the range</text>
+      <text class="lbl-sm" x="400" y="298">FETCH: one lookup per RecordId</text>
+    </svg>
+    <figcaption>Illustrative. Real leaves hold hundreds of entries, and the RecordIds are made up.</figcaption>
+  </figure>
+
+  <p><strong>Reading it for <code>find({verified: true, rating: 5})</code>:</strong></p>
+  <ol>
+    <li><strong>Seek in the index tree:</strong> root → the highlighted leaf where <code>(true, 5)</code> keys start. (Walkthrough 1, in the left tree.)</li>
+    <li><strong>Scan:</strong> read the three <code>(true, 5)</code> entries in order, then stop at the first key that isn't <code>(true, 5)</code>. That's 3 keys examined, giving RecordIds 8, 58 and 108. (Walkthrough 2.)</li>
+    <li><strong>FETCH:</strong> for each RecordId, do a fresh seek in the collection tree (root → leaf) to get the review. That's 3 docs examined.</li>
+    <li><strong>Total work:</strong> 1 index seek + 3 keys + 3 collection seeks. Notice the verified 5★ reviews are <em>not</em> next to each other in the collection tree (8, 58, 108). That's why each needs its own seek.</li>
+  </ol>
+
+  <h2>3 · Reading <code>explain()</code> with engine eyes</h2>
+  <p>The plan stages you have seen before now map onto tree operations:<a class="cite" href="https://www.mongodb.com/docs/manual/reference/explain-results/">explain docs</a></p>
+  <table>
+    <tr><th>Stage</th><th>What the engine does</th><th>Counted in</th></tr>
+    <tr><td><code>IXSCAN</code></td><td>Seeks into the <em>index</em> table, then range-scans its keys</td><td><code>totalKeysExamined</code></td></tr>
+    <tr><td><code>FETCH</code></td><td>For each RecordId, seeks into the <em>collection</em> table to get the document</td><td><code>totalDocsExamined</code></td></tr>
+    <tr><td><code>COLLSCAN</code></td><td>Walks <em>every</em> leaf of the collection table</td><td><code>totalDocsExamined</code></td></tr>
+  </table>
+  <p>A <strong>covered query</strong> is one where the index key alone holds every field you asked for. Then there is no <code>FETCH</code> at all: one B-tree instead of two.<a class="cite" href="https://www.mongodb.com/docs/manual/reference/explain-results/">explain docs</a> Note that <code>_id</code> is returned by default. If it isn't in the index, the query isn't covered.</p>
+
+  <h2>3b · From Q3 to a best practice: cover your hot queries <span class="tag layer">added after your feedback</span></h2>
+  <p>Q3 asked which query avoids <code>FETCH</code>. That turns into a real performance rule:</p>
+  <div class="callout">
+    <p><strong>For a query that runs very often, make it <em>covered</em>.</strong> Put every field it filters on, sorts on and returns into one index, and project only those fields, with <code>_id: 0</code> unless <code>_id</code> is in the index.</p>
+  </div>
+
+  <h3>Measured on the lab server (200k reviews, ~164-byte documents)</h3>
+  <p>Query <code>find({verified: true, rating: {$gte: 4}})</code>, the verified positive reviews, matches 97,789 reviews, with index <code>{verified: 1, rating: 1}</code>. Best of 5 runs:</p>
+  <table>
+    <tr><th>Variant</th><th>Plan</th><th>keys</th><th>docs</th><th>time</th><th>bytes returned</th></tr>
+    <tr><td>No projection</td><td>FETCH ← IXSCAN</td><td>97,789</td><td>97,789</td><td>44 ms</td><td>15.6 MB</td></tr>
+    <tr><td><code>{rating: 1}</code></td><td>PROJECTION_SIMPLE ← FETCH ← IXSCAN</td><td>97,789</td><td>97,789</td><td>57 ms</td><td>3.2 MB</td></tr>
+    <tr><td><code>{_id: 0, rating: 1}</code></td><td>PROJECTION_COVERED ← IXSCAN</td><td>97,789</td><td><strong>0</strong></td><td><strong>31 ms</strong></td><td><strong>1.6 MB</strong></td></tr>
+  </table>
+  <p>Three lessons hide in that table:</p>
+  <ol>
+    <li><strong>The win comes from removing FETCH, not from projecting.</strong> Row 2 projects too, but still returns <code>_id</code>, so it still does 97,789 collection seeks. Inside the database it was even a bit slower, since it adds a projection stage. Projection alone only saves network bytes.<a class="cite" href="https://www.mongodb.com/docs/manual/core/query-optimization/">docs</a></li>
+    <li><strong>It gets better when data is cold.</strong> My data was all in cache, so the gap was only 44 → 31 ms. Index keys are smaller than documents and are "typically available in RAM". Documents may have to come from disk, and then each FETCH can cost a disk read.<a class="cite" href="https://www.mongodb.com/docs/manual/core/query-optimization/">docs</a></li>
+    <li><strong>Less data over the wire.</strong> 15.6 MB → 1.6 MB for the same rows, mostly because the <code>review</code> text stays behind. Your app server feels that too.</li>
+  </ol>
+
+  <h3>When a query <em>can't</em> be covered</h3>
+  <p>The official rules:<a class="cite" href="https://www.mongodb.com/docs/manual/core/query-optimization/">docs</a></p>
+  <ul>
+    <li>Every field in the filter <em>and</em> every returned field must be in the <strong>same</strong> index.</li>
+    <li>No equality-to-<code>null</code> predicates (<code>{field: null}</code>).</li>
+    <li>Multikey indexes can't cover queries over the <strong>array</strong> fields.</li>
+    <li>On a sharded cluster (via <code>mongos</code>), the index must contain the <strong>shard key</strong>.</li>
+    <li>Not every index type supports covering.</li>
+  </ul>
+
+  <h3>The trade-off: don't widen every index</h3>
+  <p>"In write operations, MongoDB must both write the change to the collection and update the index."<a class="cite" href="https://www.mongodb.com/docs/manual/core/query-optimization/">docs</a> In engine terms: <strong>every index is one more B-tree that every insert has to modify</strong>, and every update too if it changes an indexed field. Extra fields also make the index's pages bigger, so they take more cache. Cover the few queries that dominate your traffic, not all of them.</p>
+  <p><strong>Check it worked:</strong> in <code>explain("executionStats")</code>, you want <code>totalDocsExamined: 0</code> and no <code>FETCH</code> above the <code>IXSCAN</code>. On 8.0, the top stage shows as <code>PROJECTION_COVERED</code>.</p>
+
+  <div class="lab">
+    <p>About 10 minutes. You need Docker (you have it), nothing else. I ran every step on <code>mongo:8.0</code> (8.0.34). Run the commands from the <code>foundaments</code> folder.</p>
+    <ol>
+      <li>Start a throwaway server and load 1,000 reviews with the course seed script (the same data every time):
+<pre class="terminal"><code>docker run -d --rm --name mongo-lab mongo:8.0
+docker cp lessons/code/seed-reviews.js mongo-lab:/seed-reviews.js
+docker exec mongo-lab mongosh store --eval 'const N = 1000' --file /seed-reviews.js
+docker exec -it mongo-lab mongosh store</code></pre></li>
+      <li>Look at one review, then create the compound index (inside mongosh):
+<pre><code>db.reviews.findOne()
+db.reviews.createIndex({ verified: 1, rating: 1 })</code></pre></li>
+      <li>Find the WiredTiger tables behind your collection and its indexes:
+<pre><code>db.reviews.stats().wiredTiger.uri
+Object.entries(db.reviews.stats({indexDetails: true}).indexDetails)
+  .map(([name, d]) => [name, d.uri])</code></pre>
+<pre class="output"><code>statistics:table:collection-7-16307350036540476662
+[ [ '_id_', 'statistics:table:index-8-16307350036540476662' ],
+  [ 'verified_1_rating_1', 'statistics:table:index-9-16307350036540476662' ] ]</code></pre></li>
+      <li><strong>Predict first, then run.</strong> Before each command, write down the stages and the keys/docs counts you expect.
+<pre><code>const s = q => q.explain("executionStats").executionStats
+s(db.reviews.find({ verified: true, rating: 5 }))                                  // A
+s(db.reviews.find({ verified: true, rating: 5 }, { _id: 0, verified: 1, rating: 1 })) // B
+s(db.reviews.find({ rating: 5 }))                                                  // C</code></pre>
+      Check <code>totalKeysExamined</code>, <code>totalDocsExamined</code> and <code>nReturned</code>. To see stage names, use <code>.explain().queryPlanner.winningPlan</code>.</li>
+      <li>Leave mongosh (<code>exit</code>) and look at the files themselves:
+<pre class="terminal"><code>docker exec mongo-lab ls /data/db
+docker stop mongo-lab   # --rm deletes it</code></pre>
+      You'll see your <code>collection-7-…wt</code>, <code>index-8-…wt</code> and <code>index-9-…wt</code>. The other files (<code>WiredTigerHS.wt</code>, <code>journal/</code>, <code>_mdb_catalog.wt</code>…) are topics for upcoming lessons.</li>
+    </ol>
+  </div>
+
+  <h2>4 · Check yourself</h2>
+  <p>Answer from memory, without scrolling up. The effort of recalling is what makes it stick.</p>
+  <div id="quiz"></div>
+
+  <h2>Where this fits</h2>
+  <p>Today covered the engine's first job: <strong>organising data</strong> as B-tree tables. The next lessons each take one more job:</p>
+  <ol>
+    <li><s>Organise: collections and indexes are B-tree tables</s> ✓</li>
+    <li><strong>Cache:</strong> how pages move between disk and memory, and why that 7.5 GB number mattered</li>
+    <li><strong>Concurrency:</strong> snapshots (MVCC) and write conflicts, and how two writers avoid trampling each other</li>
+    <li><strong>Durability:</strong> journal and checkpoints, or what survives a crash</li>
+    <li><strong>MongoDB on top:</strong> one write traced end to end through every layer</li>
+  </ol>
+
+  <div class="callout source">
+    <p><a href="https://source.wiredtiger.com/develop/arch-btree.html">WiredTiger Architecture Guide: B-Trees</a>. A short page. Read it now that you know what a "table" is. Then skim the "Record Stores" and "Idents" sections of the <a href="https://github.com/mongodb/mongo/blob/master/src/mongo/db/storage/README.md">Storage Engine API README</a>.</p>
+  </div>
+
+  <div class="callout ask">
+    <p>Did a lab result surprise you? Did any prediction in step 4 come out wrong? Tell me in the terminal. A wrong prediction is the most valuable thing you can bring back. Ask me anything that's unclear.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="0001-diagnostic.html">← Lesson 0001: Diagnostic</a>
+    <a href="0002-1-btrees.html">Lesson 2.1: B-trees, deep dive →</a>
+  </nav>
+</main>
+
+<script src="../assets/quiz.js"></script>
+<script>
+const STORAGE = 'https://github.com/mongodb/mongo/blob/master/src/mongo/db/storage/README.md';
+const BTREE = 'https://source.wiredtiger.com/develop/arch-btree.html';
+const EXPLAIN = 'https://www.mongodb.com/docs/manual/reference/explain-results/';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0002-two-lookups',
+  questions: [
+    { layer: 'engine',
+      q: 'Inside WiredTiger, what does each entry in the <code>verified_1_rating_1</code> index table point to?',
+      options: ['The whole document', 'The document\'s _id', 'The document\'s RecordId', 'A page number'], answer: 2,
+      explain: `Index table = <strong>index key → RecordId</strong>. To get the document, MongoDB does a second lookup in the collection table, RecordId → BSON. That second lookup is the <code>FETCH</code> stage.${c(STORAGE, 'storage README')}` },
+
+    { layer: 'engine',
+      q: 'Plan is <code>FETCH ← IXSCAN</code>, with keysExamined 20 and docsExamined 20. In engine terms, what happened?',
+      options: ['Walked index range, then fetched each RecordId', 'Scanned whole collection, then filtered by index', 'Fetched documents first, then sorted their keys', 'Read index pages only, never touched documents'], answer: 0,
+      explain: `IXSCAN seeks into the index B-tree and reads 20 keys in order. FETCH then does 20 seeks into the collection B-tree, one per RecordId. Two trees, 20 + 20 lookups.${c(EXPLAIN, 'explain docs')}` },
+
+    { layer: 'engine',
+      q: 'With only <code>{verified: 1, rating: 1}</code> and <code>_id</code> indexed, which query needs <strong>no</strong> FETCH stage?',
+      options: ['find({verified: true}, {verified: 1, rating: 1})', 'find({verified: true}, {_id: 0, verified: 1, rating: 1})', 'find({tags: "price"}, {_id: 0, tags: 1, rating: 1})', 'find({verified: true}, {_id: 0, verified: 1, review: 1})'], answer: 1,
+      explain: `It's covered: every returned field is in the index key, and <code>_id</code> is excluded. Option A still returns <code>_id</code>, which isn't in this index, so it must FETCH. I checked that one: its plan is <code>PROJECTION_SIMPLE ← FETCH</code>. Option C filters on <code>tags</code>, which has no index, so it does a COLLSCAN. Option D asks for <code>review</code>, which isn't in the index key, so it must FETCH.${c(EXPLAIN, 'explain docs')}` },
+
+    { layer: 'engine',
+      q: 'With index <code>{verified: 1, rating: 1}</code>, why can MongoDB seek straight to <code>find({verified: true})</code> but not to <code>find({rating: 5})</code>?',
+      options: ['WiredTiger only indexes the first listed field', 'The rating field is stored inside documents', 'Queries on numbers always use collection scans', 'Keys are sorted by verified, then rating'], answer: 3,
+      explain: `B-tree keys are sorted by the whole compound key, verified first. Entries with <code>rating: 5</code> are split between the <code>false</code> and the <code>true</code> parts of the tree, so there's no single place to seek to. On the lab data, the planner chose a <code>COLLSCAN</code> (keys 0, docs 1000, 438 returned).${c(BTREE, 'WT B-trees')}` },
+
+    { layer: 'engine',
+      q: 'In a WiredTiger B-tree, where are the actual key/value records stored?',
+      options: ['In the root page', 'In the leaf pages', 'In the internal pages', 'In the journal files'], answer: 1,
+      explain: `"The root and internal pages only store keys and references to other pages, while leaf pages store keys and values."${c(BTREE, 'WT B-trees')}` },
+
+    { layer: 'engine',
+      q: '<em>Back from lesson 1:</em> a collection has three indexes in total, including <code>_id</code>. How many WiredTiger table files does it use?',
+      options: ['One', 'Two', 'Three', 'Four'], answer: 3,
+      explain: `One collection table plus one table per index makes four idents. In the lab, <code>store.reviews</code> with 2 indexes used 3 files: collection-7, index-8, index-9.${c(STORAGE, 'storage README')}` },
+
+    { layer: 'engine',
+      q: '<code>find({tags: "shipping"})</code>, with no index on tags, returns 177 of the 1000 reviews. What is <code>totalDocsExamined</code>?',
+      options: ['177', '0', '1177', '1000'], answer: 3,
+      explain: `COLLSCAN walks every leaf of the collection table and examines all 1000 reviews, then filters out 823. docsExamined counts what was <em>examined</em>, not what was returned. I measured exactly this in the lab: keys 0, docs 1000, n 177.${c(EXPLAIN, 'explain docs')}` },
+
+    { layer: 'engine',
+      q: 'Which part of <code>mongod</code> understands what a query filter like <code>{tags: "shipping"}</code> means?',
+      options: ['The MongoDB server layer', 'WiredTiger\'s B-tree page code', 'The journal and checkpoint', 'The operating system\'s filesystem'], answer: 0,
+      explain: `WiredTiger stores sorted keys and values. It doesn't know what a filter, a field or a document is. The MongoDB layer turns your query into seeks and scans on tables, through the storage engine API.${c(STORAGE, 'storage README')}` }
+  ]
+});
+</script>
+</body>
+</html>

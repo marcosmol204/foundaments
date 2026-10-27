@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MongoDB Architecture Map</title>
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .stack { display: grid; gap: 6px; margin: 1.5rem 0; }
+  .layer { display: grid; grid-template-columns: 11rem 1fr; gap: 1rem; border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; break-inside: avoid; }
+  .layer h3 { margin: 0; font-size: .95rem; }
+  .layer .path { font: .7rem 'JetBrains Mono', monospace; color: var(--muted); display: block; margin-top: .25rem; word-break: break-all; }
+  .layer p { margin: 0; font-size: .88rem; }
+  .layer.engine { border-left: 4px solid var(--accent); }
+  .layer.over { border-left: 4px solid var(--tier-2); }
+  .layer.wire { border-left: 4px solid var(--tier-1); }
+  .phase { font: 600 .68rem 'JetBrains Mono', monospace; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin: 1rem 0 .1rem; }
+  @media (max-width: 600px) { .layer { grid-template-columns: 1fr; gap: .3rem; } }
+</style>
+</head>
+<body>
+<main class="wide">
+  <div class="kicker">MongoDB Internals · Reference</div>
+  <h1>Architecture map</h1>
+  <p class="subtitle">The layers a request crosses, top to bottom, with where each lives in the source. Verified against the MongoDB 9.0 manual and the server repository (Oct 2026).</p>
+
+  <div class="stack">
+    <div class="phase">Phase 2 · Transport &amp; wire</div>
+    <div class="layer wire"><div><h3>Driver</h3><span class="path">client side</span></div>
+      <p>Connection pool and server selection (read preference). Encodes commands as BSON inside OP_MSG.</p></div>
+    <div class="layer wire"><div><h3>Wire protocol</h3><span class="path"><a href="https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/">spec</a></span></div>
+      <p>16-byte <code>MsgHeader</code> (length, requestID, responseTo, opCode; little-endian). <code>OP_MSG</code> = 2013: flagBits (<code>checksumPresent</code>, <code>moreToCome</code>, <code>exhaustAllowed</code>) + sections (kind 0 body, kind 1 document sequence) + optional CRC-32C. <code>OP_COMPRESSED</code> = 2012 (snappy, zlib, zstd). Legacy opcodes removed in 5.1.</p></div>
+    <div class="layer wire"><div><h3>Transport</h3><span class="path">src/mongo/transport/</span></div>
+      <p>One <code>Session</code> per connection → <code>ServiceEntryPoint</code> → <code>SessionWorkflow</code>, which runs <strong>one WorkItem at a time</strong>, plus exhaust and fire-and-forget modes.</p></div>
+    <div class="layer wire"><div><h3>Command dispatch</h3><span class="path">docs/command_dispatch.md</span></div>
+      <p>Parses the command, checks auth, and routes it to the command implementation.</p></div>
+
+    <div class="phase">Phase 3 · Layers built over the engine</div>
+    <div class="layer over"><div><h3>Query</h3><span class="path">src/mongo/db/query/, db/exec/</span></div>
+      <p>Planning and execution: classic engine and SBE, plus aggregation document sources. <em>(Lesson pending; see Gaps in RESOURCES.md.)</em></p></div>
+    <div class="layer over"><div><h3>Replication</h3><span class="path">src/mongo/db/repl/</span></div>
+      <p>Oplog <code>local.oplog.rs</code> (capped, idempotent entries). Secondaries <strong>pull</strong> from a sync source. PV1 elections are built on Raft. The majority commit point drives <code>w:"majority"</code> and <code>readConcern:"majority"</code>.</p></div>
+    <div class="layer over"><div><h3>Sharding</h3><span class="path">src/mongo/s/ (mongos), db/s/ (shard)</span></div>
+      <p><code>mongos</code> routes by shard key. The balancer runs on the CSRS primary. Default range size is 128 MB, and a migration happens once shards differ by 3× that.</p></div>
+
+    <div class="phase">Phase 1 · The engine</div>
+    <div class="layer engine"><div><h3>Storage engine API</h3><span class="path">src/mongo/db/storage/</span></div>
+      <p>Collection → <code>RecordStore</code>. Index → <code>SortedDataInterface</code>. Snapshot and transaction → <code>RecoveryUnit</code>. Atomic group of writes → <code>WriteUnitOfWork</code>. Conflicts raise <code>WriteConflictException</code> and are retried with back-off.</p></div>
+    <div class="layer engine"><div><h3>WiredTiger</h3><span class="path"><a href="https://source.wiredtiger.com/develop/arch-index.html">arch guide</a></span></div>
+      <p>B-trees. MVCC snapshots (snapshot isolation by default). Cache with eviction: workers first, then application threads past the trigger. History store <code>WiredTigerHS.wt</code>. Journal (WAL) synced every 100 ms. Checkpoints every 60 s.</p></div>
+    <div class="layer engine"><div><h3>Disk</h3><span class="path">dbPath</span></div>
+      <p><code>collection-&lt;id&gt;.wt</code> and <code>index-&lt;id&gt;.wt</code> (one table per ident). <code>journal/WiredTigerLog.NNNNNNNNNN</code> (~100 MB each, snappy-compressed).</p></div>
+  </div>
+
+  <h2>Key numbers</h2>
+  <table>
+    <tr><th>What</th><th>Default</th><th>Source</th></tr>
+    <tr><td>WT internal cache</td><td>max(50% × (RAM − 1 GB), 0.256 GB)</td><td><a href="https://www.mongodb.com/docs/manual/core/wiredtiger/">WiredTiger docs</a></td></tr>
+    <tr><td>Checkpoint interval</td><td>60 s</td><td><a href="https://www.mongodb.com/docs/manual/core/wiredtiger/">WiredTiger docs</a></td></tr>
+    <tr><td>Eviction thresholds (% of cache)</td><td>target 80 · trigger 95 · dirty target 5 · dirty trigger 20 (WT defaults, kept by MongoDB)</td><td><a href="https://source.wiredtiger.com/develop/struct_w_t___c_o_n_n_e_c_t_i_o_n.html">WT config</a></td></tr>
+    <tr><td>Eviction worker threads</td><td>4 (MongoDB 8.0 sets <code>threads_min=4,threads_max=4</code>)</td><td><a href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/wiredtiger/wiredtiger_kv_engine.cpp#L388">kv_engine.cpp</a></td></tr>
+    <tr><td>Journal sync</td><td>100 ms (<code>commitIntervalMs</code>)</td><td><a href="https://www.mongodb.com/docs/manual/core/journaling/">Journaling</a></td></tr>
+    <tr><td>Journal file size</td><td>~100 MB</td><td><a href="https://www.mongodb.com/docs/manual/core/journaling/">Journaling</a></td></tr>
+    <tr><td>Concurrent storage transactions</td><td>Dynamic since 7.0, max 128 read + 128 write</td><td><a href="https://www.mongodb.com/docs/manual/core/wiredtiger/">WiredTiger docs</a></td></tr>
+    <tr><td>Compression</td><td>Collections: snappy · Indexes: prefix · Journal: snappy · Time series: zstd</td><td><a href="https://www.mongodb.com/docs/manual/core/wiredtiger/">WiredTiger docs</a></td></tr>
+    <tr><td>Sync source max lag</td><td>30 s (<code>maxSyncSourceLagSecs</code>)</td><td><a href="https://github.com/mongodb/mongo/blob/master/src/mongo/db/repl/README.md">repl README</a></td></tr>
+    <tr><td>Balancer range size / threshold</td><td>128 MB / 3× (384 MB)</td><td><a href="https://www.mongodb.com/docs/manual/core/sharding-balancer-administration/">Balancer docs</a></td></tr>
+  </table>
+
+  <nav class="lesson-nav">
+    <a href="../lessons/0001-diagnostic.html">← Lesson 0001: Diagnostic</a>
+    <span></span>
+  </nav>
+</main>
+</body>
+</html>

@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 3 · The Cache</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="../assets/quiz.css">
+</head>
+<body>
+<main>
+  <div class="kicker">MongoDB Internals · Lesson 0003 · Phase 1: The engine</div>
+  <h1>The cache</h1>
+  <p class="subtitle">Pages live on disk. Queries only work on pages in memory. This lesson is about what moves them back and forth, and who pays when it's slow.</p>
+
+  <p><strong>Your win today:</strong> look at a latency problem and three numbers from <code>serverStatus()</code>, then say whether your working set fits in the cache, and whether your own queries are being forced to do eviction work.</p>
+
+  <h2>0 · Warm-up from lesson 2</h2>
+  <p>From memory, before reading on: a WiredTiger B-tree has a root page, internal pages and leaf pages. <em>Which ones hold the documents? Which ones does every single seek pass through?</em> Keep your answer in mind. Section 2 depends on it, and the quiz will ask again.</p>
+
+  <h2>1 · Two memories, two formats</h2>
+  <p>A page can be in three places. MongoDB uses <strong>two</strong> memory caches, not one.<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a></p>
+
+  <figure>
+    <svg viewBox="0 0 680 250" role="img" aria-label="A page on disk is compressed. The OS filesystem cache holds the same compressed bytes. The WiredTiger cache holds an uncompressed in-memory page. Reading decompresses and builds the page; evicting a dirty page reconciles it and writes it back.">
+      <defs><marker id="ah1" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+      <rect class="box" x="20" y="30" width="190" height="110" rx="6"/>
+      <text class="lbl-title" x="34" y="56">Disk</text>
+      <text class="lbl-sm" x="34" y="80">collection-…wt</text>
+      <text class="lbl-sm" x="34" y="98">compressed blocks</text>
+      <text class="lbl-sm" x="34" y="116">(snappy)</text>
+      <rect class="box" x="245" y="30" width="190" height="110" rx="6"/>
+      <text class="lbl-title" x="259" y="56">OS filesystem cache</text>
+      <text class="lbl-sm" x="259" y="80">same bytes as on disk</text>
+      <text class="lbl-sm" x="259" y="98">still compressed</text>
+      <text class="lbl-sm" x="259" y="116">uses all free RAM</text>
+      <rect class="box-accent" x="470" y="30" width="190" height="110" rx="6"/>
+      <text class="lbl-title" x="484" y="56">WiredTiger cache</text>
+      <text class="lbl-sm" x="484" y="80">in-memory pages</text>
+      <text class="lbl-sm" x="484" y="98">uncompressed docs</text>
+      <text class="lbl-sm" x="484" y="116">+ update lists</text>
+      <path class="edge-accent" d="M212 70 L243 70" marker-end="url(#ah1)"/>
+      <path class="edge-accent" d="M437 70 L468 70" marker-end="url(#ah1)"/>
+      <text class="lbl-sm" x="300" y="22">read: decompress + build page →</text>
+      <path class="edge" d="M565 142 C 565 210, 115 210, 115 144" marker-end="url(#ah1)"/>
+      <text class="lbl-sm" x="200" y="198">evict a dirty page: reconcile → write a new image</text>
+      <text class="lbl-sm" x="20" y="238">Only pages in the WiredTiger cache can be read or changed by a query.</text>
+    </svg>
+    <figcaption>One page, three places. The middle box is the operating system's, not MongoDB's.</figcaption>
+  </figure>
+
+  <ul>
+    <li><strong>WiredTiger cache.</strong> "Memory used to hold copies of recently accessed or modified data."<a class="cite" href="https://source.wiredtiger.com/develop/arch-cache.html">WT cache</a> Pages here use a different layout from disk, built for fast access by many threads. <em>Collection data is uncompressed here.</em> Indexes keep their prefix compression.<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a></li>
+    <li><strong>Filesystem cache.</strong> The OS keeps recently read file blocks in free RAM, in the same compressed format as on disk.<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a> If WiredTiger misses but the OS cache hits, the read costs a decompression, not a disk I/O.</li>
+  </ul>
+
+  <p><strong>That's why the 7.5 GB number from the diagnostic mattered.</strong> The default WiredTiger cache is the larger of 50% × (RAM − 1 GB) or 0.256 GB.<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a> On a 16 GB server that's 7.5 GB. The other half isn't wasted: it's the OS cache, which holds compressed data, so it fits more of your data per GB.</p>
+
+  <p><strong>In the lab</strong> (2,000,000 reviews, ~164 bytes each), <code>store.reviews</code> was <strong>314 MB</strong> uncompressed but only <strong>80 MB</strong> on disk. So the same reviews take about four times as much room in the WiredTiger cache as in the OS cache. (The seed script reuses a few phrases, so its text compresses better than real reviews would. The direction is the same, though.)</p>
+
+  <h2>2 · One page's life, step by step</h2>
+  <p>We follow a single leaf page of <code>store.reviews</code>. Call it <strong>P</strong>. Reviews are stored in RecordId order, which here is creation order, so P holds about 200 reviews written between 00:00 and 00:03 on 10 January 2026. The tree has depth 3, like the lab collection in lesson 2.</p>
+
+  <h3>Walkthrough 1 · First read (a miss)</h3>
+  <ol>
+    <li>Your app asks for the reviews of 10 January, so it needs the reviews on P. The seek starts at the root. The root and the internal page are already in cache, because <em>every</em> seek passes through them.</li>
+    <li>The internal page points to P, but P is not in cache. That's a <strong>miss</strong>. "Lookups start at the root and load any missing page from storage as they descend."<a class="cite" href="https://source.wiredtiger.com/develop/arch-cache.html">WT cache</a></li>
+    <li>WiredTiger asks the block manager for P's block. The OS serves it from its cache or from disk.</li>
+    <li>WiredTiger decompresses the block and builds the in-memory page, with an index for binary search inside it.<a class="cite" href="https://source.wiredtiger.com/develop/arch-cache.html">WT cache</a> Then the query reads its documents.</li>
+  </ol>
+
+  <h3>Walkthrough 2 · Second read (a hit)</h3>
+  <ol>
+    <li>The same query runs again. Root → internal → P, and all three are in memory.</li>
+    <li>No I/O and no decompression. In the lab, this made the same query <strong>about 1.6× faster</strong> (33–37 ms vs. 53–65 ms cold; numbers in section 5).</li>
+  </ol>
+
+  <h3>Walkthrough 3 · A write makes P dirty</h3>
+  <ol>
+    <li>A moderator edits one review on P, say <code>$addToSet: {tags: "moderated"}</code>. WiredTiger does <em>not</em> rewrite P on disk. It adds the change to P's in-memory <strong>update list</strong> (lesson 2).</li>
+    <li>P is now <strong>dirty</strong>: the in-memory copy is newer than the disk copy. The cache tracks clean bytes and dirty bytes separately.<a class="cite" href="https://source.wiredtiger.com/develop/arch-cache.html">WT cache</a></li>
+    <li>Is the change lost if the server crashes now? No. The journal has it (lesson 5). The <code>.wt</code> file just doesn't have it <em>yet</em>.</li>
+  </ol>
+
+  <h3>Walkthrough 4 · P gets evicted</h3>
+  <ol>
+    <li>Other pages keep arriving. P isn't used for a while, so it becomes one of the least recently used. Eviction sorts candidates by last access and takes the oldest third, "an approximate Least Recently Used (LRU) algorithm".<a class="cite" href="https://source.wiredtiger.com/develop/arch-eviction.html">WT eviction</a></li>
+    <li><strong>If P is clean:</strong> "WiredTiger simply frees the page's memory."<a class="cite" href="https://source.wiredtiger.com/develop/arch-cache.html">WT cache</a> That's cheap, because the disk copy is already correct.</li>
+    <li><strong>If P is dirty:</strong> WiredTiger must first <strong>reconcile</strong> it. Reconciliation turns it back into the on-disk format and writes it out. The latest values go to the data file, and older versions still needed by readers go to the <em>history store</em> (<code>WiredTigerHS.wt</code>, lesson 4).<a class="cite" href="https://source.wiredtiger.com/develop/arch-eviction.html">WT eviction</a> Only then is the memory freed. That's much more expensive.</li>
+    <li>The next query that needs P starts over at Walkthrough 1.</li>
+  </ol>
+  <p>Eviction isn't the only thing that writes dirty pages. <strong>Checkpoints</strong> write them too, every 60 seconds,<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a> but the pages stay in cache afterwards, now clean.<a class="cite" href="https://source.wiredtiger.com/develop/arch-cache.html">WT cache</a></p>
+
+  <h2>3 · Who does the evicting?</h2>
+  <p>Eviction normally runs in background <strong>eviction worker threads</strong>. MongoDB 8.0 starts exactly 4 of them (<code>eviction=(threads_min=4,threads_max=4)</code>).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/wiredtiger/wiredtiger_kv_engine.cpp#L388">kv_engine.cpp</a> When they can't keep up, the threads running <em>your queries</em> get pulled in: they "are also forced to do the work of eviction workers threads … before they can read or write more data."<a class="cite" href="https://source.wiredtiger.com/develop/arch-eviction.html">WT eviction</a></p>
+  <p>Four thresholds decide this. They are percentages of the cache size, and MongoDB keeps WiredTiger's defaults:<a class="cite" href="https://source.wiredtiger.com/develop/struct_w_t___c_o_n_n_e_c_t_i_o_n.html">WT config</a></p>
+
+  <figure>
+    <svg viewBox="0 0 680 210" role="img" aria-label="Two bars. Total cache: workers start evicting at 80 percent, application threads join at 95 percent. Dirty data: workers start at 5 percent, writers are throttled at 20 percent.">
+      <text class="lbl-title" x="40" y="22">All data in cache</text>
+      <rect x="40" y="32" width="480" height="22" fill="var(--accent-soft)" stroke="var(--accent)"/>
+      <rect x="520" y="32" width="90" height="22" fill="var(--warn-bg)" stroke="var(--warn)"/>
+      <rect x="610" y="32" width="30" height="22" fill="var(--bad-bg)" stroke="var(--bad)"/>
+      <text class="lbl-sm" x="48" y="47">nobody evicts</text>
+      <text class="lbl" x="508" y="72">80%</text><text class="lbl" x="598" y="72">95%</text>
+      <text class="lbl-sm" x="440" y="90">eviction_target: workers start</text>
+      <text class="lbl-sm" x="440" y="104" style="fill: var(--bad)">eviction_trigger: your threads too</text>
+
+      <text class="lbl-title" x="40" y="132">Dirty data in cache</text>
+      <rect x="40" y="142" width="30" height="22" fill="var(--accent-soft)" stroke="var(--accent)"/>
+      <rect x="70" y="142" width="90" height="22" fill="var(--warn-bg)" stroke="var(--warn)"/>
+      <rect x="160" y="142" width="480" height="22" fill="var(--bad-bg)" stroke="var(--bad)"/>
+      <text class="lbl" x="58" y="182">5%</text><text class="lbl" x="146" y="182">20%</text>
+      <text class="lbl-sm" x="176" y="157" style="fill: var(--bad)">past eviction_dirty_trigger: writers are throttled</text>
+      <text class="lbl-sm" x="40" y="200">eviction_dirty_target (5%): workers start writing dirty pages out</text>
+    </svg>
+    <figcaption>WiredTiger defaults (80 / 95 / 5 / 20). A third pair for "bytes of updates" defaults to half the dirty pair.<a class="cite" href="https://source.wiredtiger.com/develop/struct_w_t___c_o_n_n_e_c_t_i_o_n.html">WT config</a></figcaption>
+  </figure>
+
+  <p>Two consequences:</p>
+  <ul>
+    <li><strong>A cache that's ~80% full is normal.</strong> The workers hold it there on purpose. In the lab, right after loading, the cache sat at 203.9 of 256 MB, which is 79.6%. "Cache 80% full" alone is not an alert.</li>
+    <li><strong>The latency cliff is at the triggers.</strong> Past 95% full, or 20% dirty, your request does housekeeping before it can do its own work. That's the p99 spike from diagnostic Q16.</li>
+  </ul>
+
+  <h2>4 · Try it: a 20-page cache</h2>
+  <p>A small model with the same rules: LRU eviction, 80/95 total thresholds, 5/20 dirty thresholds. Clean evictions cost workers 1 unit and dirty ones cost 2. Read a few pages by hand first, then play the scenarios. <strong>Predict before you press play:</strong> what is the hit rate on the <em>second</em> pass of the scan?</p>
+  <div id="sim"></div>
+  <p>Things to try:</p>
+  <ol>
+    <li><strong>Hot set fits:</strong> 10 misses to warm up, then every read is a hit.</li>
+    <li><strong>Scan bigger than cache ×2:</strong> 60 pages through a 20-page cache. With LRU, the second pass gets <em>zero</em> hits: each page was evicted just before it was needed again.</li>
+    <li>Switch to <strong>workers too slow</strong> and run the scan again. The cache hits the trigger, and "by your thread" starts counting.</li>
+    <li><strong>Write burst:</strong> dirty pages cost workers twice as much, so writers reach the dirty trigger even with fast workers.</li>
+  </ol>
+  <p class="cs-legend">This is a teaching model. Real WiredTiger samples pages instead of keeping a perfect LRU list, and its pages vary in size.</p>
+
+  <h2>5 · What the real engine did</h2>
+  <p>I ran all of this on <code>mongo:8.0</code> (8.0.34) with the cache limited to 256 MB. <code>store.reviews</code> had 2,000,000 reviews: 314 MB of data, 80 MB on disk. The test query was "all reviews from 10 January", which is 86,400 reviews, read as an <code>_id</code> range (one review per second). You can repeat it in the lab below.</p>
+  <table>
+    <tr><th>Experiment</th><th>Pages read into cache</th><th>Result</th></tr>
+    <tr><td>One day of reviews, <strong>cold</strong> (restart + OS cache dropped)</td><td>253</td><td>53–65 ms</td></tr>
+    <tr><td>Same, <strong>OS cache warm</strong> (restart only)</td><td>253</td><td>41–47 ms (one run 78)</td></tr>
+    <tr><td>Same, <strong>WiredTiger cache warm</strong></td><td>0</td><td>33–37 ms</td></tr>
+    <tr><td>Full collection scan #1</td><td>3,020</td><td>1,518 pages evicted</td></tr>
+    <tr><td>Full collection scan #2, nothing changed</td><td><strong>2,567</strong></td><td>2,252 pages evicted</td></tr>
+    <tr><td>Backfill: verify every unverified review, one day per batch</td><td>n/a</td><td>dirty peaked at <strong>19.6%</strong>, dirty trigger reached 5 times, 2,866 dirty pages reconciled</td></tr>
+  </table>
+  <p>Times are <code>executionTimeMillis</code> for 4 runs each, on a laptop SSD. On networked cloud disks, each miss usually costs more, so the cold/warm gap gets bigger. Three things to notice:</p>
+  <ol>
+    <li><strong>A WiredTiger hit beats everything.</strong> On this fast SSD, a miss served by the OS cache wasn't reliably faster than a real disk read: the run-to-run noise was bigger than the gap. The clear win was having the pages already in the WiredTiger cache, with no I/O and no decompression.</li>
+    <li><strong>A scan bigger than the cache doesn't get faster the second time.</strong> 314 MB of uncompressed reviews can't fit in 256 MB. Scan #2 had to read ~2,500 pages again, like the simulator.</li>
+    <li><strong>The backfill walked right up to the cliff.</strong> Dirty data peaked at 19.6%, the "dirty trigger was reached" counter went up 5 times, and application threads were asked to evict 10 times. That's the edge from section 3. A slightly faster backfill, or one running next to normal traffic, would push your queries into eviction work.</li>
+  </ol>
+
+  <h2>6 · So in production you should…</h2>
+  <div class="callout">
+    <p><strong>Rule: keep your working set in the WiredTiger cache, and watch the read-in rate and application-thread eviction, not the fill percentage.</strong> The <em>working set</em> is the index pages and document pages your normal traffic touches.</p>
+  </div>
+  <ol>
+    <li><strong>Read the right stats.</strong> In <code>db.serverStatus().wiredTiger.cache</code>, compare two snapshots and take the difference:
+      <table>
+        <tr><th>Stat</th><th>What it tells you</th></tr>
+        <tr><td><code>pages read into cache</code></td><td>Misses. In steady traffic, a high and constant rate means the working set doesn't fit.</td></tr>
+        <tr><td><code>page evict attempts by application threads</code>, <code>application thread time evicting (usecs)</code></td><td>Your queries doing eviction. This is the latency tax.</td></tr>
+        <tr><td><code>tracked dirty bytes in the cache</code> ÷ <code>maximum bytes configured</code></td><td>Dirty share. Getting close to 20% means writers are about to be throttled.</td></tr>
+      </table>
+    </li>
+    <li><strong>Shrink the working set before you buy RAM.</strong> Covered queries (lesson 2) only touch index pages, which stay prefix-compressed in cache.<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a> Dropping unused indexes frees cache too, because every index is another tree competing for it.</li>
+    <li><strong>Don't raise the cache above the default.</strong> The manual says to avoid it.<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a> The rest of RAM is the OS cache. It holds compressed data, so it fits more of your reviews per GB.</li>
+    <li><strong>In containers, or with several <code>mongod</code>s per host, set the size yourself.</strong> In my lab, 8.0 read the 2 GB container limit correctly and picked 512 MB (= 0.5 × (2 − 1)). But the manual warns that WiredTiger "may not account for the memory limits" in some cases. Set <code>--wiredTigerCacheSizeGB</code>, then check <code>maximum bytes configured</code> and <code>hostInfo().system.memLimitMB</code>.<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a></li>
+    <li><strong>Large scans and backfills push your hot pages out.</strong> A one-off report that scans a big collection evicts the pages your normal traffic needs, and normal queries become misses afterwards. Run them off-peak, in batches, or on a dedicated secondary (replication phase). Bulk writes in throttled batches keep dirty data under 20%.</li>
+  </ol>
+
+  <h3>Diagnosis table</h3>
+  <table>
+    <tr><th>Symptom</th><th>Mechanism</th><th>Proof</th></tr>
+    <tr><td>Slow after restart, then fine</td><td>Cold cache warming up</td><td><code>pages read into cache</code> high, then dropping</td></tr>
+    <tr><td>Always slower than expected, disk busy</td><td>Working set bigger than the cache</td><td>Read-in rate stays high in steady traffic</td></tr>
+    <tr><td>p99 spikes during heavy writes</td><td>Dirty trigger: writers throttled</td><td>Dirty share near 20%, app-thread eviction rising</td></tr>
+    <tr><td>Normal queries slow after a big report</td><td>Scan evicted the hot set</td><td>Read-in burst during the scan, and after it</td></tr>
+  </table>
+
+  <div class="lab">
+    <p>About 15 minutes. These are the same steps I ran. Your timings will differ, but the page counts should be close.</p>
+    <ol>
+      <li>Start a server with a small cache, so you don't need gigabytes of data:
+<pre class="terminal"><code>docker run -d --name mongo-lab3 -m 2g mongo:8.0 --wiredTigerCacheSizeGB 0.25
+docker cp lessons/code/seed-reviews.js mongo-lab3:/seed-reviews.js
+docker exec mongo-lab3 mongosh store --eval 'const N = 2000000' --file /seed-reviews.js   # ~50 s
+docker exec -it mongo-lab3 mongosh store</code></pre></li>
+      <li>Define a helper that prints cache-stat differences, and one that turns a January day into an <code>_id</code> (one review per second since 1 Jan 2026):
+<pre><code>const C = () => db.serverStatus().wiredTiger.cache
+function measure(f) {
+  const a = C(); f(); const b = C()
+  return { pagesRead: b["pages read into cache"] - a["pages read into cache"],
+           appEvict: b["page evict attempts by application threads"] - a["page evict attempts by application threads"],
+           cacheMB: Math.round(b["bytes currently in the cache"] / 2**20),
+           dirtyPct: +(100 * b["tracked dirty bytes in the cache"] / b["maximum bytes configured"]).toFixed(1) }
+}
+const day = d => ObjectId.createFromTime(Date.UTC(2026, 0, d) / 1000)
+const st = db.reviews.stats(); [st.size / 2**20, st.storageSize / 2**20]   // uncompressed vs on disk</code></pre></li>
+      <li>Restart to empty the WiredTiger cache, then read the reviews of 10 January twice. <strong>Predict pagesRead for each run first.</strong>
+<pre class="terminal"><code>docker restart mongo-lab3 &amp;&amp; docker exec -it mongo-lab3 mongosh store</code></pre>
+<pre><code>// paste the C, measure and day definitions again, then:
+const jan10 = () => db.reviews.find({ _id: { $gte: day(10), $lt: day(11) } }).itcount()
+measure(jan10)
+measure(jan10)</code></pre>
+<pre class="output"><code>{ pagesRead: 253, appEvict: 0, cacheMB: 19, dirtyPct: 0 }
+{ pagesRead: 0, appEvict: 0, cacheMB: 19, dirtyPct: 0 }</code></pre></li>
+      <li>Scan the whole collection twice. No review has this exact text and <code>review</code> has no index, so it's a COLLSCAN:
+<pre><code>const scan = () => db.reviews.find({ review: "nobody wrote this" }).itcount()
+measure(scan)
+measure(scan)</code></pre>
+<pre class="output"><code>{ pagesRead: 2875, appEvict: 1, cacheMB: 194, dirtyPct: 0 }
+{ pagesRead: 2500, appEvict: 5, cacheMB: 224, dirtyPct: 0 }</code></pre></li>
+      <li>Make pages dirty with a moderation backfill: tag two days of reviews as <code>"moderated"</code>. Then watch the dirty share go down as eviction and the checkpoint write them out:
+<pre><code>measure(() => db.reviews.updateMany({ _id: { $gte: day(5), $lt: day(7) } }, { $addToSet: { tags: "moderated" } }))
+measure(() => {})   // run again a few seconds later</code></pre>
+<pre class="output"><code>{ pagesRead: 3838, appEvict: 15, cacheMB: 171, dirtyPct: 10.8 }
+{ pagesRead: 0, appEvict: 0, cacheMB: 160, dirtyPct: 3.6 }   // 5 s later: workers wrote most of it out</code></pre></li>
+      <li>Optional: see which tree uses the cache. <code>db.reviews.stats({indexDetails: true})</code> has a <code>wiredTiger.cache</code> section for the collection and one per index. Mine showed 111 MB for the collection and 54 MB for <code>_id_</code>. The <code>_id</code> index is big here because every "reviews of a day" query goes through it.</li>
+      <li>Clean up: <code>docker rm -f mongo-lab3</code></li>
+    </ol>
+  </div>
+
+  <h2>7 · Check yourself</h2>
+  <p>From memory. The first two questions come from lesson 2 on purpose.</p>
+  <div id="quiz"></div>
+
+  <h2>Where this fits</h2>
+  <ol>
+    <li><s>Organise: collections and indexes are B-tree tables</s> ✓</li>
+    <li><s>Cache: how pages move between disk and memory</s> ✓ (today)</li>
+    <li><strong>Concurrency:</strong> snapshots (MVCC), update chains, the history store, and write conflicts</li>
+    <li><strong>Durability:</strong> journal and checkpoints, or what survives a crash</li>
+    <li><strong>MongoDB on top:</strong> one write traced end to end through every layer</li>
+  </ol>
+
+  <div class="callout source">
+    <p><a href="https://source.wiredtiger.com/develop/arch-cache.html">WiredTiger Architecture Guide: Cache</a>, then <a href="https://source.wiredtiger.com/develop/arch-eviction.html">Eviction</a>. Both are short. Read Cache first. In Eviction, find the four thresholds from section 3 and the sentence about application threads. For the MongoDB side, read the "Memory Use" section of the <a href="https://www.mongodb.com/docs/manual/core/wiredtiger/">WiredTiger Storage Engine</a> manual page (9.0).</p>
+  </div>
+
+  <div class="callout ask">
+    <p>Did the scan result in the simulator or the lab surprise you? Do you have a production server you could check with the three stats from section 6? Paste me the numbers in the terminal and we'll read them together. Ask me anything that's unclear.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="0002-1-btrees.html">← Lesson 2.1: B-trees, deep dive</a>
+    <a href="../reference/architecture-map.html">Reference: architecture map</a>
+    <span>Lesson 4: Concurrency (next)</span>
+  </nav>
+</main>
+
+<script src="../assets/cache-sim.js"></script>
+<script>CacheSim.mount('#sim', { capacity: 20, diskPages: 60 });</script>
+<script src="../assets/quiz.js"></script>
+<script>
+const CACHE = 'https://source.wiredtiger.com/develop/arch-cache.html';
+const EVICT = 'https://source.wiredtiger.com/develop/arch-eviction.html';
+const DOCS = 'https://www.mongodb.com/docs/manual/core/wiredtiger/';
+const STORAGE = 'https://github.com/mongodb/mongo/blob/master/src/mongo/db/storage/README.md';
+const BTREE = 'https://source.wiredtiger.com/develop/arch-btree.html';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0003-the-cache',
+  questions: [
+    { layer: 'review',
+      q: '<em>From lesson 2:</em> a collection has the <code>_id</code> index plus two more indexes. How many WiredTiger table files does it use?',
+      options: ['Three', 'Four', 'Two', 'Five'], answer: 1,
+      explain: `One table for the collection plus one per index: 1 + 3 = 4 idents. Every one of them is a separate B-tree competing for the same cache.${c(STORAGE, 'storage README')}` },
+
+    { layer: 'review',
+      q: '<em>From lesson 2:</em> which page does <strong>every</strong> seek into a table pass through, so it is almost always in cache?',
+      options: ['The root page', 'One leaf page', 'The journal file', 'A history page'], answer: 0,
+      explain: `Every seek starts at the root, then goes through internal pages to one leaf. That's why root and internal pages stay hot, and leaves are what come and go. Leaves hold the actual key/value records.${c(BTREE, 'WT B-trees')}` },
+
+    { layer: 'cache',
+      q: 'MongoDB 8.0 runs in a container limited to <strong>4 GB</strong> on a 64 GB host, with no cache flag. If it reads the limit correctly (it did in my lab), what is the WiredTiger cache size?',
+      options: ['31.5 GB', '2 GB', '0.256 GB', '1.5 GB'], answer: 3,
+      explain: `0.5 × (4 − 1) = 1.5 GB. In my lab, a 2 GB container got 512 MB. But the manual warns that WiredTiger "may not account for the memory limits" in some cases, so in containers, set <code>--wiredTigerCacheSizeGB</code> yourself and check it.${c(DOCS, 'docs')}` },
+
+    { layer: 'cache',
+      q: '<code>store.reviews</code> was 80 MB on disk in the lab, but it needed about 314 MB to fit in the WiredTiger cache. Why?',
+      options: ['The cache duplicates every page', 'The cache stores journal copies', 'Collection pages are uncompressed there', 'Indexes are stored inside pages'], answer: 2,
+      explain: `On disk, collection blocks are snappy-compressed. In the WiredTiger cache, "collection data … is uncompressed and uses a different representation". The OS filesystem cache keeps the compressed form.${c(DOCS, 'docs')}` },
+
+    { layer: 'cache',
+      q: 'Which costs more to evict, and why?',
+      options: ['Clean: must re-read it first', 'Dirty: reconcile and write first', 'Both: always written to disk', 'Neither: eviction just frees memory'], answer: 1,
+      explain: `A clean page's disk copy is already correct, so "WiredTiger simply frees the page's memory". A dirty page must be reconciled (turned back into the disk format) and written before it can be freed.${c(CACHE, 'WT cache')}` },
+
+    { layer: 'cache',
+      q: 'During a bulk load, p99 latency rises, and <code>page evict attempts by application threads</code> climbs fast. What does it mean?',
+      options: ['The journal syncs more often now', 'The plan cache was just cleared', 'The indexes rebuild in the background', 'Your query threads are doing eviction'], answer: 3,
+      explain: `Past <code>eviction_trigger</code> (95% full) or <code>eviction_dirty_trigger</code> (20% dirty), application threads "are forced to do the work of eviction" before they can read or write. Your requests pay that cost.${c(EVICT, 'WT eviction')}` },
+
+    { layer: 'cache',
+      q: 'A collection is bigger (uncompressed) than the cache. You scan it fully twice, and nothing else runs. What happens on the second scan?',
+      options: ['It reads many pages again', 'It is served from cache', 'It is skipped by planner', 'It writes every page out'], answer: 0,
+      explain: `With LRU eviction, the start of the collection was evicted to make room for its end. So the second scan misses again. In the lab, scan #2 read 2,567 pages back in, and in the simulator, the second pass got zero hits.${c(EVICT, 'WT eviction')}` },
+
+    { layer: 'cache',
+      q: 'Which <code>serverStatus</code> number, compared between two snapshots, best shows that your working set doesn\'t fit?',
+      options: ['bytes currently in the cache', 'unmodified pages evicted', 'pages read into cache', 'eviction worker thread active'], answer: 2,
+      explain: `A full cache sits at ~80% on purpose (eviction_target), so "bytes currently in the cache" looks the same whether things are fine or not. The rate of <code>pages read into cache</code> counts the actual misses.${c(EVICT, 'WT eviction')}` }
+  ]
+});
+</script>
+</body>
+</html>

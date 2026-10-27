@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 2.1 · B-Trees</title>
+<link rel="stylesheet" href="../assets/style.css">
+<link rel="stylesheet" href="../assets/quiz.css">
+</head>
+<body>
+<main>
+  <div class="kicker">MongoDB Internals · Lesson 2.1 · Phase 1: The engine</div>
+  <h1>B-trees, from first principles to WiredTiger</h1>
+  <p class="subtitle">Why databases use them, a 150-line B-tree in C, and four ways WiredTiger's real B-tree differs from the textbook.</p>
+
+  <p><strong>Your win today:</strong> predict when a B-tree will split and how tall it will grow. Then explain what WiredTiger does differently, and what that means in production.</p>
+  <p>This lesson extends <a href="0002-two-lookups.html">Lesson 0002 · Two lookups</a>. If <em>page</em>, <em>leaf</em> and <em>internal page</em> feel shaky, re-read its section 2b first.</p>
+
+  <!-- ============================================================ -->
+  <h2>Part 1 · Why B-trees?</h2>
+
+  <h3>The problem: reads come in pages</h3>
+  <p>A database keeps far more data than fits in memory, so most of it lives on storage. Storage isn't read one key at a time. It's read in <strong>blocks</strong>, and each read is slow compared with working in memory. So the question for an index structure isn't "how many comparisons?" but <strong>"how many page reads per lookup?"</strong> The B-tree was invented by Bayer and McCreight (1972) to answer exactly that, for "large ordered indexes" on secondary storage.<a class="cite" href="https://users.cs.utah.edu/~pandey/courses/cs6530/fall24/papers/trees/p121-comer.pdf">Comer 1979</a></p>
+
+  <h3>Binary tree vs B-tree</h3>
+  <p>A binary search tree has 2 children per node, so its depth is about log<sub>2</sub>(N). If every node is a separate page, a lookup costs about one read per level.</p>
+  <p>A B-tree makes each node <strong>one page holding many keys</strong>, so each node has many children. This is the <em>fan-out</em>, written <em>f</em>. Depth becomes log<sub>f</sub>(N). A large fan-out makes the tree very shallow:</p>
+
+  <div class="bt-widget" id="calc">
+    <div class="bt-controls">
+      <label class="bt-t">keys (N) <input type="number" id="calc-n" value="1000000000" style="width:9rem"></label>
+      <label class="bt-t">fan-out (f) <input type="number" id="calc-f" value="500" style="width:6rem"></label>
+    </div>
+    <div class="bt-stats" id="calc-out"></div>
+  </div>
+
+  <p>The same idea held in the lab: 200,000 reviews in <code>store.reviews</code> gave a collection tree of depth <strong>3</strong>.</p>
+
+  <h3>The three rules (the invariants)</h3>
+  <p>A B-tree with <em>minimum degree</em> T keeps these rules after every operation:</p>
+  <ol>
+    <li>A page holds at most <strong>2T − 1</strong> keys. Every page except the root holds at least <strong>T − 1</strong>.</li>
+    <li>Keys inside a page are <strong>sorted</strong>. A page with <em>k</em> keys has <em>k + 1</em> children, and the keys separate the children's ranges.</li>
+    <li><strong>All leaves are at the same depth.</strong> The tree is always perfectly balanced.<a class="cite" href="https://users.cs.utah.edu/~pandey/courses/cs6530/fall24/papers/trees/p121-comer.pdf">Comer 1979</a></li>
+  </ol>
+  <p>How does it stay balanced? A full page <strong>splits</strong>: its middle key (the <em>median</em>) moves up into the parent. The tree only gets taller when the <strong>root</strong> splits. So it grows from the top, never from the bottom, and every leaf stays at the same depth.</p>
+
+  <!-- ============================================================ -->
+  <h2>Part 2 · Build one in C</h2>
+  <p>The full file is <a href="code/btree.c"><code>lessons/code/btree.c</code></a> (about 150 lines). It uses T = 2, so a page holds at most <strong>3 keys</strong>. That's tiny on purpose, so splits happen often enough to watch. The keys are plain integers. Read them as RecordIds in the <code>reviews</code> collection table: that's exactly what a collection B-tree is keyed by.</p>
+<pre class="terminal"><code>cd ~/Development/foundaments/lessons/code
+cc -std=c11 -Wall -o btree btree.c && ./btree</code></pre>
+
+  <h3>The page</h3>
+<pre><code>#define T 2
+#define MAX_KEYS (2 * T - 1)
+
+typedef struct Node {
+    int n;                       /* number of keys currently stored        */
+    int keys[MAX_KEYS];          /* sorted keys                            */
+    struct Node *child[2 * T];   /* child[i] holds keys &lt; keys[i]          */
+    bool leaf;
+} Node;</code></pre>
+
+  <h3>Search: one page per level</h3>
+<pre><code>static bool btree_search(Node *x, int k) {
+    pages_visited++;
+    int i = 0;
+    while (i &lt; x-&gt;n &amp;&amp; k &gt; x-&gt;keys[i]) i++;          /* find first key &gt;= k   */
+    if (i &lt; x-&gt;n &amp;&amp; k == x-&gt;keys[i]) return true;    /* found on this page    */
+    if (x-&gt;leaf) return false;                       /* nowhere left to go    */
+    return btree_search(x-&gt;child[i], k);             /* descend one level     */
+}</code></pre>
+
+  <h3>Split: the heart of the B-tree</h3>
+<pre><code>static void split_child(Node *parent, int i) {
+    Node *full = parent-&gt;child[i];
+    Node *right = node_new(full-&gt;leaf);
+    right-&gt;n = T - 1;
+    for (int j = 0; j &lt; T - 1; j++)                  /* upper half of keys    */
+        right-&gt;keys[j] = full-&gt;keys[j + T];
+    if (!full-&gt;leaf)
+        for (int j = 0; j &lt; T; j++)                  /* ...and their children */
+            right-&gt;child[j] = full-&gt;child[j + T];
+    full-&gt;n = T - 1;                                 /* left keeps lower half */
+    /* ...shift parent's keys/children right to make room... */
+    parent-&gt;child[i + 1] = right;
+    parent-&gt;keys[i] = full-&gt;keys[T - 1];             /* median moves UP       */
+    parent-&gt;n++;
+}</code></pre>
+  <p>Insertion walks down from the root and <strong>splits any full page before entering it</strong>. That guarantees there is always room for the median, so it never has to walk back up. If the root itself is full, a new empty root is created above it first. That is the only moment the tree gets taller. (This is the algorithm from CLRS, <em>Introduction to Algorithms</em>, chapter 18.)</p>
+
+  <h3>Real output (I compiled and ran it)</h3>
+<pre class="output"><code>after inserting 30 (3 keys, height 1):
+  level 0: [10 20 30]
+after inserting 40 (4 keys, height 2):
+  level 0: [20]
+  level 1: [10] [30 40]
+after inserting 90 (9 keys, height 3):
+  level 0: [40]
+  level 1: [20] [60]
+  level 2: [10] [30] [50] [70 80 90]
+after inserting 65 (16 keys, height 3):
+  level 0: [40]
+  level 1: [20] [60 80]
+  level 2: [5 10 15] [25 30 35] [45 50 55] [65 70] [90]
+search 45: found, pages visited = 3
+search 42: not found, pages visited = 3
+range [30, 60]: 30 35 40 45 50 55 60
+  pages visited = 6</code></pre>
+
+  <h3>Play with it: predict first, then click</h3>
+  <p>The visualizer runs the <em>same algorithm</em> as the C file. "Load C example" rebuilds exactly the tree above.</p>
+  <div id="viz"></div>
+  <ol>
+    <li><strong>Reset</strong>, then insert 10, 20, 30. Before inserting 40, predict: which key moves up, and what's the new height?</li>
+    <li><strong>Load C example.</strong> Search 45, then 42. Why does a <em>miss</em> cost as many page visits as a hit?</li>
+    <li>Set <strong>max keys/page = 7</strong> and load the C example again. Predict the height first.</li>
+    <li>Reset (max 3) and insert 1, 2, 3, … 20 <strong>in ascending order</strong>. How full are the leaves at the end?</li>
+  </ol>
+  <details>
+    <summary>Answers (only after predicting!)</summary>
+    <ol>
+      <li>The page <code>[10 20 30]</code> is full and it's the root, so it splits. <code>20</code> moves up into a new root, and the height goes from 1 to 2. Result: <code>[20]</code> over <code>[10] [30 40]</code>.</li>
+      <li>A search can only say "not here" after reaching a <strong>leaf</strong>, so a miss walks the full height too. Both cost 3 pages, the tree's height. (In lesson 0002's lab, that's why a query for a non-existent key isn't free.)</li>
+      <li>Height <strong>2</strong>: <code>[40 60]</code> over three leaves. Bigger pages → more fan-out → shorter tree. That's the whole argument of Part 1, in miniature.</li>
+      <li>Height <strong>4</strong>, and almost every leaf holds just <strong>1 key</strong>, the minimum. The split puts half the keys in each new page, and ascending inserts never return to the left half. So pages stay half-empty. Keep this in mind: <em>insert order changes how full pages are</em>.</li>
+    </ol>
+  </details>
+
+  <h3>C exercises</h3>
+  <ol>
+    <li>Add a global <code>splits</code> counter, increment it in <code>split_child</code>, and print it at the end. How many splits for the 16 keys? (Count them in the visualizer to check.)</li>
+    <li>Change <code>#define T 2</code> to <code>T 50</code> (up to 99 keys per page) and insert 1,000,000 random keys with <code>rand()</code>. Predict the height before running.</li>
+  </ol>
+  <details>
+    <summary>Answer to exercise 2</summary>
+    <p>I ran it (<code>srand(42)</code>): <strong>height 4</strong>, and a search visits 4 pages. A balanced binary tree over a million keys needs about 20 levels.</p>
+  </details>
+
+  <!-- ============================================================ -->
+  <h2>Part 3 · WiredTiger's B-tree: four differences from the textbook</h2>
+  <p>Our C tree is the textbook version. WiredTiger keeps the same <em>shape</em>: a root, internal pages, and leaves, all kept sorted, with pages that split when they reach a configured limit.<a class="cite" href="https://source.wiredtiger.com/develop/arch-btree.html">WT B-trees</a> Almost everything else is engineered for real storage and many threads.</p>
+
+  <h3>1 · Data only in the leaves</h3>
+  <p>Look at the C output: <code>40</code> is stored <em>in the root</em>, and the root is where you'd find it. WiredTiger doesn't do that. "The root and internal pages only store keys and references to other pages, while leaf pages store keys and values."<a class="cite" href="https://source.wiredtiger.com/develop/arch-btree.html">WT B-trees</a> Internal pages are pure signposts. When a page's first key is needed for routing, a <em>copy</em> of it goes up to the internal page, and those copies can be trimmed with prefix/suffix compression.<a class="cite" href="https://source.wiredtiger.com/develop/arch-row-column.html">WT row/column</a> (This design is often called a B+-tree.)</p>
+  <p><strong>Why it matters:</strong> every lookup ends at a leaf, so cost = tree depth, and a range scan reads only leaves. That's exactly the <code>IXSCAN</code> behaviour from lesson 0002.</p>
+
+  <h3>2 · Every page has two forms, and a pointer isn't always a pointer</h3>
+  <p>In C, <code>child[i]</code> is a memory address. The child is always there. In WiredTiger, a child reference is a <code>WT_REF</code> with a <strong>state</strong>:<a class="cite" href="https://github.com/wiredtiger/wiredtiger/blob/develop/src/include/btmem.h">btmem.h</a></p>
+  <ul>
+    <li><code>WT_REF_DISK</code>: "the page is on disk, and must be read into memory before use"</li>
+    <li><code>WT_REF_MEM</code>: the page has been read into memory</li>
+    <li><code>WT_REF_LOCKED</code>: "locked for exclusive access"</li>
+  </ul>
+  <p>A page on disk is a compact <strong>block</strong>: a page header, "immediately followed by the block header", and then <em>cells</em> (keys, values, off-page addresses). Each block may be compressed and/or encrypted, but "the header portion of each block remains uncompressed and unencrypted".<a class="cite" href="https://source.wiredtiger.com/develop/arch-data-file.html">WT data file</a> Here is one, byte by byte:</p>
+
+  <figure>
+    <svg viewBox="0 0 680 400" role="img" aria-label="On-disk layout of a collection leaf page: a 28-byte page header, a 12-byte block header, then alternating key cells (RecordIds) and value cells (BSON documents). The first 64 bytes are never compressed. Below, the header fields with byte offsets, and an internal page whose address cells point to the leaf block.">
+      <defs><marker id="ahb" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+      <text class="lbl-title" x="20" y="20">A store.reviews leaf page on disk (one block in collection-7-….wt)</text>
+      <!-- the block -->
+      <rect class="box" x="20" y="34" width="70" height="44"/><text class="lbl-sm" x="27" y="53">page hdr</text><text class="lbl-sm" x="27" y="68">28 B</text>
+      <rect class="box" x="90" y="34" width="56" height="44"/><text class="lbl-sm" x="96" y="53">blk hdr</text><text class="lbl-sm" x="96" y="68">12 B</text>
+      <rect class="box-accent" x="146" y="34" width="48" height="44"/><text class="lbl" x="152" y="61">K 58</text>
+      <rect class="box" x="194" y="34" width="106" height="44"/><text class="lbl-sm" x="201" y="53">V {review: …,</text><text class="lbl-sm" x="201" y="68">  rating: 5}</text>
+      <rect class="box-accent" x="300" y="34" width="48" height="44"/><text class="lbl" x="306" y="61">K 59</text>
+      <rect class="box" x="348" y="34" width="106" height="44"/><text class="lbl-sm" x="355" y="53">V {review: …,</text><text class="lbl-sm" x="355" y="68">  rating: 2}</text>
+      <rect class="box-accent" x="454" y="34" width="48" height="44"/><text class="lbl" x="460" y="61">K 60</text>
+      <rect class="box" x="502" y="34" width="106" height="44"/><text class="lbl-sm" x="509" y="53">V {review: …,</text><text class="lbl-sm" x="509" y="68">  rating: 4}</text>
+      <rect class="box" x="608" y="34" width="44" height="44" style="stroke-dasharray: 3 3"/><text class="lbl" x="620" y="61">…</text>
+      <!-- compression brackets -->
+      <path class="edge" d="M20 86 L20 92 L176 92 L176 86"/><text class="lbl-sm" x="20" y="107">first 64 B: never compressed</text>
+      <path class="edge-accent" d="M178 86 L178 92 L652 92 L652 86"/><text class="lbl-sm" x="330" y="107">the rest: snappy-compressed cells</text>
+      <!-- header zoom -->
+      <text class="lbl-title" x="20" y="140">Zoom: the two headers (byte offsets)</text>
+      <g>
+        <rect class="box" x="20" y="150" width="78" height="40"/><text class="lbl-sm" x="26" y="166">recno</text><text class="lbl-sm" x="26" y="182">0–7</text>
+        <rect class="box" x="98" y="150" width="82" height="40"/><text class="lbl-sm" x="104" y="166">write_gen</text><text class="lbl-sm" x="104" y="182">8–15</text>
+        <rect class="box-accent" x="180" y="150" width="80" height="40"/><text class="lbl-sm" x="186" y="166">mem_size</text><text class="lbl-sm" x="186" y="182">16–19</text>
+        <rect class="box-accent" x="260" y="150" width="72" height="40"/><text class="lbl-sm" x="266" y="166">entries</text><text class="lbl-sm" x="266" y="182">20–23</text>
+        <rect class="box" x="332" y="150" width="50" height="40"/><text class="lbl-sm" x="338" y="166">type</text><text class="lbl-sm" x="338" y="182">24</text>
+        <rect class="box" x="382" y="150" width="50" height="40"/><text class="lbl-sm" x="388" y="166">flags</text><text class="lbl-sm" x="388" y="182">25</text>
+        <rect class="box" x="432" y="150" width="36" height="40"/><text class="lbl-sm" x="437" y="166">rsv</text><text class="lbl-sm" x="437" y="182">26</text>
+        <rect class="box" x="468" y="150" width="36" height="40"/><text class="lbl-sm" x="473" y="166">ver</text><text class="lbl-sm" x="473" y="182">27</text>
+        <text class="lbl-sm" x="512" y="174">WT_PAGE_HEADER</text>
+      </g>
+      <g>
+        <rect class="box" x="20" y="200" width="88" height="40"/><text class="lbl-sm" x="26" y="216">disk_size</text><text class="lbl-sm" x="26" y="232">0–3</text>
+        <rect class="box-accent" x="108" y="200" width="88" height="40"/><text class="lbl-sm" x="114" y="216">checksum</text><text class="lbl-sm" x="114" y="232">4–7</text>
+        <rect class="box" x="196" y="200" width="50" height="40"/><text class="lbl-sm" x="202" y="216">flags</text><text class="lbl-sm" x="202" y="232">8</text>
+        <rect class="box" x="246" y="200" width="56" height="40"/><text class="lbl-sm" x="252" y="216">pad</text><text class="lbl-sm" x="252" y="232">9–11</text>
+        <text class="lbl-sm" x="312" y="224">WT_BLOCK_HEADER</text>
+      </g>
+      <text class="lbl-sm" x="20" y="260">mem_size: bytes the page will take once built in cache</text>
+      <text class="lbl-sm" x="20" y="275">entries: number of cells · type: e.g. row-store leaf</text>
+      <!-- internal page -->
+      <text class="lbl-title" x="20" y="300">Its parent: an internal page on disk</text>
+      <rect class="box" x="20" y="314" width="110" height="44"/><text class="lbl-sm" x="27" y="333">page + blk hdr</text><text class="lbl-sm" x="27" y="348">40 B</text>
+      <rect class="box-accent" x="130" y="314" width="44" height="44"/><text class="lbl" x="139" y="341">K 1</text>
+      <rect class="box" x="174" y="314" width="120" height="44" style="fill: var(--warn-bg); stroke: var(--warn)"/><text class="lbl-sm" x="181" y="333">ADDR</text><text class="lbl-sm" x="181" y="348">→ leaf of 1…57</text>
+      <rect class="box-accent" x="294" y="314" width="50" height="44"/><text class="lbl" x="302" y="341">K 58</text>
+      <rect class="box" x="344" y="314" width="200" height="44" style="fill: var(--warn-bg); stroke: var(--warn)"/><text class="lbl-sm" x="351" y="333">ADDR: offset, size,</text><text class="lbl-sm" x="351" y="348">checksum of the leaf</text>
+      <rect class="box" x="544" y="314" width="60" height="44" style="stroke-dasharray: 3 3"/><text class="lbl" x="566" y="341">…</text>
+      <path class="edge-accent" d="M500 314 L500 298 L668 298 L668 56 L655 56" marker-end="url(#ahb)"/>
+      <text class="lbl-sm" x="20" y="378">The "pointer" to a child is a file address. To follow it,</text>
+      <text class="lbl-sm" x="20" y="393">WiredTiger reads that block and verifies its checksum.</text>
+    </svg>
+    <figcaption>Header fields and offsets come from <code>btmem.h</code> and <code>block.h</code>. RecordIds and documents are illustrative, and real leaves hold hundreds of cells, up to 32 KB in your lab.</figcaption>
+  </figure>
+
+  <p>How to read it:</p>
+  <ul>
+    <li><strong>Headers first, 40 bytes.</strong> The 28-byte page header (<code>WT_PAGE_HEADER</code>) says what the page is: its type, how many cells it has (<code>entries</code>), and how big it will be once built in memory (<code>mem_size</code>). The 12-byte block header belongs to the block manager: the block's size on disk and its checksum.<a class="cite" href="https://github.com/wiredtiger/wiredtiger/blob/develop/src/include/btmem.h">btmem.h</a><a class="cite" href="https://github.com/wiredtiger/wiredtiger/blob/develop/src/include/block.h">block.h</a></li>
+    <li><strong>The first 64 bytes are never compressed</strong> (<code>WT_BLOCK_COMPRESS_SKIP</code>), so WiredTiger can read the headers before it decompresses anything.<a class="cite" href="https://github.com/wiredtiger/wiredtiger/blob/develop/src/include/block.h">block.h</a></li>
+    <li><strong>Then cells, in key order.</strong> A row-store leaf is a key cell followed by a value cell, again and again.<a class="cite" href="https://source.wiredtiger.com/develop/arch-data-file.html">WT data file</a> In a collection, the key is the RecordId and the value is the BSON document. In an index leaf, the keys are index keys, prefix-compressed: a shared prefix is "stored only once per page". A value can also carry a time window, its visibility timestamps (lesson 4).</li>
+    <li><strong>Internal pages hold key + address pairs.</strong> The address cell is the on-disk "pointer": where the child block is in the file, how big it is, and its checksum. The checksum is stored twice, in the parent's address and in the child's own header. That helps catch corruption, and also bugs like a page overwritten by another valid page.<a class="cite" href="https://github.com/wiredtiger/wiredtiger/blob/develop/src/include/block.h">block.h</a></li>
+  </ul>
+  <p>When a thread needs that page, WiredTiger reads the block, decrypts and decompresses it, and builds in-memory structures for binary search.<a class="cite" href="https://source.wiredtiger.com/develop/arch-cache.html">WT cache</a> The in-memory layout is "optimized for fast, concurrent access by multiple application threads". The disk layout is optimized for space.<a class="cite" href="https://source.wiredtiger.com/develop/arch-cache.html">WT cache</a></p>
+
+  <h3>3 · Changes don't edit the page. They hang off it.</h3>
+  <p>In our C code, inserting means shifting keys inside the array. With many threads reading the same page, that would be a disaster. So WiredTiger leaves the page's original contents alone:<a class="cite" href="https://github.com/wiredtiger/wiredtiger/blob/develop/src/include/btmem.h">btmem.h</a></p>
+  <figure>
+    <svg viewBox="0 0 680 230" role="img" aria-label="An in-memory WiredTiger leaf page: a sorted WT_ROW array of keys from disk, insert skip lists holding new keys between slots, and update chains hanging off entries">
+      <text class="lbl-title" x="20" y="22">In-memory row-store leaf page</text>
+      <text class="lbl-sm" x="20" y="50">WT_ROW array</text><text class="lbl-sm" x="20" y="63">(from disk, sorted)</text>
+      <rect class="box" x="160" y="36" width="90" height="34" rx="4"/><text class="lbl" x="190" y="58">k=10</text>
+      <rect class="box" x="340" y="36" width="90" height="34" rx="4"/><text class="lbl" x="370" y="58">k=20</text>
+      <rect class="box" x="520" y="36" width="90" height="34" rx="4"/><text class="lbl" x="550" y="58">k=30</text>
+      <text class="lbl-sm" x="20" y="120">insert skip lists</text><text class="lbl-sm" x="20" y="133">(new keys)</text>
+      <rect class="box-accent" x="250" y="104" width="44" height="30" rx="4"/><text class="lbl" x="259" y="124">12</text>
+      <rect class="box-accent" x="300" y="104" width="44" height="30" rx="4"/><text class="lbl" x="309" y="124">15</text>
+      <rect class="box-accent" x="610" y="104" width="44" height="30" rx="4"/><text class="lbl" x="619" y="124">35</text>
+      <path class="edge" d="M250 53 L 272 104"/><path class="edge" d="M610 53 L 632 104"/>
+      <text class="lbl-sm" x="20" y="186">update chains</text><text class="lbl-sm" x="20" y="199">(WT_UPDATE list)</text>
+      <path class="edge-accent" d="M385 70 L 385 168"/>
+      <rect class="box-accent" x="345" y="168" width="80" height="30" rx="4"/><text class="lbl-sm" x="357" y="188">update</text>
+      <rect class="box" x="440" y="168" width="80" height="30" rx="4"/><text class="lbl-sm" x="452" y="188">update</text>
+      <path class="edge" d="M425 183 L 440 183"/>
+      <text class="lbl-sm" x="160" y="222">the original row array is left alone; new keys and new versions hang off it</text>
+    </svg>
+    <figcaption>Illustrative layout. Struct names come from WiredTiger's <code>btmem.h</code>.</figcaption>
+  </figure>
+  <ul>
+    <li><strong>Existing keys</strong> sit in an array of <code>WT_ROW</code>, "sorted by key, fixed in size", pointing at the on-page data.</li>
+    <li><strong>New keys</strong> go into <strong>skip lists</strong> of <code>WT_INSERT</code> items. Each node gets "a randomly chosen depth of next pointers". A skip list is a sorted linked list with express lanes, searchable in O(log N).<a class="cite" href="https://source.wiredtiger.com/develop/arch-glossary.html">WT glossary</a></li>
+    <li><strong>New versions</strong> of a key are <code>WT_UPDATE</code> structures "formed into a forward-linked list", the <em>update chain</em>. Keeping several versions is what makes snapshots (MVCC) possible. That's lesson 4.</li>
+  </ul>
+  <p>Readers use <strong>hazard pointers</strong>, "a data structure that assists in lock free algorithms, used by WiredTiger Btrees".<a class="cite" href="https://source.wiredtiger.com/develop/arch-glossary.html">WT glossary</a> A thread announces "I'm using this page" without taking a lock, and eviction must not remove a page while such a pointer is held. WiredTiger's own bug tracker records cases where hazard pointers blocked eviction.<a class="cite" href="https://jira.mongodb.org/browse/WT-486">WT-486</a></p>
+
+  <h3>4 · It never overwrites a block on disk</h3>
+  <p>To write a changed page, WiredTiger first <strong>reconciles</strong> it: it converts the in-memory page, with its skip lists and update chains, back into a compact disk image.<a class="cite" href="https://source.wiredtiger.com/develop/arch-cache.html">WT cache</a> Then the block manager writes that image to a <strong>new location</strong>. It is a no-overwrite system: "once a block is written it cannot be modified."<a class="cite" href="https://source.wiredtiger.com/develop/arch-block.html">WT block manager</a></p>
+  <figure>
+    <svg viewBox="0 0 680 150" role="img" aria-label="Page lifecycle: an old disk block is read into the cache, modified in memory, reconciled, and written to a new disk block while the old block remains for the previous checkpoint">
+      <defs><marker id="ah2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+      <rect class="box" x="10" y="40" width="170" height="60" rx="4"/><text class="lbl" x="24" y="64">disk block @A</text><text class="lbl-sm" x="24" y="84">compressed cells</text>
+      <rect class="box-accent" x="255" y="40" width="170" height="60" rx="4"/><text class="lbl" x="269" y="64">in-memory page</text><text class="lbl-sm" x="269" y="84">+ inserts + updates</text>
+      <rect class="box" x="500" y="40" width="170" height="60" rx="4"/><text class="lbl" x="514" y="64">NEW block @B</text><text class="lbl-sm" x="514" y="84">reconciled image</text>
+      <path class="edge-accent" d="M180 70 L 253 70" marker-end="url(#ah2)"/><text class="lbl-sm" x="188" y="32">read + decompress</text>
+      <path class="edge-accent" d="M425 70 L 498 70" marker-end="url(#ah2)"/><text class="lbl-sm" x="438" y="32">reconcile</text>
+      <text class="lbl-sm" x="10" y="128">@A stays intact: the previous checkpoint still uses it, so a crash mid-write is safe.</text>
+    </svg>
+    <figcaption>Copy-on-write at the block level. The block manager tracks file ranges in three extent lists per checkpoint: alloc, avail and discard.</figcaption>
+  </figure>
+  <p>This is why the lesson-1 diagnostic said the previous checkpoint "stays valid" during a crash. Its blocks were never touched. A block can even belong to several checkpoints.<a class="cite" href="https://source.wiredtiger.com/develop/arch-block.html">WT block manager</a></p>
+
+  <div class="callout">
+    <p><strong>So, in production…</strong></p>
+    <ul>
+      <li><strong>Deleting data doesn't shrink <code>.wt</code> files.</strong> Freed blocks go onto the <em>avail</em> list for reuse. The file only shrinks when free space sits at the very end, which is what <em>compaction</em> works toward.<a class="cite" href="https://source.wiredtiger.com/develop/arch-block.html">WT block manager</a> Expect disk usage to stay flat after a big delete.</li>
+      <li><strong>Pages are the unit of everything:</strong> I/O, cache, compression and splitting. Collection leaf pages max out at 32 KB in your lab, and index pages at 16 KB.</li>
+      <li><strong>Very large values</strong> don't fit on a page and become <em>overflow pages</em>, stored separately.<a class="cite" href="https://source.wiredtiger.com/develop/arch-glossary.html">WT glossary</a></li>
+      <li><strong>A very hot page</strong> touched by many threads can be hard to evict, because of hazard pointers. WiredTiger engineers track this as a latency source.<a class="cite" href="https://jira.mongodb.com/browse/WT-12860">WT-12860</a></li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <p>From memory, no scrolling.</p>
+  <div id="quiz"></div>
+
+  <div class="callout source">
+    <p><a href="https://users.cs.utah.edu/~pandey/courses/cs6530/fall24/papers/trees/p121-comer.pdf">Douglas Comer, "The Ubiquitous B-Tree", <em>ACM Computing Surveys</em> 11(2), 1979</a>. The classic, readable survey of <em>why</em> B-trees won, and of the B+-tree variant. Read sections 1–2 (about 30 minutes). Then read the <a href="https://source.wiredtiger.com/develop/arch-btree.html">WiredTiger B-Trees</a> page again. You'll find it much easier now.</p>
+  </div>
+
+  <div class="callout ask">
+    <p>Did the C split code confuse you? Would you like me to add <em>delete</em> (merging and borrowing between pages, the harder half of B-trees), or build a B+-tree version where data lives only in the leaves? Ask in the terminal.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="0002-two-lookups.html">← Lesson 0002: Two lookups</a>
+    <a href="../reference/architecture-map.html">Reference: architecture map</a>
+    <a href="0003-the-cache.html">Lesson 0003: The cache →</a>
+  </nav>
+</main>
+
+<script src="../assets/btree-viz.js"></script>
+<script src="../assets/quiz.js"></script>
+<script>
+BTreeViz.mount('#viz', { t: 2, preset: [10, 20, 30, 40, 50, 60, 70, 80, 90, 25, 35, 45, 5, 15, 55, 65] });
+
+(function calc() {
+  const n = document.getElementById('calc-n'), f = document.getElementById('calc-f'), out = document.getElementById('calc-out');
+  function update() {
+    const N = Math.max(2, +n.value), F = Math.max(2, +f.value);
+    const bin = Math.ceil(Math.log2(N)), bt = Math.ceil(Math.log(N) / Math.log(F));
+    out.innerHTML = `binary tree: ~${bin} levels (≈ ${bin} page reads) · B-tree with fan-out ${F}: ~${bt} levels (≈ ${bt} page reads)`;
+  }
+  n.addEventListener('input', update); f.addEventListener('input', update); update();
+})();
+
+const BT = 'https://source.wiredtiger.com/develop/arch-btree.html';
+const BLOCK = 'https://source.wiredtiger.com/develop/arch-block.html';
+const CACHE = 'https://source.wiredtiger.com/develop/arch-cache.html';
+const BTMEM = 'https://github.com/wiredtiger/wiredtiger/blob/develop/src/include/btmem.h';
+const COMER = 'https://users.cs.utah.edu/~pandey/courses/cs6530/fall24/papers/trees/p121-comer.pdf';
+const STORAGE = 'https://github.com/mongodb/mongo/blob/master/src/mongo/db/storage/README.md';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0002.1-btrees',
+  questions: [
+    { layer: 'btree',
+      q: 'Why do databases prefer wide B-trees over binary search trees for data on storage?',
+      options: ['Fewer levels means fewer page reads', 'Binary trees cannot store string keys', 'Wide nodes avoid all key comparisons', 'Binary trees need a journal file'], answer: 0,
+      explain: `Storage is read in blocks, so the cost that matters is page reads per lookup. Depth is log<sub>f</sub>(N), so a big fan-out <em>f</em> makes the tree very shallow.${c(COMER, 'Comer')}` },
+
+    { layer: 'btree',
+      q: 'One billion keys, fan-out of 1,000 per page. Roughly how many levels deep is the B-tree?',
+      options: ['10', '3', '30', '1,000'], answer: 1,
+      explain: `1000<sup>3</sup> = 10<sup>9</sup>, so about 3 levels. A binary tree would need about 30. Try it in the calculator.` },
+
+    { layer: 'btree',
+      q: 'Max 3 keys per page. You insert into a full <em>non-root</em> leaf <code>[10 20 30]</code>. What happens?',
+      options: ['30 is dropped from the page', 'The page doubles its size limit', '20 moves up; two pages remain', 'The tree gains a new root'], answer: 2,
+      explain: `The median (20) moves up into the parent, leaving <code>[10]</code> and <code>[30]</code>. Because it isn't the root, the height doesn't change. Only a <em>root</em> split adds a level.` },
+
+    { layer: 'btree',
+      q: 'When does a B-tree\'s height increase?',
+      options: ['When any leaf page splits', 'When a key is deleted', 'When the journal is synced', 'When the root page splits'], answer: 3,
+      explain: `The tree grows from the top. A root split creates a new root above it, so every leaf goes one level deeper at once. That's how all leaves stay at the same depth.${c(COMER, 'Comer')}` },
+
+    { layer: 'wiredtiger',
+      q: 'Our C tree stores the key 40 in its root page. How does WiredTiger\'s B-tree differ?',
+      options: ['Internal pages hold only routing keys', 'WiredTiger stores every key in root', 'WiredTiger trees have only one level', 'WiredTiger keeps keys in random order'], answer: 0,
+      explain: `"The root and internal pages only store keys and references to other pages, while leaf pages store keys and values." Every lookup ends at a leaf.${c(BT, 'WT B-trees')}` },
+
+    { layer: 'wiredtiger',
+      q: 'WiredTiger writes a modified page back to disk. Where do the bytes go?',
+      options: ['Over the old block, in-place', 'Into the journal file only', 'Into the history store table', 'To a new block location'], answer: 3,
+      explain: `The block manager is no-overwrite: "once a block is written it cannot be modified." The old block stays valid for the previous checkpoint, which is why a crash mid-write is safe.${c(BLOCK, 'WT block manager')}` },
+
+    { layer: 'wiredtiger',
+      q: 'A brand-new key is inserted into an in-memory row-store leaf page. Where does WiredTiger put it?',
+      options: ['Into the sorted WT_ROW array', 'Into an insert skip list', 'Into a new disk block', 'Into the journal file only'], answer: 1,
+      explain: `New keys go into skip lists of <code>WT_INSERT</code> items. The sorted <code>WT_ROW</code> array, which came from the disk image, isn't shifted around. (The journal <em>also</em> records the change, but that's the durability log, not the page.)${c(BTMEM, 'btmem.h')}` },
+
+    { layer: 'wiredtiger',
+      q: 'Before a dirty in-memory page can be written to disk, WiredTiger must first:',
+      options: ['Lock the entire B-tree file', 'Reconcile it into disk format', 'Copy it to every secondary', 'Rebuild the root page first'], answer: 1,
+      explain: `Reconciliation converts the in-memory page (row array + skip lists + update chains) into a compact on-disk image.${c(CACHE, 'WT cache')}` },
+
+    { layer: 'wiredtiger',
+      q: '<em>Spaced review:</em> a collection has <code>_id</code> plus two more indexes. How many B-trees (<code>.wt</code> tables) does it use?',
+      options: ['Two', 'Three', 'Five', 'Four'], answer: 3,
+      explain: `Each .wt file is one B-tree. That's 1 collection table + 3 index tables (<code>_id</code> + 2) = 4.${c(STORAGE, 'storage README')}` }
+  ]
+});
+</script>
+</body>
+</html>
