@@ -10,68 +10,115 @@
 <main>
   <nav class="crumbs" aria-label="Breadcrumb"><a href="../index.html">Home</a> / <a href="index.html">MongoDB</a> / Questions</nav>
   <div class="kicker">MongoDB Internals · Self-test</div>
-  <div id="questions"><p>Loading <a href="QUESTIONS.md">QUESTIONS.md</a>…</p></div>
+  <h1>Questions I asked</h1>
+  <p class="subtitle">Side questions from the lessons. Answer each one out loud, from memory, before you open it.</p>
+  <div id="questions" aria-live="polite"><p class="q-loading">Loading questions…</p></div>
 </main>
-<!-- Renders QUESTIONS.md so the file stays the single source of truth. -->
+<!-- Renders QUESTIONS.md (the single source of truth) into question cards. -->
 <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
 <script>
   const el = document.getElementById('questions');
+  const CHEVRON = '<svg class="q-chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
-  // Wrap each "## Lesson" heading and what follows it in a collapsible section.
-  function groupByLesson(root) {
+  // QUESTIONS.md → [{ heading, questions: [{ text, meta, answer }] }]
+  function parse(md) {
+    const doc = document.createElement('div');
+    doc.innerHTML = marked.parse(md);
     const sections = [];
-    let current = null;
-    for (const node of [...root.children]) {
-      if (node.tagName === 'H2') {
-        current = document.createElement('details');
-        current.className = 'q-lesson';
-        const summary = document.createElement('summary');
-        summary.innerHTML = `<span class="q-lesson-title">${node.innerHTML}</span>`;
-        current.append(summary);
-        node.replaceWith(current);
-        sections.push(current);
-      } else if (current) {
-        current.append(node);
-      }
-    }
-    for (const s of sections) {
-      const n = s.querySelectorAll('h3').length;
-      s.querySelector('summary').insertAdjacentHTML('beforeend',
-        `<span class="q-count">${n ? n + (n === 1 ? ' question' : ' questions') : 'none yet'}</span>`);
-      if (n) s.open = true;
-      else { s.classList.add('empty'); s.insertAdjacentHTML('beforeend', '<p class="q-empty">No questions logged for this lesson yet.</p>'); }
+    let section = null, q = null;
+    for (const node of doc.children) {
+      if (node.tagName === 'H2') sections.push(section = { heading: node.textContent.trim(), questions: [] });
+      else if (node.tagName === 'H3' && section) section.questions.push(q = { text: node.innerHTML.replace(/^Q:\s*/, ''), meta: '', answer: '' });
+      else if (q && node.tagName === 'P' && !q.meta && !q.answer) q.meta = node.innerHTML;
+      else if (q && node.tagName === 'DETAILS') { node.querySelector('summary')?.remove(); q.answer = node.innerHTML; }
     }
     return sections;
   }
 
-  function toolbar(sections) {
-    const bar = document.createElement('div');
-    bar.className = 'q-toolbar';
-    const actions = [
-      ['Expand all', () => sections.forEach(s => s.open = true)],
-      ['Collapse all', () => el.querySelectorAll('details').forEach(d => d.open = false)],
-      ['Show answers', () => { sections.forEach(s => s.open = true); el.querySelectorAll('.q-lesson details').forEach(d => d.open = true); }],
-      ['Hide answers', () => el.querySelectorAll('.q-lesson details').forEach(d => d.open = false)],
-    ];
-    for (const [label, fn] of actions) {
-      const b = document.createElement('button');
-      b.type = 'button'; b.textContent = label; b.addEventListener('click', fn);
-      bar.append(b);
+  // "Lesson 0002 · Two lookups" → { num: "Lesson 0002", name: "Two lookups" }
+  function splitHeading(h) {
+    const i = h.indexOf(' · ');
+    return i < 0 ? { num: '', name: h } : { num: h.slice(0, i), name: h.slice(i + 3) };
+  }
+
+  function lessonHref(section) {
+    const a = document.createElement('div');
+    for (const q of section.questions) {
+      a.innerHTML = q.meta;
+      const link = a.querySelector('a[href^="lessons/"]');
+      if (link) return link.getAttribute('href').split('#')[0];
     }
-    return bar;
+    return null;
+  }
+
+  function render(sections) {
+    const full = sections.filter(s => s.questions.length);
+    const empty = sections.filter(s => !s.questions.length && splitHeading(s.heading).num);
+    const total = full.reduce((n, s) => n + s.questions.length, 0);
+    if (!total) {
+      el.innerHTML = '<p class="q-empty">No questions yet. Ask one during a lesson and it will show up here.</p>';
+      return;
+    }
+
+    let n = 0;
+    el.innerHTML = `
+      <div class="q-bar">
+        <p class="q-stats"><strong>${total}</strong> ${total === 1 ? 'question' : 'questions'} · ${full.length} ${full.length === 1 ? 'lesson' : 'lessons'}</p>
+        <button type="button" class="q-toggle" aria-pressed="false">Reveal all answers</button>
+      </div>
+      ${full.map(s => {
+        const { num, name } = splitHeading(s.heading);
+        const href = lessonHref(s);
+        return `
+        <details class="q-lesson" open>
+          <summary>
+            ${CHEVRON}
+            <span class="q-lesson-head">
+              ${num ? `<span class="q-lesson-num">${num}</span>` : ''}
+              <span class="q-lesson-name">${name}</span>
+            </span>
+            <span class="q-count">${s.questions.length}</span>
+          </summary>
+          ${href ? `<a class="q-lesson-link" href="${href}">Open the lesson →</a>` : ''}
+          <ol class="q-cards">
+            ${s.questions.map(q => `
+            <li class="q-card">
+              <span class="q-num">${String(++n).padStart(2, '0')}</span>
+              <div class="q-body">
+                <h3 class="q-text">${q.text}</h3>
+                ${q.meta ? `<p class="q-meta">${q.meta}</p>` : ''}
+                <details class="q-answer">
+                  <summary><span class="when-closed">Show answer</span><span class="when-open">Hide answer</span>${CHEVRON}</summary>
+                  <div class="q-answer-body">${q.answer}</div>
+                </details>
+              </div>
+            </li>`).join('')}
+          </ol>
+        </details>`;
+      }).join('')}
+      ${empty.length ? `<p class="q-none">No questions yet for: ${empty.map(s => splitHeading(s.heading).name).join(' · ')}</p>` : ''}`;
+
+    const toggle = el.querySelector('.q-toggle');
+    const answers = [...el.querySelectorAll('.q-answer')];
+    const sync = () => {
+      const all = answers.every(d => d.open);
+      toggle.setAttribute('aria-pressed', String(all));
+      toggle.textContent = all ? 'Hide all answers' : 'Reveal all answers';
+    };
+    toggle.addEventListener('click', () => {
+      const open = toggle.getAttribute('aria-pressed') !== 'true';
+      if (open) el.querySelectorAll('.q-lesson').forEach(d => d.open = true);
+      answers.forEach(d => d.open = open);
+      sync();
+    });
+    answers.forEach(d => d.addEventListener('toggle', sync));
   }
 
   fetch('QUESTIONS.md')
     .then(r => { if (!r.ok) throw new Error(r.status); return r.text(); })
-    .then(md => {
-      el.innerHTML = marked.parse(md);
-      const intro = el.querySelector('h1 + p');
-      if (intro) intro.classList.add('subtitle');
-      const sections = groupByLesson(el);
-      if (sections.length) sections[0].before(toolbar(sections));
-    })
+    .then(md => render(parse(md)))
     .catch(() => {
-      el.innerHTML = '<p>Couldn\'t load the questions. Open <a href="QUESTIONS.md">QUESTIONS.md</a> directly, or serve this folder over HTTP (fetch doesn\'t work from <code>file://</code>).</p>';
+      el.innerHTML = '<p class="q-empty">Couldn\'t load the questions. Open <a href="QUESTIONS.md">QUESTIONS.md</a> directly, or serve this folder over HTTP (fetch doesn\'t work from <code>file://</code>).</p>';
     });
 </script>
 </body>
