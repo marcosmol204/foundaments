@@ -114,11 +114,19 @@
     answers.forEach(d => d.addEventListener('toggle', sync));
   }
 
-  fetch('QUESTIONS.md')
-    .then(r => { if (!r.ok) throw new Error(r.status); return r.text(); })
-    .then(md => render(parse(md)))
-    .catch(() => {
-      el.innerHTML = '<p class="q-empty">Couldn\'t load the questions. Open <a href="QUESTIONS.md">QUESTIONS.md</a> directly, or serve this folder over HTTP (fetch doesn\'t work from <code>file://</code>).</p>';
+  // Opened from disk (file://), browsers block reading QUESTIONS.md, so fall back to the pushed copy on GitHub.
+  const PUSHED = 'https://raw.githubusercontent.com/marcosmol204/foundaments/main/mongodb/QUESTIONS.md';
+  const load = url => fetch(url, { cache: 'no-cache' }).then(r => { if (!r.ok) throw new Error(r.status); return r.text(); });
+  const fromDisk = location.protocol === 'file:';
+
+  (fromDisk ? load(PUSHED) : load('QUESTIONS.md').catch(() => load(PUSHED)))
+    .then(md => {
+      render(parse(md));
+      if (fromDisk) el.insertAdjacentHTML('afterbegin', '<p class="q-loading">Opened from disk: showing the questions pushed to GitHub. Unpushed edits won\'t appear.</p>');
+    })
+    .catch(err => {
+      console.error(err);
+      el.innerHTML = '<p class="q-empty">Couldn\'t load the questions. Open <a href="QUESTIONS.md">QUESTIONS.md</a> directly, or view the site at <a href="https://marcosmol204.github.io/foundaments/mongodb/questions.html">marcosmol204.github.io</a>.</p>';
     });
 </script>
 </body>
