@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 9 · Server Ingress: Threads and Sessions</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<link rel="stylesheet" href="../../assets/quiz.css">
+<style>
+  /* Lesson-local */
+  .hop { display: inline-block; min-width: 1.5em; text-align: center; font: 600 .78rem/1.5 'JetBrains Mono', monospace; color: var(--accent); border: 1px solid var(--accent); border-radius: 50%; margin-right: .3rem; }
+  .table-scroll { overflow-x: auto; }
+  table.num td:not(:first-child), table.num th:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+</style>
+</head>
+<body>
+<main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>
+  <div class="kicker">MongoDB Internals · Lesson 0009 · Phase 2: Transport &amp; wire</div>
+  <h1>Server ingress: threads and sessions</h1>
+  <p class="subtitle">Hop <span class="hop">3</span> from lesson 6. What mongod does when a connection arrives, which thread runs it, and what each idle connection in your app's pool costs the server.</p>
+
+  <p><strong>Your win today:</strong> given "N app instances, pool size P", predict how many threads and how much memory a mongod spends on them, say what happens when the limit is hit, and name the <code>serverStatus</code> fields that prove it. Every number in this lesson was measured on <code>mongo:8.0</code> (8.0.34) in Docker, with <code>-m 1g</code> and 10,000 seeded reviews.</p>
+
+  <h2>0 · Warm-up from lessons 6 to 8</h2>
+  <p>From memory, before reading on.</p>
+  <ol>
+    <li>Lesson 6, hop 3: how many commands can one connection run at the same time?</li>
+    <li>Lesson 7: four app servers use the default <code>maxPoolSize</code> (100) against a 3-member replica set. At most how many pooled connections does <em>each</em> mongod see?</li>
+  </ol>
+  <p>Keep your answers. Section 1 answers the first; section 6 the second.</p>
+
+  <h2>1 · One connection, step by step</h2>
+  <p>We follow one connection from the lab: number 38, from a small client that does what a driver does on a new pooled connection. It sends <code>hello</code> with client metadata, runs <code>db.reviews.find({rating: {$gte: 4}}).limit(1)</code>, and then sits idle, like most connections in a real pool.</p>
+
+  <figure>
+    <svg viewBox="0 0 680 300" role="img" aria-label="The listener thread accepts a TCP connection and creates a Session. The SessionManager checks the connection limit, creates a Client named conn38 and a SessionWorkflow, and starts a new dedicated thread named conn38. That thread loops forever: source a message from the socket (it sleeps here while the connection is idle), process it through handleRequest, which is command dispatch, then sink the reply to the socket. When the socket closes, the loop ends and the thread exits.">
+      <defs><marker id="ah9" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+      <rect class="box" x="20" y="24" width="170" height="70" rx="6"/>
+      <text class="lbl-title" x="34" y="48">listener thread</text>
+      <text class="lbl-sm" x="34" y="68">① accept() TCP socket</text>
+      <text class="lbl-sm" x="34" y="84">→ Session</text>
+      <path class="edge-accent" d="M190 59 L234 59" marker-end="url(#ah9)"/>
+      <rect class="box" x="238" y="24" width="190" height="70" rx="6"/>
+      <text class="lbl-title" x="252" y="48">SessionManager</text>
+      <text class="lbl-sm" x="252" y="68">② under the limit? log</text>
+      <text class="lbl-sm" x="252" y="84">③ Client conn38 + workflow</text>
+      <path class="edge-accent" d="M428 59 L472 59" marker-end="url(#ah9)"/>
+      <rect class="box-accent" x="476" y="24" width="184" height="70" rx="6"/>
+      <text class="lbl-title" x="490" y="48">new thread conn38</text>
+      <text class="lbl-sm" x="490" y="68">④ 1 MiB stack, dedicated</text>
+      <text class="lbl-sm" x="490" y="84">to this one connection</text>
+      <path class="edge" d="M568 94 L568 120" marker-end="url(#ah9)"/>
+      <rect class="box-accent" x="40" y="124" width="620" height="140" rx="8" fill="none"/>
+      <text class="lbl-title" x="56" y="148">⑤ SessionWorkflow loop, on thread conn38, one WorkItem at a time</text>
+      <rect class="box" x="60" y="166" width="170" height="60" rx="5"/>
+      <text class="lbl" x="72" y="188">source</text>
+      <text class="lbl-sm" x="72" y="208">idle: the thread sleeps</text>
+      <rect class="box" x="258" y="166" width="170" height="60" rx="5"/>
+      <text class="lbl" x="270" y="188">process</text>
+      <text class="lbl-sm" x="270" y="208">handleRequest = hop 4</text>
+      <rect class="box" x="456" y="166" width="180" height="60" rx="5"/>
+      <text class="lbl" x="468" y="188">sink</text>
+      <text class="lbl-sm" x="468" y="208">write the reply (OP_MSG)</text>
+      <path class="edge-accent" d="M230 196 L254 196" marker-end="url(#ah9)"/>
+      <path class="edge-accent" d="M428 196 L452 196" marker-end="url(#ah9)"/>
+      <path class="edge" d="M546 226 L546 246 L145 246 L145 230" marker-end="url(#ah9)"/>
+      <text class="lbl-sm" x="290" y="260">repeat until the socket closes</text>
+      <text class="lbl-sm" x="40" y="290">⑥ socket closed → "Connection ended" → the thread exits</text>
+    </svg>
+    <figcaption>One connection = one <code>Session</code> = one <code>SessionWorkflow</code> = one OS thread, for the whole life of the connection.</figcaption>
+  </figure>
+
+  <ol>
+    <li><strong>Accept.</strong> A single thread named <code>listener</code> accepts TCP connections and hands each new socket, wrapped in a <code>Session</code>, to the session manager.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/asio/asio_transport_layer.cpp#L1388">asio_transport_layer.cpp</a> "Once a client connection is accepted, a <code>Session</code> object is created to manage it."<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/README.md">transport README</a></li>
+    <li><strong>Check the limit, then log.</strong> If the number of open sessions is already at the maximum, the server logs "Connection refused because there are too many open connections" and closes the socket. Otherwise it logs "Connection accepted" with the new <code>connectionCount</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_manager_common.cpp#L325">session_manager_common.cpp</a> Both lines come from <code>ctx: "listener"</code>.</li>
+    <li><strong>Make a Client and a SessionWorkflow.</strong> The Client is named <code>conn</code> + the session id, so <code>conn38</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/asio/asio_session_manager.cpp#L70">asio_session_manager.cpp</a> Its thread model is always set to <code>kSynchronous</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/asio/asio_session_manager.cpp#L75">asio_session_manager.cpp</a></li>
+    <li><strong>Start a dedicated thread.</strong> The synchronous executor launches a new OS thread for this client with a 1 MiB stack (<code>kStackSize = 1024 * 1024</code>).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/service_executor_utils.cpp#L72">service_executor_utils.cpp</a> In <code>/proc</code> the thread is called <code>conn38</code>. "For each incoming connection … a new dedicated thread is spawned then detached."<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/docs/command_dispatch.md">command dispatch</a></li>
+    <li><strong>Loop: source → process → sink.</strong> Each iteration reads one message (<code>sourceMessage</code>), turns it into a <code>WorkItem</code>, passes it to <code>handleRequest</code> (hop 4, next lesson), and writes the reply (<code>sinkMessage</code>).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_workflow.cpp#L879">session_workflow.cpp</a> The code is a plain <code>while (true)</code>, with the comment "All available service executors use dedicated threads, so it's okay to run eager futures in an ordinary loop".<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_workflow.cpp#L925">session_workflow.cpp</a> When the client sends nothing, the thread blocks in <code>sourceMessage</code>. An idle connection is a sleeping thread.</li>
+    <li><strong>End.</strong> When the client closes the socket, <code>sourceMessage</code> fails, the loop ends, the server logs "Connection ended", and the thread exits.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_manager_common.cpp#L448">session_manager_common.cpp</a></li>
+  </ol>
+  <p>Answer to warm-up 1: one. "A <code>SessionWorkflow</code> can only have one <code>WorkItem</code> in progress at a time."<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/README.md">transport README</a> The thread is busy for the whole command, including a <code>w: "majority"</code> wait.</p>
+
+  <h3>The log lines for connection 38</h3>
+  <p>From the lab, trimmed. The <code>client metadata</code> line is the <code>hello</code> the client sent first. Real drivers send the same shape, so this is how you find out <em>which app</em> owns a connection.<a class="cite" href="https://specifications.readthedocs.io/en/latest/mongodb-handshake/handshake/">handshake spec</a></p>
+<pre class="output"><code>{"ctx":"listener","msg":"Connection accepted","attr":{"remote":"172.20.0.3:58100",
+   "connectionId":38,"local":"172.20.0.2:27017","connectionCount":3}}
+{"ctx":"conn38","msg":"client metadata","attr":{"remote":"172.20.0.3:58100","client":"conn38",
+   "doc":{"application":{"name":"lab9-reviews-app"},"driver":{"name":"lab9-raw-sockets","version":"1.0"},
+          "os":{"type":"Linux"},"platform":"Node.js v22.23.4"}}}
+{"ctx":"conn38","msg":"Connection not authenticating", …}
+{"ctx":"conn38","msg":"Received first command on ingress connection since session start or auth handshake",
+   "attr":{"elapsedMillis":2}}
+   … 90 s idle: no log lines, the thread sleeps in sourceMessage …
+{"ctx":"conn38","msg":"Connection ended","attr":{"remote":"172.20.0.3:58100","connectionId":38,
+   "connectionCount":991}}</code></pre>
+  <p>Notice <code>ctx</code>: the accept line comes from <code>listener</code>, everything after from <code>conn38</code>, the connection's own thread. The same name appears in <code>currentOp</code> as <code>desc: "conn38"</code>.</p>
+
+  <h2>2 · Which thread model does 8.0 use?</h2>
+  <p>Old blog posts describe several thread models. In 8.0.34, the code has three service executors, and <code>serverStatus().network.serviceExecutors</code> shows each one:<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/service_executor.cpp#L169">service_executor.cpp</a></p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Executor</th><th>In <code>serverStatus</code></th><th>Used for</th></tr>
+    <tr><td>Synchronous</td><td><code>passthrough</code></td><td><strong>Every client connection.</strong> One dedicated thread each. The default and, for normal clients, the only one.</td></tr>
+    <tr><td>Reserved</td><td><code>reserved</code></td><td>Only exists if <code>net.reservedAdminThreads</code> is set. Used by exempt clients (section 4) when the server is already over its connection limit.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/service_executor_reserved.cpp#L67">service_executor_reserved.cpp</a></td></tr>
+    <tr><td>Inline</td><td><code>inline</code></td><td>Internal work that runs on the caller's thread. 0 in every lab run.</td></tr>
+  </table>
+  </div>
+  <p>There is no thread pool shared by client connections, and no async mode you can switch on. The startup parameters <code>initialServiceExecutorUseDedicatedThread</code> (default <code>true</code>) and <code>fixedServiceExecutorThreadLimit</code> still exist in <code>service_executor.idl</code>, but nothing in <code>src/mongo/transport</code> at 8.0.34 reads them.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/service_executor.idl#L35">service_executor.idl</a> Ignore them. The thread pools in <a href="https://github.com/mongodb/mongo/blob/r8.0.34/docs/thread_pools.md"><code>docs/thread_pools.md</code></a> are for internal and outgoing work, not for client connections.</p>
+  <p>Measured: with 3,005 connections open, <code>passthrough.threadsRunning</code> was 3,005 and the mongod process had 3,049 threads. That's one thread per connection plus 44 background threads (eviction, journal flusher, checkpointer, the listener…).</p>
+
+  <h2>3 · What one idle connection costs</h2>
+  <p>The lab opens 0, 1,000 and 3,000 idle connections to a fresh mongod and reads <code>/proc/1/status</code> (mongod is PID 1 in the official image) and <code>serverStatus</code>. "current" includes the 5 connections of the <code>mongosh</code> that takes the measurement.</p>
+  <div class="table-scroll">
+  <table class="num">
+    <tr><th>Idle client connections</th><th>0</th><th>1,000</th><th>3,000</th></tr>
+    <tr><td><code>connections.current</code></td><td>5</td><td>1,005</td><td>3,005</td></tr>
+    <tr><td><code>connections.active</code></td><td>1</td><td>1</td><td>1</td></tr>
+    <tr><td>OS threads (<code>Threads:</code>)</td><td>48–49</td><td>1,048–1,049</td><td>3,049</td></tr>
+    <tr><td>Resident memory (<code>VmRSS</code>)</td><td>182–203 MB</td><td>287–304 MB</td><td>486 MB</td></tr>
+    <tr><td>tcmalloc <code>current_allocated_bytes</code></td><td>112–125 MB</td><td>197–203 MB</td><td>346 MB</td></tr>
+    <tr><td>Address space (<code>VmSize</code>)</td><td>3.7 GB</td><td>4.8 GB</td><td>7.0 GB</td></tr>
+  </table>
+  </div>
+  <p>Per idle connection, that is:</p>
+  <ul>
+    <li><strong>1 OS thread.</strong> Exactly. Thread count tracks <code>connections.current</code> one for one.</li>
+    <li><strong>≈ 100 KB of resident memory</strong> (+105 MB per 1,000 on a fresh server, +303 MB per 3,000). About <strong>78 KB</strong> of it is heap that mongod allocates (tcmalloc: the Client, buffers, per-connection state) and about <strong>24 KB</strong> is the part of the 1 MiB stack the thread has actually touched (measured from <code>/proc/1/smaps</code>: 3,005 one-MiB mappings, 72 MB resident).</li>
+    <li><strong>≈ 1.1 MB of address space</strong>, mostly the reserved stack. That's virtual: it costs nothing until it's touched, but it's why <code>VmSize</code> looks scary.</li>
+    <li><strong>2 file descriptors</strong>: the socket, plus one so the client can be woken up (<code>eventfd</code>). The source says so when it computes the limit (section 4).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_manager_common.cpp#L122">session_manager_common.cpp</a></li>
+  </ul>
+  <p><strong><code>active</code> stayed at 1.</strong> 3,000 connections, and only one of them (the measuring shell) was running anything. The other 3,000 threads were asleep in <code>sourceMessage</code>. That is the normal shape of a production server: many connections, few active.</p>
+  <p><strong>The memory doesn't all come back.</strong> After the 3,000 connections closed, threads went back to 48 and tcmalloc's allocated bytes fell to 129 MB, but RSS stayed at 421 MB. tcmalloc kept the freed pages in its heap (<code>heap_size</code> 360 MB) for reuse. A connection spike can leave the process bigger for a long time, and that memory isn't available to the WiredTiger cache's neighbours (lesson 3).</p>
+  <p>100 KB sounds small. But 10,000 idle connections are ≈ 1 GB of RAM and 10,000 threads doing nothing. On the same box, that RAM could have been cache.</p>
+
+  <h2>4 · The connection limit</h2>
+  <p><code>net.maxIncomingConnections</code> (<code>--maxConns</code>) is the cap. In 8.0.34 the effective limit is the <em>smallest</em> of three numbers:<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_manager_common.cpp#L127">session_manager_common.cpp</a></p>
+  <ol>
+    <li><strong>What you set</strong>, default 1,000,000.</li>
+    <li><strong>80% of half the open-file limit</strong> (<code>RLIMIT_NOFILE / 2 × 0.8</code>): half because each connection needs two descriptors, 80% to leave room for data files. The manual lists this as the Linux default.<a class="cite" href="https://www.mongodb.com/docs/manual/reference/configuration-options/#mongodb-setting-net.maxIncomingConnections">config options</a> In the Docker image, <code>nofile</code> is 1,048,576, so this gives 419,430.</li>
+    <li><strong>A memory cap</strong> (a recent addition: it's in 8.0.34; check yours with <code>getParameter</code>): <code>capMemoryConsumptionForPreAuthBuffers</code> (default 20%) of the server's memory ÷ <code>preAuthMaximumMessageSizeBytes</code> (16 KiB, the largest message a client may send before it authenticates).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/transport_options.idl#L194">transport_options.idl</a> With <code>-m 1g</code>: 1,024 MiB × 0.2 ÷ 16 KiB = <strong>13,107</strong>. mongod read the cgroup limit, not the laptop's 7.8 GB, and said so at startup:</li>
+  </ol>
+<pre class="output"><code>{"s":"W","c":"NETWORK","id":11621101,"ctx":"initandlisten",
+ "msg":"Overriding max connections to honor `capMemoryConsumptionForPreAuthBuffers` settings","attr":{"limit":13107}}</code></pre>
+  <p>So <code>connections.available</code> was 13,102 with 5 open. On a 64 GB server the same cap is ≈ 838,000, so you will rarely notice it, but on small containers it's real.</p>
+
+  <h3>What happens at the limit</h3>
+  <p>I started mongod with <code>--maxConns 200</code> and opened 300 connections. 200 got in, <strong>100 were refused</strong> (<code>connections.rejected: 100</code>), each with a log line:</p>
+<pre class="output"><code>{"ctx":"listener","msg":"Connection refused because there are too many open connections",
+ "attr":{"remote":"172.20.0.3:37110","connectionId":205,"connectionCount":200}}</code></pre>
+  <p>And then the important part: <strong>my own <code>mongosh</code> couldn't get in either</strong> (<code>MongoServerSelectionError: connection &lt;monitor&gt; to 127.0.0.1:27017 closed</code>). When the limit is full, the admin trying to diagnose it is refused like everybody else.</p>
+  <p>The fix is an exemption list. <code>net.maxIncomingConnectionsOverride</code> takes CIDR ranges that ignore the limit; <code>net.reservedAdminThreads</code> starts a small pool of threads for them. Both are config-file only and hidden from <code>--help</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/server_options_general.idl#L92">server_options_general.idl</a> Rerun with both set, <code>127.0.0.1/32</code> exempt: the client again got 200 of 300, but the local <code>mongosh</code> connected, and <code>serverStatus</code> showed <code>connections.limitExempt: 5</code> and the <code>reserved</code> executor running.</p>
+
+  <h2>5 · Connection storms, and the 8.0 throttles</h2>
+  <p>A <em>connection storm</em> is many connections arriving at once: an app deploy, an autoscaler adding 20 instances, or every client reconnecting after a failover. Each new connection costs a thread, a handshake, and (in production) authentication, which is CPU-heavy. In the lab, 3,000 connections arrived in 534 ms and mongod created 3,000 threads in that half-second.</p>
+  <p>8.0.34 has three ingress throttles. Check what's on with <code>getParameter</code>; these are the measured defaults:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Throttle</th><th>Limits</th><th>Default (8.0.34)</th></tr>
+    <tr><td>Connection establishment rate limiter<br><code>ingressConnectionEstablishment*</code></td><td>New connections per second; extra ones wait in a queue or are refused</td><td><strong>Off</strong> (<code>…RateLimiterEnabled: false</code>), queue depth 0<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/transport_options.idl#L82">transport_options.idl</a></td></tr>
+    <tr><td>Ingress request rate limiter<br><code>ingressRequestAdmissionRatePerSec</code></td><td>Requests per second, before an operation is created</td><td>Enabled, but the rate is 2,147,483,647/s: effectively unlimited<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/admission/ingress_request_rate_limiter.idl">rate limiter idl</a></td></tr>
+    <tr><td>Ingress admission control<br><code>ingressAdmissionControllerTicketPoolSize</code></td><td>Concurrent user operations (<code>find</code>, <code>insert</code>, …)</td><td>Enabled, 1,000,000 tickets: effectively unlimited<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/admission/ingress_admission_control.idl#L43">admission idl</a></td></tr>
+  </table>
+  </div>
+  <p>The last one is the <code>queues.ingress.admissions</code> you saw in lesson 6's slow-query line. The manual lists the establishment limiter's <code>serverStatus</code> counters from 8.0.12 on, so older 8.0 patch releases may not have it.<a class="cite" href="https://www.mongodb.com/docs/manual/reference/command/serverStatus/">serverStatus</a></p>
+  <p>I turned on the establishment rate limiter at runtime at 100 connections/s, burst 1 s, queue 2,000 (with <code>127.0.0.1/32</code> in <code>ingressConnectionEstablishmentRateLimiterBypass</code> so my shell stayed exempt):</p>
+  <ul>
+    <li><strong>Queue depth 2,000:</strong> 1,000 connections took <strong>9.0 s</strong> instead of 0.2 s. While they waited, <code>connections.queuedForEstablishment</code> showed 72, 37, 2. None were refused.</li>
+    <li><strong>Queue depth 0</strong> (the default): <strong>123 got in, 877 were refused</strong> (<code>establishmentRateLimit.rejected: 877</code>). 100 is the burst, the rest are the tokens refilled during the 250 ms the attempt lasted.</li>
+  </ul>
+  <p>One detail from the source: the rate limiter runs in the <em>first iteration of the SessionWorkflow loop</em>, so a queued connection already has its Session and its thread.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_workflow.cpp#L899">session_workflow.cpp</a> It smooths the CPU cost of handshakes and auth. It does not save you threads; only <code>maxIncomingConnections</code> does that.</p>
+
+  <h2>6 · Sizing pools across app instances</h2>
+  <p>The server's connection count is set by your apps, not by mongod. Per mongod, at most:</p>
+  <div class="callout">
+    <p><strong>connections ≈ app instances × (maxPoolSize + monitoring connections)</strong></p>
+  </div>
+  <ul>
+    <li><strong>The manual's example</strong>, which is warm-up 2: 4 app servers × <code>maxPoolSize</code> 100 = <strong>400 incoming connections to each mongod</strong>. Each app server opens 300 in total, because it has one pool per replica set member.<a class="cite" href="https://www.mongodb.com/docs/manual/tutorial/connection-pool-performance-tuning/">pool tuning</a></li>
+    <li><strong>Monitoring adds a few per instance.</strong> Measured: one Node.js driver 6.21 client with <code>minPoolSize=maxPoolSize=50</code> held <strong>52</strong> connections: 50 pooled plus 2 for server monitoring (lesson 7). They show up in the log with the same <code>appName</code>.</li>
+    <li><strong>Deploys double it.</strong> During a rolling deploy, old and new instances are both connected. Plan for 2× the steady state.</li>
+    <li><strong>Pools don't share.</strong> A connection waiting on one app instance can't serve a request on another. 50 instances × 100 = 5,000 threads per mongod, even if only 30 operations are ever active at once.</li>
+  </ul>
+
+  <h2>7 · What to watch</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Question</th><th>Where</th></tr>
+    <tr><td>How many connections, and how close to the limit?</td><td><code>serverStatus().connections.current</code>, <code>.available</code>, <code>.rejected</code></td></tr>
+    <tr><td>How many are doing work?</td><td><code>connections.active</code> (vs. <code>current</code>)</td></tr>
+    <tr><td>Is there a storm?</td><td>Rate of <code>connections.totalCreated</code>; "Connection accepted" lines per second; <code>queuedForEstablishment</code> if the limiter is on</td></tr>
+    <tr><td>Who owns the connections?</td><td>"client metadata" log lines; <code>db.currentOp({$all: true})</code> grouped by <code>clientMetadata.application.name</code> or <code>client</code> IP</td></tr>
+    <tr><td>Threads and memory?</td><td><code>network.serviceExecutors.passthrough.threadsRunning</code>; <code>Threads:</code> and <code>VmRSS</code> in <code>/proc/&lt;pid&gt;/status</code>; <code>serverStatus({tcmalloc: 1}).tcmalloc.generic</code></td></tr>
+    <tr><td>Throttles firing?</td><td><code>connections.establishmentRateLimit.rejected</code>; <code>queues.ingress</code></td></tr>
+  </table>
+  </div>
+
+  <h2>8 · So in production you should…</h2>
+  <div class="callout">
+    <p><strong>Rule: every connection is a sleeping thread and ≈ 100 KB on the server, so size pools from the server's side: add up instances × maxPoolSize (+ monitoring) for every app, keep it well under <code>maxIncomingConnections</code>, and always keep a way in for admins.</strong></p>
+  </div>
+  <ol>
+    <li><strong>Keep pools small and few.</strong> Most apps need far fewer connections than the default 100 per instance. Start from your real concurrency (<code>connections.active</code> at peak) and set <code>maxPoolSize</code> near it. Don't set a large <code>minPoolSize</code>: it keeps idle threads alive on every mongod for nothing.</li>
+    <li><strong>Set <code>maxIncomingConnections</code> on purpose</strong>, a bit above your computed total (with the 2× deploy margin). A limit you chose fails loudly in the log. The default fails as a memory problem.</li>
+    <li><strong>Exempt your admin and monitoring hosts</strong> with <code>net.maxIncomingConnectionsOverride</code> (and a couple of <code>reservedAdminThreads</code>). Otherwise, when connections are full, you can't connect to see why.</li>
+    <li><strong>Plan for storms.</strong> Stagger instance start-up and reconnects. If storms are a known problem (failovers, autoscaling), turn on <code>ingressConnectionEstablishmentRateLimiterEnabled</code> with a queue depth above 0, so connections wait instead of being refused. Exempt admin IPs with <code>…RateLimiterBypass</code>.</li>
+    <li><strong>Always set <code>appName</code></strong> in your connection string. Then the "client metadata" lines and <code>currentOp</code> tell you which service is holding 3,000 connections.</li>
+    <li><strong>Container sizing:</strong> in small containers, remember the 8.0 memory cap (20% of memory ÷ 16 KiB) and that thousands of connections take RAM that would otherwise be cache.</li>
+  </ol>
+
+  <h3>Diagnosis table</h3>
+  <table>
+    <tr><th>Symptom</th><th>Mechanism</th><th>Proof</th></tr>
+    <tr><td>"Connection refused because there are too many open connections"; you can't log in</td><td>At the effective limit</td><td><code>connections.rejected</code> rising, <code>available</code> ≈ 0</td></tr>
+    <tr><td>mongod RSS high, cache isn't full, few ops running</td><td>Thousands of idle connections</td><td><code>current</code> ≫ <code>active</code>; <code>Threads:</code> ≈ <code>current</code> + ~45</td></tr>
+    <tr><td>CPU spike and latency right after a deploy or failover</td><td>Connection storm</td><td><code>totalCreated</code> jumps; many "Connection accepted" per second</td></tr>
+    <tr><td>RSS stays high long after a spike</td><td>tcmalloc kept freed heap</td><td><code>tcmalloc.generic.heap_size</code> ≫ <code>current_allocated_bytes</code></td></tr>
+    <tr><td>Clients get errors only during a burst of new connections</td><td>Establishment rate limiter, queue depth 0</td><td><code>connections.establishmentRateLimit.rejected</code></td></tr>
+  </table>
+
+  <div class="lab">
+    <p>About 15 minutes. Run these from the <code>mongodb/</code> folder. The client is <a href="code/0009-open-connections.js"><code>lessons/code/0009-open-connections.js</code></a> (raw sockets, no npm packages); the measurement is <a href="code/0009-measure.sh"><code>lessons/code/0009-measure.sh</code></a>. Your MB numbers will differ a little; the thread counts should match exactly.</p>
+    <ol>
+      <li>Start mongod with a 1 GB memory limit and seed 10,000 reviews:
+<pre class="terminal"><code>docker network create lab9
+docker run -d --name lab9-mongod --hostname mongod --network lab9 -m 1g -p 27190:27017 mongo:8.0 --bind_ip_all
+sleep 8
+docker logs lab9-mongod 2>&amp;1 | grep 11621101          # the 13,107 memory cap
+docker cp lessons/code/seed-reviews.js lab9-mongod:/seed-reviews.js
+docker exec lab9-mongod mongosh store --quiet --eval 'const N = 10000' --file /seed-reviews.js
+sh lessons/code/0009-measure.sh</code></pre>
+<pre class="output"><code>threads=49 rssMB=182 current=5 available=13102 totalCreated=5 rejected=0 active=1 passthroughThreads=5 tcmallocMB=120.1 heapMB=138.0</code></pre></li>
+      <li><strong>Predict</strong> the thread count and RSS with 1,000 idle connections. Then open them (held for 120 s) and measure:
+<pre class="terminal"><code>docker run -d --name lab9-client --network lab9 -v "$PWD/lessons/code":/code:ro \
+  node:22-alpine node /code/0009-open-connections.js mongod:27017 1000 120
+sleep 10; docker logs lab9-client; sh lessons/code/0009-measure.sh</code></pre>
+<pre class="output"><code>READY n=1000 failed=0 in 225 ms; holding 120 s
+threads=1049 rssMB=287 current=1005 available=12102 totalCreated=1010 rejected=0 active=1 passthroughThreads=1005 tcmallocMB=196.5 heapMB=206.0</code></pre></li>
+      <li>Look at the threads and their stacks (the <code>-u mongodb</code> is needed to read <code>smaps</code>):
+<pre class="terminal"><code>docker exec lab9-mongod sh -c 'cat /proc/1/task/*/comm | sed "s/[0-9]*$//" | sort | uniq -c | sort -rn | head -4'
+docker exec -u mongodb lab9-mongod sh -c 'awk "/^Size:/{s=\$2} /^Rss:/{if (s==1024) {n++; r+=\$2}} END {print n, \"stacks,\", r/n, \"KB resident each\"}" /proc/1/smaps'</code></pre>
+<pre class="output"><code>   1000 conn
+      8 prefetch-ser
+      4 eviction-ser
+      …
+1006 stacks, 24.07 KB resident each</code></pre></li>
+      <li>Read one connection's life in the log. Pick the first <code>lab9-reviews-app</code> connection and follow its <code>ctx</code>:
+<pre class="terminal"><code>docker logs lab9-mongod 2>&amp;1 | grep -m1 lab9-reviews-app
+docker logs lab9-mongod 2>&amp;1 | grep -E '"ctx":"conn38"|"connectionId":38,'</code></pre>
+      Use the conn number your first grep printed. After the 120 s hold, run the second grep again to see "Connection ended", then measure once more: threads back to ~48, RSS not.</li>
+      <li>Repeat step 2 with <code>3000</code> instead of <code>1000</code> (wait until the first client has exited, then <code>docker rm lab9-client</code>). Check: threads ≈ 3,049, RSS up by ≈ 300 MB.</li>
+      <li>Hit the limit. Restart with <code>--maxConns 200</code> and open 300:
+<pre class="terminal"><code>docker rm -f lab9-client lab9-mongod
+docker run -d --name lab9-mongod --hostname mongod --network lab9 -m 1g mongo:8.0 --bind_ip_all --maxConns 200
+sleep 8
+docker run --rm --network lab9 -v "$PWD/lessons/code":/code:ro node:22-alpine node /code/0009-open-connections.js mongod:27017 300 30 &amp;
+sleep 5; docker exec lab9-mongod mongosh --quiet --eval 'db.serverStatus().connections.rejected'</code></pre>
+      <strong>Predict</strong> what the last command prints before you run it. (Mine: <code>MongoServerSelectionError … closed</code>. Wait 30 s and try again.) Optional: put <code>net.maxIncomingConnectionsOverride: ["127.0.0.1/32"]</code> and <code>net.reservedAdminThreads: 2</code> in a config file, mount it, start with <code>--config</code>, and see your shell get in.</li>
+      <li>Optional, the establishment rate limiter. First restart <code>lab9-mongod</code> with step 1's command (no <code>--maxConns</code>), then:
+<pre class="terminal"><code>docker exec lab9-mongod mongosh admin --quiet --eval '
+  db.adminCommand({setParameter: 1, ingressConnectionEstablishmentRateLimiterBypass: {ranges: ["127.0.0.1/32"]}})
+  db.adminCommand({setParameter: 1, ingressConnectionEstablishmentRatePerSec: 100})
+  db.adminCommand({setParameter: 1, ingressConnectionEstablishmentBurstCapacitySecs: 1})
+  db.adminCommand({setParameter: 1, ingressConnectionEstablishmentMaxQueueDepth: 2000})
+  db.adminCommand({setParameter: 1, ingressConnectionEstablishmentRateLimiterEnabled: true})'
+docker run --rm --network lab9 -v "$PWD/lessons/code":/code:ro node:22-alpine node /code/0009-open-connections.js mongod:27017 1000 5</code></pre>
+<pre class="output"><code>READY n=1000 failed=0 in 9011 ms; holding 5 s</code></pre>
+      Set <code>ingressConnectionEstablishmentMaxQueueDepth</code> to 0 and run the client again: most connections are refused.</li>
+      <li>Clean up: <code>docker rm -f lab9-client lab9-mongod; docker network rm lab9</code></li>
+    </ol>
+  </div>
+
+  <h2>9 · Check yourself</h2>
+  <p>From memory. The first question comes from lesson 2.1 on purpose.</p>
+  <div id="quiz"></div>
+
+  <h2>Where this fits</h2>
+  <ol>
+    <li><s>Phase 1: the engine</s> ✓ (lessons 2–6)</li>
+    <li><s>Hop 1: the driver's pool, monitoring, server selection</s> (<a href="0007-driver-pool.html">lesson 7</a>)</li>
+    <li><s>Hop 2: OP_MSG in depth</s> (<a href="0008-op-msg.html">lesson 8</a>)</li>
+    <li><s>Hop 3: server ingress, threads and sessions</s> ✓ (today)</li>
+    <li><strong>Next, hop 4: command dispatch and interruption.</strong> What <code>handleRequest</code> does with the message: parse, auth, find the command, set the deadline on the <code>OperationContext</code> this hop already created, and how <code>maxTimeMS</code> and <code>killOp</code> stop it.</li>
+  </ol>
+
+  <div class="callout source">
+    <p>Read the <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/README.md">transport README at r8.0.34</a> (five minutes), then the code it describes: <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_manager_common.cpp#L300"><code>SessionManagerCommon::startSession</code></a> (the limit check and the log lines) and <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_workflow.cpp#L879"><code>SessionWorkflow::Impl::_doOneIteration</code> and <code>_scheduleIteration</code></a> (the loop and the <code>while (true)</code>). For pool sizing, the manual's <a href="https://www.mongodb.com/docs/manual/tutorial/connection-pool-performance-tuning/">Tuning Your Connection Pool Settings</a> (9.0).</p>
+  </div>
+
+  <div class="callout ask">
+    <p>Try it on your own system: run <code>db.serverStatus().connections</code> on a production mongod and compare <code>current</code> with <code>active</code>. Then add up instances × <code>maxPoolSize</code> for every service that connects. Tell me both numbers and we'll work out how much of the server is spent on sleeping threads. Ask me anything that's unclear.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="0008-op-msg.html">← Lesson 8: OP_MSG in depth</a>
+    <a href="../reference/architecture-map.html">Reference: architecture map</a>
+    <a href="0010-dispatch.html">Lesson 10: Command dispatch →</a>
+  </nav>
+</main>
+
+<script src="../../assets/quiz.js"></script>
+<script>
+const R = 'https://github.com/mongodb/mongo/blob/r8.0.34/';
+const BTREE = 'https://source.wiredtiger.com/develop/arch-btree.html';
+const TREADME = R + 'src/mongo/transport/README.md';
+const SMC = R + 'src/mongo/transport/session_manager_common.cpp';
+const SWF = R + 'src/mongo/transport/session_workflow.cpp';
+const POOL = 'https://www.mongodb.com/docs/manual/tutorial/connection-pool-performance-tuning/';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0009-ingress',
+  questions: [
+    { layer: 'review',
+      q: '<em>From lesson 2.1:</em> you insert reviews into <code>store.reviews</code> until a <strong>non-root</strong> leaf of the <code>{rating: 1}</code> index is full, and it splits. What happens to the tree\'s height?',
+      options: ['It grows by one level', 'It shrinks by one level', 'It stays the same height', 'It doubles, then it rebalances'], answer: 2,
+      explain: `The leaf splits in two and the median key moves up into the parent. The height only grows when the <em>root</em> splits, because then a new root is made above it.${c(BTREE, 'WT B-trees')}` },
+
+    { layer: 'threads',
+      q: 'In MongoDB 8.0, which thread runs the <code>SessionWorkflow</code> loop of a normal client connection?',
+      options: ['A shared pool of worker threads', 'The one listener thread that accepts', 'One of four eviction worker threads', 'A dedicated thread for that connection'], answer: 3,
+      explain: `The session manager always picks the synchronous executor, which starts one thread per client ("All available service executors use dedicated threads"). In the lab, 3,005 connections meant 3,005 <code>passthrough</code> threads.${c(SWF + '#L925', 'session_workflow.cpp')}` },
+
+    { layer: 'threads',
+      q: 'A connection in your app\'s pool has been idle for ten minutes. What is its thread on the server doing?',
+      options: ['Blocked in sourceMessage, waiting for bytes', 'Polling the socket every few milliseconds', 'Parked inside the shared worker-thread pool', 'Running a hello heartbeat every second'], answer: 0,
+      explain: `The loop is source → process → sink. With nothing to read, the thread sleeps inside <code>sourceMessage</code>. That's why <code>connections.active</code> stayed at 1 with 3,000 connections open.${c(SWF + '#L689', 'session_workflow.cpp')}` },
+
+    { layer: 'cost',
+      q: 'In the lab (8.0.34, idle connections), how much resident memory did each extra connection add to mongod?',
+      options: ['About 1 MB each', 'About 100 KB each', 'About 16 KB each', 'About 10 MB each'], answer: 1,
+      explain: `+105 MB per 1,000 and +303 MB per 3,000: ≈ 78 KB of tcmalloc heap plus ≈ 24 KB of touched stack. The 1 MiB stack is mostly <em>virtual</em> (VmSize), not resident.` },
+
+    { layer: 'limits',
+      q: 'mongod runs with <code>--maxConns 200</code> and 200 app connections are open. You run <code>mongosh</code> on the server itself. What happens?',
+      options: ['It gets in on a reserved thread', 'It is refused like any other client', 'It waits until a slot becomes free', 'It closes the oldest idle app connection'], answer: 1,
+      explain: `The limit check doesn't care who you are, unless your address is in <code>net.maxIncomingConnectionsOverride</code>. In the lab, mongosh failed with "connection &lt;monitor&gt; … closed" and the log said "Connection refused because there are too many open connections".${c(SMC + '#L325', 'session_manager_common.cpp')}` },
+
+    { layer: 'limits',
+      q: 'Why did a mongod in a 1 GB container report <code>connections.available: 13102</code> with no <code>--maxConns</code> set?',
+      options: ['Half the open-file limit, times 0.8', 'The 1,000,000 default divided by 76', '20% of memory divided by 16KiB', 'The WiredTiger cache size in pages'], answer: 2,
+      explain: `8.0.34 caps connections at <code>capMemoryConsumptionForPreAuthBuffers</code> (20%) of memory ÷ <code>preAuthMaximumMessageSizeBytes</code> (16 KiB): 1,024 MiB × 0.2 ÷ 16 KiB = 13,107, minus 5 open. The file-descriptor rule gave 419,430, so the memory cap won.${c(SMC + '#L103', 'session_manager_common.cpp')}` },
+
+    { layer: 'pools',
+      q: 'Six app instances each use <code>maxPoolSize: 50</code> against a 3-member replica set. At most how many pooled connections does <em>each</em> mongod get?',
+      options: ['50', '150', '900', '300'], answer: 3,
+      explain: `Each instance keeps one pool per member, so each mongod sees 6 × 50 = 300 (plus a couple of monitoring connections per instance; the lab measured 52 for one pool of 50). Each instance opens 150 in total.${c(POOL, 'pool tuning')}` },
+
+    { layer: 'storms',
+      q: 'You enable the 8.0 connection establishment rate limiter at 100/s with queue depth 0. 1,000 connections arrive at once. What happens?',
+      options: ['Most of them are refused outright', 'All of them wait in line', 'All of them get in immediately', 'The server closes old ones first'], answer: 0,
+      explain: `Queue depth 0 means "refuse if a token isn't free right now". The lab: 123 got in (the burst plus refill), 877 refused. With a queue depth of 2,000 they all got in, over 9 s.${c(R + 'src/mongo/transport/transport_options.idl#L115', 'transport_options.idl')}` },
+
+    { layer: 'observe',
+      q: '<code>connections.current</code> is 4,000 but <code>connections.active</code> is 25. What does that tell you?',
+      options: ['The server is about to refuse clients', 'Pools are much bigger than real load', 'Most queries are waiting for the disk', 'The listener thread is falling far behind'], answer: 1,
+      explain: `Only 25 connections have an operation in progress; the other 3,975 are sleeping threads that each cost ≈ 100 KB. Shrink <code>maxPoolSize</code> (and <code>minPoolSize</code>) toward the real concurrency.${c(TREADME, 'transport README')}` }
+  ]
+});
+</script>
+</body>
+</html>

@@ -3,3 +3,5 @@ mongodb/lessons/code/btree
 .DS_Store
 
 .claude
+__pycache__/
+*.pcap

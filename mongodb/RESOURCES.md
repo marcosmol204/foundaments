@@ -24,6 +24,10 @@
 - [Source: server design docs (`docs/`)](https://github.com/mongodb/mongo/tree/master/docs)
   Command dispatch, egress networking, batons, thread pools, futures/promises. Use for: how a request is scheduled and dispatched.
 
+- [Spec: Wire Compression / OP_COMPRESSED (MongoDB Specifications)](https://specifications.readthedocs.io/en/latest/compression/OP_COMPRESSED/)
+  `compression` field in the hello handshake, the client's first matching compressor wins, the 9-byte OP_COMPRESSED header, compressor ids 0–3, and the never-compressed list (hello, sasl*, authenticate, createUser, updateUser…). Use for: compression questions.
+- Source (r8.0.34): [`rpc/op_msg.cpp`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/rpc/op_msg.cpp#L152-L257) (`OpMsg::parse`: flag mask, section kinds, at most 2 sequences, CRC-32C), [`transport/session_workflow.cpp`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_workflow.cpp#L321-L363) (makeExhaustMessage; the reply uses the request's compressor), [`transport/message_compressor_manager.cpp`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/message_compressor_manager.cpp#L72-L124), [`message_compressor_options_server.idl`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/message_compressor_options_server.idl#L33-L38) (default `snappy,zstd,zlib`), [`service_entry_point_common.cpp`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L2299-L2332) (moreToCome → no reply; NotWritablePrimary closes the connection). Use for: source-reading exercises on hop 2 (lesson 8).
+
 ### Replication & consistency
 - [Source: Replication Internals README (`src/mongo/db/repl/README.md`)](https://github.com/mongodb/mongo/blob/master/src/mongo/db/repl/README.md)
   Oplog fetching (pull), sync sources, idempotent oplog entries, PV1 elections (Raft-based), commit point, read concern, transactions. Use for: everything replication.
@@ -47,7 +51,7 @@
   Use for: finding a local MongoDB User Group to present internals talks (mission: teach others).
 
 ## Gaps
-- No authoritative doc yet on the **ingress thread model** (thread-per-connection vs. async executors) for current versions. Search `docs/thread_pools.md` and `service_executor*` before teaching it.
+- ~~ingress thread model~~: closed in lesson 0009 from the r8.0.34 source (dedicated thread per connection; `docs/thread_pools.md` covers internal pools only).
 - Need a trusted source on the **query engine (SBE vs classic)** and plan cache.
 - ~~WiredTiger in-memory page structure~~: covered in lesson 2.1 via btmem.h. Still missing: authoritative source on hazard-pointer mechanics (only glossary + Jira so far).
 
@@ -86,3 +90,30 @@
 - Driver specs: [Server Selection](https://specifications.readthedocs.io/en/latest/server-selection/server-selection/), [Connection Monitoring and Pooling (CMAP)](https://specifications.readthedocs.io/en/latest/connection-monitoring-and-pooling/connection-monitoring-and-pooling/), [Retryable Writes](https://specifications.readthedocs.io/en/latest/retryable-writes/retryable-writes/). Use for: the client side of hop 1 (lesson 6), and Phase 2.
 - [Source: Sessions and transactions README (`src/mongo/db/s/README_sessions_and_transactions.md`)](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README_sessions_and_transactions.md)
   Why retryable-write oplog entries carry `lsid`, `txnNumber`, `stmtId`, `prevOpTime`, and the `config.transactions` record. Use for: reading oplog entries.
+
+### Ingress & thread model (added 2026-10-30)
+- [Source: `session_workflow.cpp` (r8.0.34)](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_workflow.cpp#L879), [`asio_session_manager.cpp`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/asio/asio_session_manager.cpp#L75), [`service_executor.cpp`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/service_executor.cpp#L169), [`service_executor_utils.cpp`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/service_executor_utils.cpp#L72)
+  The 8.0 thread model: every client connection gets a dedicated thread (synchronous/"passthrough" executor, 1 MiB stack); reserved executor only for exempt clients over the limit; source → process → sink loop. Use for: "which thread runs my connection?"
+- [Source: `session_manager_common.cpp` (r8.0.34)](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_manager_common.cpp#L103)
+  Effective connection limit = min(maxConns, 80% of nofile/2, 20% memory ÷ 16 KiB pre-auth buffer cap); "Connection accepted/refused/ended" log lines. Use for: connection-limit questions.
+- Source IDLs (r8.0.34): [`transport_options.idl`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/transport_options.idl) (ingressConnectionEstablishment*, capMemoryConsumptionForPreAuthBuffers, maxIncomingConnectionsOverride), [`ingress_admission_control.idl`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/admission/ingress_admission_control.idl), [`ingress_request_rate_limiter.idl`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/admission/ingress_request_rate_limiter.idl), [`server_options_general.idl`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/server_options_general.idl#L87) (hidden yaml options reservedAdminThreads, maxIncomingConnectionsOverride). Use for: ingress defaults and throttles.
+- [Docs: Tuning Your Connection Pool Settings (Manual 9.0)](https://www.mongodb.com/docs/manual/tutorial/connection-pool-performance-tuning/)
+  Pool-size symptoms and the "app servers × maxPoolSize per mongod" calculation. Use for: sizing pools across instances.
+- [Spec: MongoDB Handshake](https://specifications.readthedocs.io/en/latest/mongodb-handshake/handshake/)
+  The client metadata a driver sends in its first hello (what the "client metadata" log line shows). Use for: identifying which app owns connections.
+
+### Driver: pool, monitoring, selection (added 2026-10-30)
+- Driver specs: [Server Monitoring](https://specifications.readthedocs.io/en/latest/server-discovery-and-monitoring/server-monitoring/) (streaming hello with topologyVersion/maxAwaitTimeMS, the extra RTT socket, dedicated unauthenticated monitoring sockets, serverMonitoringMode) and [SDAM](https://specifications.readthedocs.io/en/latest/server-discovery-and-monitoring/server-discovery-and-monitoring/) (error handling: mark Unknown + clear the pool on network errors; clear only for "node is shutting down", not for "not writable primary"). Use for: lesson 7 and failover behaviour.
+- [Source: Node.js driver v7.7.0](https://github.com/mongodb/node-mongodb-native/tree/v7.7.0/src): `connection_string.ts` (defaults), `cmap/connection_pool.ts` (`processWaitQueue`, the maxConnecting loop), `cmap/connect.ts` (handshake document), `cmap/auth/scram.ts` (speculativeAuthenticate, PBKDF2 cache), `sdam/monitor.ts` (streaming, RTTPinger, no credentials), `sdam/topology.ts` (power-of-two selection), `timeout.ts` (checkout timeout). Use for: what one real driver does by default.
+- [Source: Execution Control README (`src/mongo/db/admission/README.md`, r8.0.34)](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/admission/README.md)
+  Throughput probing: how 8.0 adjusts the number of read/write tickets. Use for: the server-side queue that `durationMillis − workingMillis` shows.
+- Docs: [replSetStepDown](https://www.mongodb.com/docs/manual/reference/command/replSetStepDown/) (doesn't close all client connections, nominates a secondary, kills in-progress writes) and [Replica set elections](https://www.mongodb.com/docs/manual/core/replica-set-elections/) (electionTimeoutMillis 10 s). Use for: planned vs. crash failover.
+
+### Command dispatch & interruption (added 2026-10-30)
+- [Source: `docs/command_dispatch.md` + `service_entry_point_common.cpp` (r8.0.34)](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L1628)
+  handleRequest → parseCommand → findCommand → `_parseCommand` → `_initiateCommand` (auth, then the maxTimeMS deadline, then read-concern defaults) → `_commandExec` → completeOperation (slow log). Use for: hop 4, step by step.
+- [Source: `operation_context.cpp` `checkForInterruptNoAssert` (r8.0.34)](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/operation_context.cpp#L220), [`kill_op.cpp`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/commands/kill_op.cpp), [`plan_yield_policy.h`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/query/plan_yield_policy.h#L215), [`getmore_cmd.cpp` leftover maxTime](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/commands/getmore_cmd.cpp#L305), [`default_max_time_ms_cluster_parameter.cpp`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/default_max_time_ms_cluster_parameter.cpp#L36)
+  Cooperative interruption: a kill or deadline only sets a flag, which is checked at yield points (10 ms timer). Use for: "why didn't my kill or maxTimeMS work?"
+- [Spec: Client Side Operations Timeout (CSOT)](https://specifications.readthedocs.io/en/latest/client-side-operations-timeout/client-side-operations-timeout/)
+  `timeoutMS` covers server selection, checkout and all getMores in wall-clock time; the driver appends maxTimeMS = remaining time − minRTT. Use for: client-side timeouts.
+- Docs (Manual 9.0): [killOp](https://www.mongodb.com/docs/manual/reference/command/killOp/), [cursor.maxTimeMS](https://www.mongodb.com/docs/manual/reference/method/cursor.maxTimeMS/), [$currentOp](https://www.mongodb.com/docs/manual/reference/operator/aggregation/currentOp/), [Terminate Running Operations](https://www.mongodb.com/docs/manual/tutorial/terminate-running-operations/), [Atomicity](https://www.mongodb.com/docs/manual/core/write-operations-atomicity/). Use for: operator procedures and kill semantics.

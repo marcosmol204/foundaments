@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 10 · Command Dispatch and Interruption</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<link rel="stylesheet" href="../../assets/quiz.css">
+<style>
+  /* Lesson-local: hop badge (same as lesson 6), error exits, scrolling tables */
+  .hop { display: inline-block; min-width: 1.5em; text-align: center; font: 600 .78rem/1.5 'JetBrains Mono', monospace; color: var(--accent); border: 1px solid var(--accent); border-radius: 50%; margin-right: .3rem; }
+  .table-scroll { overflow-x: auto; }
+  svg .exit { fill: var(--bad); font: 11px 'JetBrains Mono', monospace; }
+  svg .edge-bad { stroke: var(--bad); stroke-width: 1.2; fill: none; stroke-dasharray: 4 3; }
+  svg .tick { stroke: var(--accent); stroke-width: 1; }
+  svg .bar { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.2; }
+  svg .bar-warn { fill: var(--warn-bg); stroke: var(--warn); stroke-width: 1.2; }
+  svg .kill { stroke: var(--bad); stroke-width: 1.6; fill: none; }
+  svg .arrow-bad { fill: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>
+  <div class="kicker">MongoDB Internals · Lesson 0010 · Phase 2: Transport &amp; wire</div>
+  <h1>Command dispatch and interruption</h1>
+  <p class="subtitle">Hop 4: what the server does between "a message arrived" and "the command's code runs", and how a running command is stopped by <code>maxTimeMS</code> or <code>killOp</code>.</p>
+
+  <p><strong>Your win today:</strong> a runaway <code>db.reviews.find({review: /battery/i})</code> is scanning your 5-million-review collection. You find it in <code>$currentOp</code>, kill it safely, predict how fast it stops and what stays changed, and prove all of it from the slow-query log line. This is the "diagnose a production symptom" goal from your <a href="../MISSION.md">mission</a>, for hop 4.</p>
+
+  <h2>0 · Warm-up from lessons 6 and 9</h2>
+  <p>From memory, before reading on.</p>
+  <ol>
+    <li>In lesson 6, the insert with <code>w: "majority"</code> waited for the secondaries. On which thread did it wait, and in which hop's code?</li>
+    <li>From lesson 9: how many commands can one connection run at the same time?</li>
+    <li>You run <code>db.reviews.find({review: /battery/i})</code> on 5 million reviews. There is no index on <code>review</code>, and a regex can't use a normal one for <code>/i</code> anyway. What does <code>planSummary</code> say?</li>
+  </ol>
+  <p>Answers: (1) the connection's own thread, inside dispatch, after the command ran (<code>RunCommandAndWaitForWriteConcern</code>). (2) One. (3) <code>COLLSCAN</code>, which reads all 5 million documents. Keep (1) in mind: section 1 shows where that wait sits.</p>
+
+  <h2>1 · From message to <code>run()</code>, step by step</h2>
+  <p>We follow one command: <code>db.reviews.find({review: /battery/i}).maxTimeMS(1000)</code>. Everything here is the server source at tag <code>r8.0.34</code>, the version in the lab. The main file is <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp"><code>service_entry_point_common.cpp</code></a>; the doc for the whole hop is <a href="https://github.com/mongodb/mongo/blob/r8.0.34/docs/command_dispatch.md"><code>docs/command_dispatch.md</code></a>.</p>
+
+  <figure>
+    <svg viewBox="0 0 680 430" role="img" aria-label="The dispatch pipeline for one command, top to bottom. 1, the SessionWorkflow creates an OperationContext. 2, handleRequest switches on the opCode: OP_MSG goes on, legacy opcodes are rejected. 3, parseCommand turns the message into an OpMsgRequest; the command name is the first field. 4, findCommand looks up find in the CommandRegistry; unknown names fail with CommandNotFound 59. 5, generic arguments such as $db, maxTimeMS, readConcern and comment are parsed, CurOp records the command, and parse builds a CommandInvocation. 6, _initiateCommand starts the clock, checks authorization, checks primary or secondary, sets the deadline from maxTimeMS, and applies the read concern; it can fail with Unauthorized 13 or NotWritablePrimary 10107. 7, _commandExec waits for the read concern and calls invocation run; this is where MaxTimeMSExpired 50 and Interrupted 11601 come from. 8, completeOperation stops the CurOp clock and writes the Slow query log line.">
+      <defs>
+        <marker id="ah10" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 z"/></marker>
+        <marker id="ah10b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow-bad" d="M0 0 L8 4 L0 8 z"/></marker>
+      </defs>
+      <rect class="box" x="20" y="10" width="420" height="42" rx="5"/>
+      <text class="lbl" x="32" y="30">① WorkItem::initOperation</text>
+      <text class="lbl-sm" x="32" y="45">hop 3 makes the OperationContext (opid, deadline, kill flag)</text>
+      <rect class="box" x="20" y="62" width="420" height="42" rx="5"/>
+      <text class="lbl" x="32" y="82">② handleRequest → runOperation</text>
+      <text class="lbl-sm" x="32" y="97">switch on opCode: OP_MSG 2013 → receivedCommands</text>
+      <rect class="box" x="20" y="114" width="420" height="42" rx="5"/>
+      <text class="lbl" x="32" y="134">③ parseCommand → OpMsgRequest</text>
+      <text class="lbl-sm" x="32" y="149">body + document sequences; name = first field: "find"</text>
+      <rect class="box" x="20" y="166" width="420" height="42" rx="5"/>
+      <text class="lbl" x="32" y="186">④ CommandHelpers::findCommand("find")</text>
+      <text class="lbl-sm" x="32" y="201">lookup in the CommandRegistry built at startup</text>
+      <rect class="box" x="20" y="218" width="420" height="42" rx="5"/>
+      <text class="lbl" x="32" y="238">⑤ _parseCommand</text>
+      <text class="lbl-sm" x="32" y="253">$db, maxTimeMS, readConcern, comment · CurOp · parse()</text>
+      <rect class="box-accent" x="20" y="270" width="420" height="42" rx="5"/>
+      <text class="lbl" x="32" y="290">⑥ _initiateCommand</text>
+      <text class="lbl-sm" x="32" y="305">clock · auth · primary? · deadline · read concern</text>
+      <rect class="box-accent" x="20" y="322" width="420" height="42" rx="5"/>
+      <text class="lbl" x="32" y="342">⑦ _commandExec → invocation-&gt;run()</text>
+      <text class="lbl-sm" x="32" y="357">wait for read concern · run · (writes) wait for w</text>
+      <rect class="box" x="20" y="374" width="420" height="42" rx="5"/>
+      <text class="lbl" x="32" y="394">⑧ completeOperation</text>
+      <text class="lbl-sm" x="32" y="409">CurOp clock stops · "Slow query" if ≥ slowms</text>
+      <path class="edge-accent" d="M230 52 L230 61" marker-end="url(#ah10)"/>
+      <path class="edge-accent" d="M230 104 L230 113" marker-end="url(#ah10)"/>
+      <path class="edge-accent" d="M230 156 L230 165" marker-end="url(#ah10)"/>
+      <path class="edge-accent" d="M230 208 L230 217" marker-end="url(#ah10)"/>
+      <path class="edge-accent" d="M230 260 L230 269" marker-end="url(#ah10)"/>
+      <path class="edge-accent" d="M230 312 L230 321" marker-end="url(#ah10)"/>
+      <path class="edge-accent" d="M230 364 L230 373" marker-end="url(#ah10)"/>
+      <path class="edge-bad" d="M440 83 L470 83" marker-end="url(#ah10b)"/>
+      <text class="exit" x="476" y="87">legacy opcode: rejected</text>
+      <path class="edge-bad" d="M440 187 L470 187" marker-end="url(#ah10b)"/>
+      <text class="exit" x="476" y="191">CommandNotFound (59)</text>
+      <path class="edge-bad" d="M440 284 L470 284" marker-end="url(#ah10b)"/>
+      <text class="exit" x="476" y="288">Unauthorized (13)</text>
+      <text class="exit" x="476" y="303">NotWritablePrimary (10107)</text>
+      <path class="edge-bad" d="M440 336 L470 336" marker-end="url(#ah10b)"/>
+      <text class="exit" x="476" y="340">MaxTimeMSExpired (50)</text>
+      <text class="exit" x="476" y="355">Interrupted (11601)</text>
+    </svg>
+    <figcaption>Hop 4 for one command. Errors on the right become an error reply; the slow-query log (step 8) still records them. The two green steps are where today's lesson lives.</figcaption>
+  </figure>
+
+  <ol>
+    <li><strong>The OperationContext already exists.</strong> Hop 3 creates it when it turns the message into a <code>WorkItem</code> (<code>initOperation</code>).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_workflow.cpp#L607">session_workflow.cpp</a> Every operation has one. It holds the operation's <code>opid</code>, its <strong>deadline</strong>, its <strong>kill flag</strong>, its locks and its storage transaction. Remember the deadline and the kill flag: section 2 is about them.</li>
+    <li><strong>Pick a path by opCode.</strong> <code>handleRequest</code> → <code>runOperation</code> switches on the header's opCode. OP_MSG (2013, <a href="0008-op-msg.html">lesson 8</a>) goes to <code>receivedCommands</code>. <code>OP_INSERT</code>, <code>OP_GET_MORE</code> and the other legacy opcodes fail with "no longer supported".<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L2406">runOperation</a></li>
+    <li><strong>Parse the message.</strong> <code>parseCommand</code> turns the bytes into an <code>OpMsgRequest</code>: the body document plus any kind-1 document sequences.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L2234">parseCommand</a> The command's name is simply the <em>first field</em> of the body: <code>find</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/rpc/op_msg.h#L220">op_msg.h</a></li>
+    <li><strong>Find the command.</strong> Every command registers itself in a global <code>CommandRegistry</code> at startup.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/docs/command_dispatch.md#commands">command_dispatch.md</a> <code>findCommand("find")</code> looks it up. An unknown name fails with <code>CommandNotFound</code> (59), "no such command".<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L2263">executeCommand</a></li>
+    <li><strong>Parse the generic arguments, then the command.</strong> Some fields mean the same thing for every command: <code>$db</code>, <code>maxTimeMS</code>, <code>readConcern</code>, <code>lsid</code>, <code>comment</code>. <code>_parseCommand</code> reads them first. Then CurOp records the command body, so <strong>from here on <code>$currentOp</code> can show it</strong>. Last, <code>command-&gt;parse()</code> builds a <code>CommandInvocation</code>: one parsed, ready-to-run instance of <code>find</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L597">_parseCommand</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/commands.h#L816">commands.h</a>
+      <br><strong>About <code>$db</code>:</strong> the server keeps no "current database" for a connection. Every command carries <code>$db</code>, and <code>use store</code> in mongosh only changes what mongosh puts there. <code>$db: "store"</code> plus <code>find: "reviews"</code> gives the namespace <code>store.reviews</code>. In the lab, an <code>Unauthorized</code> error message echoed the whole body back, ending in <code>$readPreference: { mode: "primaryPreferred" }, $db: "store"</code>.</li>
+    <li><strong>The checks before running (<code>_initiateCommand</code>).</strong> In this order:<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L1628">_initiateCommand</a>
+      <ul>
+        <li><strong>Start the clock</strong> (<code>startedCommandExecAt</code>). The <code>maxTimeMS</code> budget is counted from here, so reading the socket and parsing are not in it.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L1636">L1636</a></li>
+        <li><strong>Authorization:</strong> <code>checkAuthorization</code> throws <code>Unauthorized</code> (13). In the lab, a user without read access on <code>store</code> got <code>Unauthorized</code> in 5 ms, before any scanning.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L1731">L1731</a></li>
+        <li><strong>Can it run on this node?</strong> A write on a secondary fails with <code>NotWritablePrimary</code> (10107); a read without a secondary-ok read preference with <code>NotPrimaryNoSecondaryOk</code> (13435).</li>
+        <li><strong>The deadline:</strong> <code>setDeadlineByDate(startedCommandExecAt + maxTimeMS, MaxTimeMSExpired)</code>. If the client sent no <code>maxTimeMS</code> and the command is a read, 8.0 can use the <code>defaultMaxTimeMS</code> cluster parameter instead (section 4).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L1808">L1808</a></li>
+        <li><strong>Read concern:</strong> the client's, or the cluster default if the client set no level. On a replica set, the slow log says where it came from: <code>readConcern: {level: "local", provenance: "implicitDefault"}</code> in every lab line.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L1477">_extractReadConcern</a></li>
+        <li><strong>One interrupt check</strong>, then <code>CurOp::ensureStarted()</code>: by now CurOp's timer is running.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L1927">L1927</a></li>
+      </ul></li>
+    <li><strong>Run it (<code>_commandExec</code>).</strong> First wait for the read concern if needed (for example <code>afterClusterTime</code>).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L1955">L1955</a> Then, if the command takes a write concern, <code>RunCommandAndWaitForWriteConcern</code>: run, then wait for <code>w</code>, all on this thread. That's warm-up answer 1, and lesson 6's hop 8. Otherwise <code>RunCommandImpl</code>. Both end in <code>invocation-&gt;run(opCtx, reply)</code>, the command's own code.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/commands.h#L836">CommandInvocation::run</a> For our <code>find</code>: plan a <code>COLLSCAN</code>, fill the first batch (101 documents), and park the rest of the scan in a cursor for later <code>getMore</code>s.</li>
+    <li><strong>Log it (<code>completeOperation</code>).</strong> <code>CurOp::completeAndLogOperation</code> stops the clock, computes <code>durationMillis</code> and <code>workingMillis</code>, and writes the <code>"Slow query"</code> line if the time is at least <code>slowms</code> (100 ms by default). It writes it for failed commands too, with <code>errCode</code> and <code>errName</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L2439">completeOperation</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/curop.cpp#L613">curop.cpp</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/server_options.h#L111">slowMS</a> Then the reply goes back to hop 3, which writes it to the socket.</li>
+  </ol>
+  <p>So CurOp knows the command from step 5, its timer runs by the end of step 6, and it stops in step 8. <code>$currentOp</code> shows the operation in between, and <code>durationMillis</code> measures roughly steps 6 to 8. That is why a <code>maxTimeMS: 1000</code> error can log <code>durationMillis: 998</code>: the deadline clock started a little earlier (step 6, first line) than CurOp's timer.</p>
+
+  <h2>2 · How a running command is stopped</h2>
+  <p>Now the find is in step 7, scanning. Two things can stop it: its own deadline, or somebody's <code>killOp</code>. Both work the same way, and neither one stops the thread from the outside.</p>
+  <ol>
+    <li><strong>A kill only sets a flag.</strong> <code>killOp</code> finds the target's OperationContext and calls <code>markKilled(Interrupted)</code>, which stores the error code in an atomic field.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_context.cpp#L435">service_context.cpp</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/operation_context.h#L450">operation_context.h</a> Then it returns <code>{info: "attempting to kill op", ok: 1}</code>. The source says it plainly: "killOp always reports success once past the auth check."<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/commands/kill_op.cpp#L60">kill_op.cpp</a></li>
+    <li><strong>The running thread must look at the flag.</strong> It does that in <code>checkForInterrupt</code>, which checks, in order: client killed, shutdown, <strong>deadline passed → <code>MaxTimeMSExpired</code> (50)</strong>, <strong>kill flag set → <code>Interrupted</code> (11601)</strong>, and, for <code>find</code> and <code>count</code>, whether the client has disconnected.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/operation_context.cpp#L220">checkForInterruptNoAssert</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/commands/find_cmd.cpp#L564">find_cmd.cpp</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/base/error_codes.yml#L100">error codes</a> So <code>maxTimeMS</code> is not a timer that fires. It is a time check inside the same function. The manual: MongoDB "terminates operations that exceed their allotted time limit using the same mechanism as <code>db.killOp()</code>" and "only terminates an operation at one of its designated interrupt points."<a class="cite" href="https://www.mongodb.com/docs/manual/reference/method/cursor.maxTimeMS/">cursor.maxTimeMS</a></li>
+    <li><strong>A scan checks at its yield points.</strong> The query executor asks "time to yield?" as it goes. The answer is yes every <code>internalQueryExecYieldPeriodMS</code> = 10 ms by default.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/query/query_knobs.idl#L477">query_knobs.idl</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/query/plan_executor_impl.cpp#L406">plan_executor_impl.cpp</a> At a yield it checks for interrupts, releases its locks and storage snapshot, and takes them again. Waits on a condition (a lock, a ticket, the write concern) wake up for a kill or a deadline too.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/operation_context.cpp#L303">waitForConditionOrInterrupt</a> In the lab, a 1-second scan logged about 60 <code>numYields</code> and 129 <code>numInterruptChecks</code>.</li>
+    <li><strong>So between two checks, nothing can stop it.</strong> If one stretch of work takes 3 seconds, a kill waits 3 seconds. In the lab I made that happen on purpose: I set <code>internalQueryExecYieldPeriodMS</code> to 5,000 (a test knob; never do this in production), so a 2.2-second scan never reached a check. Inside a multi-document transaction, queries never <em>yield</em> (they can't release their snapshot), but they still check for interrupts on the same timer.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/query/plan_yield_policy.cpp#L85">plan_yield_policy.cpp</a></li>
+  </ol>
+
+  <figure>
+    <svg viewBox="0 0 680 206" role="img" aria-label="Two timelines of the same 2.2-second regex scan. Top: the normal case, with an interrupt check about every 8 milliseconds drawn as dense ticks; killOp arrives at 1.5 seconds and the scan stops at the next check, 3 milliseconds later, with Interrupted. Bottom: interrupt checks set to every 5 seconds, so there are no ticks during the scan; killOp arrives at 1.0 second, killPending stays true, and the scan runs to the end at 2.2 seconds and returns the full count.">
+      <defs><marker id="ah10k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow-bad" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+      <text class="lbl-title" x="20" y="24">Default: a check about every 8 ms</text>
+      <rect class="bar" x="60" y="56" width="349" height="24" rx="3"/>
+      <path class="tick" d="M64 62v12 M68 62v12 M72 62v12 M76 62v12 M80 62v12 M84 62v12 M88 62v12 M92 62v12 M96 62v12 M100 62v12 M104 62v12 M108 62v12 M112 62v12 M116 62v12 M120 62v12 M124 62v12 M128 62v12 M132 62v12 M136 62v12 M140 62v12 M144 62v12 M148 62v12 M152 62v12 M156 62v12 M160 62v12 M164 62v12 M168 62v12 M172 62v12 M176 62v12 M180 62v12 M184 62v12 M188 62v12 M192 62v12 M196 62v12 M200 62v12 M204 62v12 M208 62v12 M212 62v12 M216 62v12 M220 62v12 M224 62v12 M228 62v12 M232 62v12 M236 62v12 M240 62v12 M244 62v12 M248 62v12 M252 62v12 M256 62v12 M260 62v12 M264 62v12 M268 62v12 M272 62v12 M276 62v12 M280 62v12 M284 62v12 M288 62v12 M292 62v12 M296 62v12 M300 62v12 M304 62v12 M308 62v12 M312 62v12 M316 62v12 M320 62v12 M324 62v12 M328 62v12 M332 62v12 M336 62v12 M340 62v12 M344 62v12 M348 62v12 M352 62v12 M356 62v12 M360 62v12 M364 62v12 M368 62v12 M372 62v12 M376 62v12 M380 62v12 M384 62v12 M388 62v12 M392 62v12 M396 62v12 M400 62v12 M404 62v12"/>
+      <path class="kill" d="M408 34 L408 52" marker-end="url(#ah10k)"/>
+      <text class="lbl-sm" x="330" y="30">killOp at 1.5 s</text>
+      <text class="lbl-sm" x="418" y="73">stops 3 ms later: Interrupted</text>
+      <text class="lbl-title" x="20" y="116">Lab knob: a check every 5 s</text>
+      <rect class="bar-warn" x="60" y="136" width="510" height="24" rx="3"/>
+      <path class="tick" d="M62 142v12 M66 142v12"/>
+      <path class="kill" d="M292 114 L292 132" marker-end="url(#ah10k)"/>
+      <text class="lbl-sm" x="300" y="126">killOp at 1.0 s · killPending: true</text>
+      <text class="lbl-sm" x="470" y="178">runs to 2.2 s, full count</text>
+      <path class="edge" d="M60 188 L640 188"/>
+      <text class="lbl-sm" x="56" y="199">0</text><text class="lbl-sm" x="284" y="199">1 s</text><text class="lbl-sm" x="516" y="199">2 s</text>
+    </svg>
+    <figcaption>The same scan of 5 million reviews. The kill flag is set at the arrow; the thread only notices it at a tick.</figcaption>
+  </figure>
+
+  <h3>What I measured</h3>
+  <p>5,000,000 seeded reviews, a 1-node replica set, <code>mongo:8.0</code> (8.0.34) in Docker with <code>-m 1g</code> (256 MB cache). A full <code>countDocuments({review: /battery/i})</code> takes 2.5–2.6 s and finds 1,159,853 reviews. I use <code>countDocuments</code> for the timing tests because it is <em>one</em> command that scans everything (it runs as an <code>aggregate</code>). Four runs each:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Test</th><th>Stopped after (server)</th><th>Result</th><th><code>numYields</code></th></tr>
+    <tr><td><code>maxTimeMS: 500</code></td><td>504–515 ms</td><td><code>MaxTimeMSExpired</code> (50)</td><td>28–33</td></tr>
+    <tr><td><code>maxTimeMS: 1000</code></td><td>998–1,014 ms</td><td><code>MaxTimeMSExpired</code> (50)</td><td>54–62</td></tr>
+    <tr><td><code>maxTimeMS: 2000</code></td><td>1,998–2,016 ms</td><td><code>MaxTimeMSExpired</code> (50)</td><td>121–131</td></tr>
+    <tr><td><code>killOp</code> after ~1.5 s</td><td>2–14 ms after <code>killOp</code> returned</td><td><code>Interrupted</code> (11601)</td><td>89–97</td></tr>
+    <tr><td>Checks every 5 s, <code>maxTimeMS: 500</code></td><td>2,203–2,288 ms</td><td><strong>Finished: full count</strong></td><td>0</td></tr>
+    <tr><td>Checks every 5 s, <code>killOp</code> at 1 s</td><td>2,203–2,251 ms</td><td><strong>Finished: full count</strong></td><td>0</td></tr>
+  </table>
+  </div>
+  <p>With default settings, a deadline or a kill lands within about 15 ms. Without checks, both are simply ignored until the work ends. The killed op showed <code>killPending: true</code> in <code>$currentOp</code> the whole time, and its log line said <code>numInterruptChecks: 4</code> (the ones in dispatch, before the scan started). Regexes themselves were not the problem: I also tried classic "catastrophic" patterns like <code>/^(a|aa)+$/</code> on a long review, and 8.0's PCRE2 finished each in under 10 ms.</p>
+
+  <h3>A cursor's budget is server time</h3>
+  <p>Our <code>find</code> returns its first 101 matches in about 1 ms. The rest of the scan happens in <code>getMore</code>s. Each <code>getMore</code> gets the time the cursor has <em>left</em> as its deadline.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/commands/getmore_cmd.cpp#L305">getmore_cmd.cpp</a> In the lab, <code>find(…).maxTimeMS(1000)</code> iterated in mongosh failed in its fifth or sixth <code>getMore</code>: 1,010–1,023 ms of server time in total. But <strong>mongosh waited 7.3–7.8 s</strong>, and received 480,000–490,000 reviews first. The manual says it: "MongoDB does not count network latency between the client and the server towards a cursor's time limit."<a class="cite" href="https://www.mongodb.com/docs/manual/reference/method/cursor.maxTimeMS/">cursor.maxTimeMS</a> The time your app spends between batches isn't counted either.</p>
+  <p>The fix is <strong><code>timeoutMS</code></strong>, the driver's client-side operation timeout (CSOT). It counts wall-clock time for the whole operation: server selection, pool checkout, the find and every <code>getMore</code>.<a class="cite" href="https://specifications.readthedocs.io/en/latest/client-side-operations-timeout/client-side-operations-timeout/">CSOT spec</a> The driver still sends <code>maxTimeMS</code> (remaining time minus the server's minimum round trip), so the server stops too. With Node driver 7.7.0 and <code>timeoutMS: 1000</code>, the same loop failed with <code>MongoOperationTimeoutError</code> after <strong>1,003–1,070 ms of wall clock</strong>. The driver sent <code>maxTimeMS: 1000</code> on the find (the round trip rounds to 0 ms on one machine), and then a <code>killCursors</code>, so the server didn't keep a half-read cursor.</p>
+
+  <h2>3 · Find and kill a runaway operation</h2>
+  <p>In production you rarely know the opid. You find it with <code>$currentOp</code> on the <code>admin</code> database:<a class="cite" href="https://www.mongodb.com/docs/manual/reference/operator/aggregation/currentOp/">$currentOp</a></p>
+<pre><code>db.getSiblingDB("admin").aggregate([
+  { $currentOp: { allUsers: true } },
+  { $match: { active: true, secs_running: { $gte: 5 }, client: { $exists: true }, ns: /^store\./ } },
+  { $project: { opid: 1, secs_running: 1, op: 1, ns: 1, planSummary: 1, appName: 1,
+                client: 1, numYields: 1, killPending: 1, comment: "$command.comment" } }
+])</code></pre>
+  <p>What it returned in the lab, for a scan started with <code>{comment: "lab10-runaway"}</code>:</p>
+<pre class="output"><code>{ client: '127.0.0.1:59678', appName: 'mongosh 2.13.0', opid: 397313,
+  secs_running: Long('1'), op: 'command', ns: 'store.reviews',
+  planSummary: 'COLLSCAN', numYields: 75, comment: 'lab10-runaway' }</code></pre>
+  <ul>
+    <li><strong><code>secs_running</code></strong> is whole seconds since CurOp started (<code>microsecs_running</code> is precise). Your filter.</li>
+    <li><strong><code>planSummary: 'COLLSCAN'</code></strong> on a big collection is the usual suspect.</li>
+    <li><strong><code>appName</code></strong> and <strong><code>client</code></strong> say which service sent it. Set <code>appName</code> in every connection string, so this field names your service and not just "Node driver".</li>
+    <li><strong><code>client: {$exists: true}</code></strong> keeps only operations from client connections. Internal operations (replication, TTL, index builds) are not yours to kill. The manual: "Only use killOp to terminate operations initiated by clients", and never use it on index builds; use <code>dropIndexes</code>.<a class="cite" href="https://www.mongodb.com/docs/manual/reference/command/killOp/">killOp</a></li>
+    <li><strong><code>numYields</code> going up</strong> between two looks means it is reaching interrupt points, so a kill will land quickly.</li>
+  </ul>
+  <p>Then <code>db.killOp(opid)</code>. Don't trust its <code>ok: 1</code>: run <code>$currentOp</code> again. Either the op is gone, or it shows <code>killPending: true</code>, which means it hasn't reached its next interrupt point yet.<a class="cite" href="https://www.mongodb.com/docs/manual/reference/command/killOp/">killOp</a></p>
+
+  <h3>What a kill rolls back, and what it doesn't</h3>
+  <p>The kill makes the command throw at its next check. Whatever was already committed stays committed. Lesson 6's rule decides what that means:</p>
+  <ul>
+    <li><strong>A read:</strong> nothing to undo. The cursor is freed.</li>
+    <li><strong>A single-document write:</strong> one <code>WriteUnitOfWork</code>, so all or nothing (<a href="0006-one-write.html">lesson 6</a>).</li>
+    <li><strong>A multi-document write without a transaction is not one unit.</strong> "The modification of each document is atomic, but the operation as a whole is not atomic."<a class="cite" href="https://www.mongodb.com/docs/manual/core/write-operations-atomicity/">atomicity</a> In the lab, I added a field <code>flagged: true</code> (a moderation flag, only for this test) with <code>updateMany({review: /battery/i}, …)</code> and killed it after 1.6 s. <strong>172,232 reviews stayed flagged.</strong> The client got only <code>Interrupted</code>, with no count of what changed, and the slow-log line had no <code>nModified</code> either. Those changes are in the oplog, so the secondaries have them too.</li>
+    <li><strong>Inside a transaction:</strong> killing one statement aborts the whole transaction. In the lab, a transaction updated one review, then its <code>countDocuments</code> was killed. The commit failed with <code>NoSuchTransaction</code> (251), and the earlier update was gone.</li>
+  </ul>
+  <p>So before you kill a write, decide whether "half done" is OK. If it isn't, make the job resumable (a filter that skips finished documents, such as <code>{flagged: {$ne: true}}</code>), or run it in batches.</p>
+
+  <h2>4 · Read it in the slow-query log</h2>
+  <p>Here is the real line for the killed scan, trimmed. One line shows the whole story of hop 4:</p>
+<pre class="output"><code>"msg":"Slow query", "attr":{ "type":"command", "ns":"store.reviews", "appName":"mongosh 2.13.0",
+  "command":{ "aggregate":"reviews", "pipeline":[{"$match":{"review":{"$regularExpression":{"pattern":"battery","options":"i"}}}}, …],
+              "comment":"lab10-runaway-1793339814", …, "$db":"store" },
+  "planSummary":"COLLSCAN", "numYields":96, "queryFramework":"sbe",
+  "ok":0, "errMsg":"PlanExecutor error during aggregation :: caused by :: operation was interrupted",
+  "errName":"Interrupted", "errCode":11601,
+  "readConcern":{"level":"local","provenance":"implicitDefault"},
+  "cpuNanos":1522956701, "numInterruptChecks":196,
+  "queues":{"execution":{"admissions":98},"ingress":{"admissions":1}},
+  "workingMillis":1531, "durationMillis":1531 }</code></pre>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Field</th><th>What it tells you</th></tr>
+    <tr><td><code>durationMillis</code></td><td>CurOp's span, roughly steps 6 → 8. For a <code>maxTimeMS</code> error, about the deadline; for a kill, when it was killed.</td></tr>
+    <tr><td><code>errCode</code> / <code>errName</code></td><td><strong>50 <code>MaxTimeMSExpired</code></strong>: its own deadline. <strong>11601 <code>Interrupted</code></strong>: somebody's <code>killOp</code>. 13 / 59 / 10107: failed in dispatch, before running.</td></tr>
+    <tr><td><code>planSummary</code></td><td>Why it was slow: <code>COLLSCAN</code> over 5 million reviews.</td></tr>
+    <tr><td><code>numYields</code>, <code>numInterruptChecks</code></td><td>Whether it could be stopped. 0 yields on a long query means a kill or deadline would have waited.</td></tr>
+    <tr><td><code>readConcern.provenance</code></td><td>Whether the client chose the read concern or dispatch applied a default (step 6).</td></tr>
+    <tr><td><code>comment</code>, <code>appName</code></td><td>Who sent it. Tag your queries with a <code>comment</code>; it shows up here and in <code>$currentOp</code>.</td></tr>
+  </table>
+  </div>
+  <p>A query that "ignored" its <code>maxTimeMS</code> looks like the lab's no-check run: <code>durationMillis</code> 2,237, <code>numYields: 0</code>, <code>numInterruptChecks: 4</code>, no <code>errName</code>, and <code>maxTimeMS: 500</code> right there in the command.</p>
+
+  <h2>5 · Read the path in the source</h2>
+  <p>At tag <code>r8.0.34</code>. About fifteen minutes. Find the named line in each.</p>
+  <ol>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/docs/command_dispatch.md"><code>docs/command_dispatch.md</code></a>: the overview. Short; read it all.</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L2522"><code>service_entry_point_common.cpp</code> L2522</a>: <code>handleRequest</code> → <code>startOperation</code>, <code>runOperation</code>, <code>completeOperation</code>. Then up to <code>receivedCommands</code> (L2354), <code>parseCommand</code> (L2234), <code>executeCommand</code> (L2254).</li>
+    <li>Same file, <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L1628"><code>_initiateCommand</code> L1628–1940</a>: find <code>checkAuthorization</code>, <code>setDeadlineByDate</code> and <code>_extractReadConcern</code>. Note that auth comes before the deadline.</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/operation_context.cpp#L220"><code>operation_context.cpp</code> L220</a>: <code>checkForInterruptNoAssert</code>. The whole interruption model is these 50 lines.</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/commands/kill_op.cpp#L48"><code>commands/kill_op.cpp</code></a>: <code>killOp</code> is 20 lines, and it never waits.</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/query/plan_yield_policy.h#L215"><code>query/plan_yield_policy.h</code> L215</a>: <code>shouldYieldOrInterrupt</code>, the 10 ms timer.</li>
+  </ol>
+
+  <h2>6 · So in production you should…</h2>
+  <div class="callout">
+    <p><strong>Rule: give every user-facing query a deadline the server enforces (<code>timeoutMS</code> in the driver, which sends <code>maxTimeMS</code>), and treat <code>killOp</code> as a request, not a guarantee: confirm it, and know what a half-finished write leaves behind.</strong></p>
+  </div>
+  <ol>
+    <li><strong>Set <code>timeoutMS</code> on the client</strong> (CSOT, or per operation). It bounds what the user actually waits: 1.0 s in the lab, against 7.3–7.8 s for <code>maxTimeMS(1000)</code> alone. It also bounds the pool wait from <a href="0007-driver-pool.html">lesson 7</a>. If your driver has no CSOT yet, set <code>maxTimeMS</code> on every query, and remember it only counts server time.</li>
+    <li><strong>Add a server-side safety net.</strong> In 8.0, <code>setClusterParameter: {defaultMaxTimeMS: {readOperations: …}}</code> gives every read without its own <code>maxTimeMS</code> a deadline.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/default_max_time_ms_cluster_parameter.cpp#L36">default_max_time_ms</a> In the lab with <code>readOperations: 200</code>, an app user's full scan failed with <code>MaxTimeMSExpired</code> after 203–210 ms. A query with its own <code>maxTimeMS: 5000</code> still finished (369 ms). It applies only to reads, and users with the <code>bypassDefaultMaxTimeMS</code> privilege skip it: <code>root</code> did, and so does everyone when auth is off.</li>
+    <li><strong>Tag queries</strong> with <code>appName</code> (per service) and <code>comment</code> (per code path). Then <code>$currentOp</code> and the slow log tell you who to call.</li>
+    <li><strong>Kill safely:</strong> filter <code>$currentOp</code> by <code>active</code>, <code>secs_running</code>, <code>client</code> and <code>ns</code>; kill by <code>opid</code>; check again for <code>killPending</code>. Never kill internal operations or index builds.</li>
+    <li><strong>Make long writes resumable</strong>, because a killed <code>updateMany</code> keeps everything it already did (172,232 reviews in the lab) and doesn't tell you how many.</li>
+    <li><strong>Fix the cause, not just the symptom.</strong> A deadline stops a <code>COLLSCAN</code>; an index prevents it. For word search in reviews, a text or Atlas Search index fits better than <code>/battery/i</code>.</li>
+  </ol>
+
+  <h3>Diagnosis table</h3>
+  <table>
+    <tr><th>Symptom</th><th>Cause</th><th>Proof</th></tr>
+    <tr><td>Slow log: <code>errCode: 50</code>, <code>durationMillis</code> ≈ the <code>maxTimeMS</code></td><td>Its own deadline worked</td><td><code>planSummary</code> shows why it was slow</td></tr>
+    <tr><td>User waited far longer than <code>maxTimeMS</code></td><td>Time between <code>getMore</code>s isn't counted</td><td>Sum of <code>durationMillis</code> per cursor ≪ wall clock; use <code>timeoutMS</code></td></tr>
+    <tr><td><code>killOp</code> said ok, the op is still there</td><td>No interrupt point reached yet</td><td><code>killPending: true</code>, <code>numYields</code> not moving</td></tr>
+    <tr><td>Query ran past its <code>maxTimeMS</code> and succeeded</td><td>It never checked for interrupts</td><td><code>numYields: 0</code>, small <code>numInterruptChecks</code></td></tr>
+    <tr><td>Instant <code>Unauthorized</code> or <code>NotWritablePrimary</code></td><td>Rejected in dispatch, step 6</td><td>Error in milliseconds, too fast for the slow log; <code>metrics.commands.&lt;name&gt;.failed</code> rises</td></tr>
+  </table>
+
+  <div class="lab">
+    <p>About 15 minutes, most of it seeding. Run from the <code>mongodb/</code> folder. Your times will differ a little; the shape (deadline ±15 ms, kill in ms, nothing stops the no-check run) should match.</p>
+    <ol>
+      <li>Start a 1-node replica set (so read-concern defaults apply, as in production) and seed 5 million reviews. Seeding took 2 min 16 s here.
+<pre class="terminal"><code>docker run -d --name lab10-m1 --hostname m1 -m 1g mongo:8.0 --replSet rs0 --bind_ip_all
+sleep 5
+docker exec lab10-m1 mongosh --quiet --eval 'rs.initiate({_id: "rs0", members: [{_id: 0, host: "m1:27017"}]})'
+sleep 10
+docker cp lessons/code/seed-reviews.js lab10-m1:/seed-reviews.js
+docker exec lab10-m1 mongosh store --quiet --eval 'const N = 5000000' --file /seed-reviews.js</code></pre></li>
+      <li>Time the full scan once. <strong>Predict first:</strong> how many interrupt checks will a 2.5 s scan do with the default 10 ms yield period?
+<pre class="terminal"><code>docker exec lab10-m1 mongosh store --quiet --eval 'let t = Date.now(); print(db.reviews.countDocuments({review: /battery/i}), Date.now() - t, "ms")'</code></pre>
+<pre class="output"><code>1159853 2521 ms</code></pre></li>
+      <li>Run the lab script: deadlines, a cursor's budget, <code>killOp</code> from a second shell, and the same with interrupt checks every 5 s. It resets the knob at the end.
+<pre class="terminal"><code>bash lessons/code/0010-dispatch-lab.sh</code></pre>
+<pre class="output"><code>== 1. maxTimeMS on one command (countDocuments = one aggregate, scans everything)
+maxTimeMS 500 -> MaxTimeMSExpired 50 after 515 ms
+maxTimeMS 1000 -> MaxTimeMSExpired 50 after 1002 ms
+maxTimeMS 2000 -> MaxTimeMSExpired 50 after 2011 ms
+== 2. maxTimeMS on a find cursor: a budget of server time across find + getMores
+MaxTimeMSExpired after 479951 documents; the shell waited 7454 ms
+   getMore 183 ms … getMore 109 ms MaxTimeMSExpired
+   total server time: 1017 ms
+== 3. killOp from a second shell, after 1.5 s
+shell 2: opid 332801 secs_running Long('1') COLLSCAN numYields 95 mongosh 2.13.0
+shell 2: killOp returned at 1793339827591
+shell 1: Interrupted 11601 at 1793339827594 (ran 1540 ms)
+== 4. Same two tests with interrupt checks pushed to every 5 s (LAB ONLY, never in production)
+maxTimeMS 500 -> finished anyway after 2250 ms, n = 1159853
+shell 2: killOp returned at 1793339831959
+shell 2: 0.5 s later: killPending true numYields 0
+shell 1: finished anyway at 1793339833115 after 2212 ms, n = 1159853
+== 5. The slow-query log lines for the tests above
+   lab10-deadline-… {'durationMillis': 1001, 'planSummary': 'COLLSCAN', 'numYields': 62, 'errCode': 50, 'errName': 'MaxTimeMSExpired'}
+   lab10-runaway-…  {'durationMillis': 1531, 'planSummary': 'COLLSCAN', 'numYields': 96, 'errCode': 11601, 'errName': 'Interrupted'}
+   lab10-noyield-…  {'durationMillis': 2237, 'planSummary': 'COLLSCAN', 'numYields': 0}</code></pre>
+      Then read one full line yourself and find every field from section 4:
+<pre class="terminal"><code>docker logs lab10-m1 2>&amp;1 | grep '"Slow query"' | grep lab10-runaway | tail -1</code></pre></li>
+      <li>Kill a write halfway, by hand, in two terminals. <strong>Predict first:</strong> after the kill, how many reviews have <code>flagged: true</code>: none, all 1,159,853, or some?
+        <p>Terminal 1:</p>
+<pre class="terminal"><code>docker exec lab10-m1 mongosh store --quiet --eval 'db.reviews.updateMany({review: /battery/i}, {$set: {flagged: true}}, {comment: "lab10-flag"})'</code></pre>
+        <p>Terminal 2, within a second or two:</p>
+<pre class="terminal"><code>docker exec lab10-m1 mongosh admin --quiet --eval '
+  const op = db.aggregate([{$currentOp: {}}, {$match: {"command.comment": "lab10-flag"}}]).toArray()[0];
+  print(op.opid, op.op, op.planSummary, op.secs_running); db.killOp(op.opid)'
+docker exec lab10-m1 mongosh store --quiet --eval 'db.reviews.countDocuments({flagged: true})'</code></pre>
+<pre class="output"><code>MongoServerError[Interrupted]: operation was interrupted      (terminal 1)
+172232                                                         (terminal 2: yours will differ)</code></pre>
+        Clean up the test field: <code>docker exec lab10-m1 mongosh store --quiet --eval 'db.reviews.updateMany({flagged: {$exists: true}}, {$unset: {flagged: ""}})'</code></li>
+      <li>Optional: the same <code>find</code> with the driver's <code>timeoutMS: 1000</code> (Node driver 7.7.0, as in lesson 7):
+<pre class="terminal"><code>docker run -d --name lab10-node --network container:lab10-m1 -m 512m -v "$PWD/lessons/code":/code node:22-alpine sleep infinity
+docker exec lab10-node sh -c 'cd /tmp &amp;&amp; npm i -s mongodb@7.7.0'
+docker exec -e NODE_PATH=/tmp/node_modules lab10-node node /code/0010-csot.js</code></pre>
+<pre class="output"><code>timeoutMS 1000 -> MongoOperationTimeoutError after 186040 documents, 1008 ms wall clock
+timeoutMS 1000 -> MongoOperationTimeoutError after 186040 documents, 1009 ms wall clock
+timeoutMS 1000 -> MongoOperationTimeoutError after 186040 documents, 1006 ms wall clock</code></pre></li>
+      <li>Clean up: <code>docker rm -f lab10-m1 lab10-node</code></li>
+    </ol>
+  </div>
+
+  <h2>7 · Check yourself</h2>
+  <p>From memory. The first question comes from lesson 2.1 on purpose.</p>
+  <div id="quiz"></div>
+
+  <h2>Where this fits</h2>
+  <ol>
+    <li><s>Hop 1, the driver: pool, monitoring, server selection</s> ✓ (<a href="0007-driver-pool.html">lesson 7</a>)</li>
+    <li><s>Hop 2, the wire: OP_MSG in depth</s> ✓ (<a href="0008-op-msg.html">lesson 8</a>)</li>
+    <li><s>Hop 3, ingress: sessions, threads, connection limits</s> ✓ (<a href="0009-ingress.html">lesson 9</a>)</li>
+    <li><s>Hop 4, dispatch: parse, auth, deadline, run, interrupt</s> ✓ (today)</li>
+    <li><strong>Next: recap.</strong> Diagnose a latency spike across hops 1–4, using the evidence each hop leaves behind (driver events, connection counts, queues, the slow-query log).</li>
+  </ol>
+
+  <div class="callout source">
+    <p>Read <a href="https://github.com/mongodb/mongo/blob/r8.0.34/docs/command_dispatch.md"><code>docs/command_dispatch.md</code></a> (r8.0.34), then <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L1628"><code>ExecCommandDatabase::_initiateCommand</code></a> top to bottom with section 1 next to it, then <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/operation_context.cpp#L220"><code>OperationContext::checkForInterruptNoAssert</code></a>. For the operator's view, the manual's <a href="https://www.mongodb.com/docs/manual/tutorial/terminate-running-operations/">Terminate Running Operations</a> (9.0) and the <a href="https://specifications.readthedocs.io/en/latest/client-side-operations-timeout/client-side-operations-timeout/">CSOT spec</a>.</p>
+  </div>
+
+  <div class="callout ask">
+    <p>Try it on your own system: find the slowest query in your logs that has an <code>errCode</code>. Is it 50 or 11601? What were its <code>planSummary</code> and <code>numYields</code>, and did the caller have a <code>timeoutMS</code>? Paste me the line (remove the values) and we'll read it together. Ask me anything that's unclear.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="0009-ingress.html">← Lesson 9: Server ingress</a>
+    <a href="../reference/architecture-map.html">Reference: architecture map</a>
+    <a href="0011-transport-recap.html">Lesson 11: Recap →</a>
+  </nav>
+</main>
+
+<script src="../../assets/quiz.js"></script>
+<script>
+const R = 'https://github.com/mongodb/mongo/blob/r8.0.34/';
+const SEP = R + 'src/mongo/db/service_entry_point_common.cpp';
+const BTREE = 'https://source.wiredtiger.com/develop/arch-btree.html';
+const MAXTIME = 'https://www.mongodb.com/docs/manual/reference/method/cursor.maxTimeMS/';
+const KILLOP = 'https://www.mongodb.com/docs/manual/reference/command/killOp/';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0010-dispatch',
+  questions: [
+    { layer: 'review',
+      q: '<em>From lesson 2.1:</em> new verified 5★ reviews fill a <strong>non-root</strong> leaf page of the <code>{verified: 1, rating: 1}</code> index, and it splits. Its parent page has room. What happens to the height of the tree?',
+      options: ['It grows by one level', 'It stays the same height', 'It shrinks by one level', 'It doubles its leaf count'], answer: 1,
+      explain: `The leaf splits in two and one separator key moves up into the parent. Only a <em>root</em> split adds a level, because a new root is created above it.${c(BTREE, 'WT B-trees')}` },
+
+    { layer: 'dispatch',
+      q: 'A user with no read access on <code>store</code> sends <code>find({review: /battery/i})</code> with <code>maxTimeMS: 1</code>. What comes back?',
+      options: ['MaxTimeMSExpired (50), after one millisecond', 'CommandNotFound (59), during command lookup', 'Unauthorized (13), before any scanning', 'Interrupted (11601), at first yield'], answer: 2,
+      explain: `<code>checkAuthorization</code> runs in <code>_initiateCommand</code> before the deadline is even set and long before <code>run()</code>. In the lab it came back in 5 ms, and the error message echoed the body, <code>$db: "store"</code> included.${c(SEP + '#L1731', 'L1731')}` },
+
+    { layer: 'interrupt',
+      q: '<code>db.killOp(opid)</code> returns <code>{info: "attempting to kill op", ok: 1}</code>. What does that tell you?',
+      options: ['The op was flagged for killing', 'The op has already stopped running', 'The op rolled back its writes', 'The op will restart from scratch'], answer: 0,
+      explain: `killOp only calls <code>markKilled</code>, which sets a flag, and "always reports success once past the auth check." Check <code>$currentOp</code> again: gone, or <code>killPending: true</code>.${c(R + 'src/mongo/db/commands/kill_op.cpp#L60', 'kill_op.cpp')}${c(KILLOP, 'killOp')}` },
+
+    { layer: 'interrupt',
+      q: 'A scan reaches no interrupt check for its whole 2.2 seconds. You run <code>killOp</code> on it after 1 second. What happens?',
+      options: ['It stops within about ten milliseconds', 'The server kills its thread immediately', 'The server closes the client connection', 'It keeps running until it finishes'], answer: 3,
+      explain: `Interruption is cooperative: the thread only sees the flag in <code>checkForInterrupt</code>. In the lab (checks pushed to every 5 s) it ran to 2.2 s and returned the full count, with <code>killPending: true</code> meanwhile.${c(R + 'src/mongo/db/operation_context.cpp#L220', 'checkForInterrupt')}` },
+
+    { layer: 'interrupt',
+      q: 'In mongosh, <code>find({review: /battery/i}).maxTimeMS(1000)</code> failed with <code>MaxTimeMSExpired</code>, but the shell waited 7.4 seconds. Why?',
+      options: ['The deadline restarts with every new getMore', 'maxTimeMS counts only server time per cursor', 'maxTimeMS applies only to the first batch', 'The server ignored maxTimeMS on getMore commands'], answer: 1,
+      explain: `Each <code>getMore</code> gets the cursor's <em>leftover</em> time. The server's commands added up to about 1,017 ms; the rest was network and the shell handling 480,000 documents. Use the driver's <code>timeoutMS</code> to bound wall-clock time.${c(R + 'src/mongo/db/commands/getmore_cmd.cpp#L305', 'getmore_cmd.cpp')}${c(MAXTIME, 'cursor.maxTimeMS')}` },
+
+    { layer: 'interrupt',
+      q: 'You kill <code>updateMany({review: /battery/i}, {$set: {flagged: true}})</code> halfway. No transaction. What about the documents it already changed?',
+      options: ['Every update is rolled back', 'Updates pause until you resume', 'Earlier updates stay in place', 'Only the oplog keeps them'], answer: 2,
+      explain: `"The modification of each document is atomic, but the operation as a whole is not atomic." In the lab, 172,232 reviews stayed flagged, and the client only got <code>Interrupted</code>, with no count.${c('https://www.mongodb.com/docs/manual/core/write-operations-atomicity/', 'atomicity')}` },
+
+    { layer: 'observe',
+      q: 'A slow-log line shows <code>maxTimeMS: 500</code> in the command, <code>durationMillis: 2237</code>, <code>numYields: 0</code> and no <code>errName</code>. What do you conclude?',
+      options: ['It never reached an interrupt check', 'The client clock was badly skewed', 'Yields only happen on index scans', 'maxTimeMS only ever applies to writes'], answer: 0,
+      explain: `A deadline is only noticed in <code>checkForInterrupt</code>, and a scan checks at its yield points. Zero yields on a 2-second query means nothing looked at the deadline. The lab reproduced exactly this line.${c(R + 'src/mongo/db/query/plan_yield_policy.h#L215', 'plan_yield_policy.h')}` },
+
+    { layer: 'dispatch',
+      q: 'Where does the server turn a command\'s <code>maxTimeMS</code> into a deadline on the OperationContext?',
+      options: ['In the driver, before sending it', 'In WiredTiger, once per page read', 'In SessionWorkflow, when bytes are read', 'In dispatch, after the auth check'], answer: 3,
+      explain: `<code>_initiateCommand</code> calls <code>setDeadlineByDate(startedCommandExecAt + maxTimeMS, MaxTimeMSExpired)</code>, after <code>checkAuthorization</code>. The clock starts at the top of that function, so socket reading and parsing are not counted.${c(SEP + '#L1808', 'L1808')}` }
+  ]
+});
+</script>
+</body>
+</html>

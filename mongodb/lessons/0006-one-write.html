@@ -362,7 +362,7 @@ db.reviews.find({ _id: id }).readConcern("majority").toArray()  // majority read
     <li><s>Concurrency: snapshots, update chains, write conflicts</s> ✓</li>
     <li><s>Durability: journal and checkpoints</s> ✓</li>
     <li><s>MongoDB on top: one write traced end to end</s> ✓ (today). <strong>Phase 1 is done.</strong></li>
-    <li><strong>Next, Phase 2: transport and wire.</strong> Hops 1–4 in depth: the thread model, OP_MSG flags (<code>moreToCome</code>, <code>exhaustAllowed</code>), compression, and how the driver's pool and monitoring work.</li>
+    <li><strong>Next, Phase 2: transport and wire</strong> (starts with <a href="0007-driver-pool.html">lesson 7</a>). Hops 1–4 in depth: the thread model, OP_MSG flags (<code>moreToCome</code>, <code>exhaustAllowed</code>), compression, and how the driver's pool and monitoring work.</li>
   </ol>
 
   <div class="callout source">
@@ -376,7 +376,7 @@ db.reviews.find({ _id: id }).readConcern("majority").toArray()  // majority read
   <nav class="lesson-nav">
     <a href="0005-durability.html">← Lesson 5: Durability</a>
     <a href="../reference/architecture-map.html">Reference: architecture map</a>
-    <span>Phase 2: Transport (next)</span>
+    <a href="0007-driver-pool.html">Lesson 7: The driver's pool →</a>
   </nav>
 </main>
 

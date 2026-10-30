@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 7 · The Driver's Side: Pool and Monitoring</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<link rel="stylesheet" href="../../assets/quiz.css">
+<style>
+  /* Lesson-local */
+  .hop { display: inline-block; min-width: 1.5em; text-align: center; font: 600 .78rem/1.5 'JetBrains Mono', monospace; color: var(--accent); border: 1px solid var(--accent); border-radius: 50%; margin-right: .3rem; }
+  .table-scroll { overflow-x: auto; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.hot td { background: var(--warn-bg); }
+</style>
+</head>
+<body>
+<main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>
+  <div class="kicker">MongoDB Internals · Lesson 0007 · Phase 2: Transport &amp; wire</div>
+  <h1>The driver's side: pool and monitoring</h1>
+  <p class="subtitle">Before mongod sees a single byte of your query, the driver has already done three things: it knew which servers exist, it picked one, and it borrowed a connection. This lesson opens hop 1.</p>
+
+  <p><strong>Your win today:</strong> when your app sees a slow <code>find</code> but the server's <code>durationMillis</code> is short, you can prove the time went into the driver's <em>wait queue</em>, and you can choose <code>maxPoolSize</code>, <code>maxConnecting</code> and the timeouts with a reason for each. That's the "diagnose a production symptom by naming the mechanism and the metric" goal from your <a href="../MISSION.md">mission</a>.</p>
+
+  <h2>0 · Warm-up from lesson 6</h2>
+  <p>From memory, before reading on.</p>
+  <ol>
+    <li>Lesson 6, hop 3: how many commands can one connection run at the same time?</li>
+    <li>Your app fires 40 <code>find</code>s at once. The driver's pool to the primary has 5 connections, and each <code>find</code> takes 100 ms on the server. About how long does the <em>last</em> one take, as your app sees it?</li>
+  </ol>
+  <p>Write down a number for question 2. Section 4 shows what I measured.</p>
+
+  <h2>1 · What one MongoClient holds</h2>
+  <p>Our query, as always: <code>db.reviews.find({rating: {$gte: 4}})</code> in <code>store.reviews</code>. The app talks to a 3-member replica set (<code>m1</code> primary, <code>m2</code>, <code>m3</code>). Inside the <code>MongoClient</code> there are three parts. Each one has its own driver spec, which every official driver implements:</p>
+  <ul>
+    <li><strong>Monitoring (SDAM).</strong> One <em>monitor</em> per server keeps the client's picture of the cluster, the <em>topology description</em>: who is primary, who is a secondary, how far away each one is.<a class="cite" href="https://specifications.readthedocs.io/en/latest/server-discovery-and-monitoring/server-monitoring/">server monitoring spec</a></li>
+    <li><strong>Server selection.</strong> For each operation, it uses that picture and your read preference to choose one server.<a class="cite" href="https://specifications.readthedocs.io/en/latest/server-selection/server-selection/">server selection spec</a></li>
+    <li><strong>Connection pool (CMAP).</strong> One pool <em>per server</em>. The operation borrows ("checks out") a connection, uses it for one command, and gives it back ("checks in").<a class="cite" href="https://specifications.readthedocs.io/en/latest/connection-monitoring-and-pooling/connection-monitoring-and-pooling/">CMAP spec</a></li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 680 330" role="img" aria-label="One MongoClient with three server entries, m1, m2 and m3. Each entry has a monitor socket running a streaming hello, an RTT socket, and a connection pool. Only m1's pool has a connection after one find on the primary. Server selection sits on top and sends the find to m1's pool. Seven sockets in total.">
+      <defs><marker id="ah7a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+      <rect class="box-accent" x="10" y="10" width="440" height="310" rx="8" fill="none"/>
+      <text class="lbl-title" x="24" y="34">MongoClient (one per app process)</text>
+      <rect class="box" x="24" y="46" width="412" height="40" rx="5"/>
+      <text class="lbl" x="36" y="64">server selection</text>
+      <text class="lbl-sm" x="36" y="79">read preference + topology description → one server</text>
+
+      <text class="lbl" x="24" y="112">m1 (primary)</text>
+      <rect class="box" x="24" y="120" width="120" height="44" rx="4"/><text class="lbl-sm" x="32" y="138">monitor socket</text><text class="lbl-sm" x="32" y="154">streaming hello</text>
+      <rect class="box" x="152" y="120" width="96" height="44" rx="4"/><text class="lbl-sm" x="160" y="138">RTT socket</text><text class="lbl-sm" x="160" y="154">ping, 10 s</text>
+      <rect class="box-accent" x="256" y="120" width="180" height="44" rx="4"/><text class="lbl-sm" x="264" y="138">pool: 1 connection</text><text class="lbl-sm" x="264" y="154">max 100 · 2 opening</text>
+
+      <text class="lbl" x="24" y="190">m2</text>
+      <rect class="box" x="24" y="198" width="120" height="36" rx="4"/><text class="lbl-sm" x="32" y="220">monitor socket</text>
+      <rect class="box" x="152" y="198" width="96" height="36" rx="4"/><text class="lbl-sm" x="160" y="220">RTT socket</text>
+      <rect class="box" x="256" y="198" width="180" height="36" rx="4" stroke-dasharray="4 3"/><text class="lbl-sm" x="264" y="220">pool: empty</text>
+
+      <text class="lbl" x="24" y="258">m3</text>
+      <rect class="box" x="24" y="266" width="120" height="36" rx="4"/><text class="lbl-sm" x="32" y="288">monitor socket</text>
+      <rect class="box" x="152" y="266" width="96" height="36" rx="4"/><text class="lbl-sm" x="160" y="288">RTT socket</text>
+      <rect class="box" x="256" y="266" width="180" height="36" rx="4" stroke-dasharray="4 3"/><text class="lbl-sm" x="264" y="288">pool: empty</text>
+
+      <path class="edge-accent" d="M346 86 L346 116" marker-end="url(#ah7a)"/>
+      <text class="lbl-sm" x="352" y="104">find → m1</text>
+
+      <rect class="box" x="520" y="120" width="140" height="44" rx="5"/><text class="lbl" x="534" y="140">m1 mongod</text><text class="lbl-sm" x="534" y="156">3 sockets</text>
+      <rect class="box" x="520" y="198" width="140" height="36" rx="5"/><text class="lbl" x="534" y="221">m2 mongod · 2</text>
+      <rect class="box" x="520" y="266" width="140" height="36" rx="5"/><text class="lbl" x="534" y="289">m3 mongod · 2</text>
+      <path class="edge" d="M440 142 L516 142" marker-end="url(#ah7a)"/>
+      <path class="edge" d="M440 216 L516 216" marker-end="url(#ah7a)"/>
+      <path class="edge" d="M440 284 L516 284" marker-end="url(#ah7a)"/>
+    </svg>
+    <figcaption>After one <code>find</code> on the primary: 2 monitoring sockets per member, plus 1 pooled connection on <code>m1</code>. Seven sockets for one query. The lab counts them with <code>$currentOp</code>.</figcaption>
+  </figure>
+
+  <h2>2 · The walkthrough: one <code>find</code> through hop 1</h2>
+  <p>Measured with the Node.js driver <strong>7.7.0</strong> (current release, 2026-09) and <code>mongo:8.0</code> (8.0.34), a 3-node replica set in Docker, 200,000 seeded reviews. Defaults are from the driver's own source at tag <code>v7.7.0</code>.<a class="cite" href="https://github.com/mongodb/node-mongodb-native/blob/v7.7.0/src/connection_string.ts#L850">connection_string.ts</a></p>
+  <ol>
+    <li><strong>The picture is already there.</strong> When the client started, the monitors connected to every host in the URI and ran <code>hello</code>. The replies said "I'm primary" or "I'm secondary", and the client built its topology description from them. Your <code>find</code> does not wait for that again.</li>
+    <li><strong>Server selection.</strong> The default read preference is <code>primary</code>, so only <code>m1</code> is suitable. With <code>secondaryPreferred</code> or <code>nearest</code> there can be several suitable servers; section 3 shows how it picks one. If no suitable server exists (say, during an election), the driver asks the monitors for an immediate check and waits, up to <code>serverSelectionTimeoutMS</code> = 30 s.<a class="cite" href="https://specifications.readthedocs.io/en/latest/server-selection/server-selection/#server-selection-algorithm">selection loop</a></li>
+    <li><strong>Check out from <code>m1</code>'s pool.</strong> Three cases, checked in this order:<a class="cite" href="https://github.com/mongodb/node-mongodb-native/blob/v7.7.0/src/cmap/connection_pool.ts#L724">processWaitQueue</a>
+      <ul>
+        <li>an idle connection is in the pool → take it (fast path, microseconds);</li>
+        <li>fewer than <code>maxPoolSize</code> (100) connections exist <em>and</em> fewer than <code>maxConnecting</code> (2) are being opened right now → open a new one;</li>
+        <li>otherwise → wait in the <strong>wait queue</strong>, in order, until a connection is checked in.<a class="cite" href="https://specifications.readthedocs.io/en/latest/connection-monitoring-and-pooling/connection-monitoring-and-pooling/#waitqueue">CMAP WaitQueue</a></li>
+      </ul></li>
+    <li><strong>Opening a connection</strong> (only if needed) is several round trips: TCP connect, the TLS handshake if TLS is on, then the MongoDB handshake. The handshake is one <code>hello</code> carrying your client metadata, and with credentials it also carries the first step of SCRAM authentication (<code>speculativeAuthenticate</code>), which saves one round trip.<a class="cite" href="https://github.com/mongodb/node-mongodb-native/blob/v7.7.0/src/cmap/connect.ts#L236">connect.ts</a><a class="cite" href="https://github.com/mongodb/node-mongodb-native/blob/v7.7.0/src/cmap/auth/scram.ts#L41">scram.ts</a> In the lab, a new connection was ready in <strong>1 ms</strong> (p50) without auth and <strong>1–2 ms</strong> with SCRAM-SHA-256. The first authenticated connection in a process took 7–9 ms: the driver caches the expensive salted-password step after that.<a class="cite" href="https://github.com/mongodb/node-mongodb-native/blob/v7.7.0/src/cmap/auth/scram.ts#L310">HI cache</a> (TLS I did not measure. Across a real network, every one of these round trips costs your RTT.)</li>
+    <li><strong>Send, wait, check in.</strong> The <code>find</code> goes out as one OP_MSG (hop 2, next lesson) on that connection. The connection is now busy until the reply comes back. Then it goes back to the pool for the next operation.</li>
+  </ol>
+  <p>The server sees the handshake too. <code>$currentOp</code> shows each connection's <code>clientMetadata</code>, which is where <code>appName</code> comes from:</p>
+<pre class="output"><code>{ desc: 'conn185', client: '172.19.0.6:33482',
+  clientMetadata: { application: { name: 'lab7-monitor' },
+                    driver: { name: 'nodejs', version: '7.7.0' },
+                    platform: 'Node.js v22.23.4, LE', os: { name: 'linux', … },
+                    env: { container: { runtime: 'docker' } } }, active: false }</code></pre>
+
+  <h2>3 · Monitoring and selection: the sockets you didn't ask for</h2>
+  <p>The lab's <code>monitor</code> experiment ran one <code>findOne</code>, waited 25 s, and then asked each member's <code>$currentOp</code> (with <code>idleConnections: true</code>) for sockets with our <code>appName</code>:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Member</th><th>Active</th><th>Command</th><th>What it is</th></tr>
+    <tr><td>m1</td><td>true</td><td><code>hello</code>, <code>maxAwaitTimeMS: 10000</code></td><td>monitor: a <em>streaming</em> hello, parked on the server</td></tr>
+    <tr><td>m1</td><td>false</td><td>(idle)</td><td>RTT pinger</td></tr>
+    <tr><td>m1</td><td>false</td><td>(idle)</td><td>the pooled connection our <code>findOne</code> used</td></tr>
+    <tr><td>m2</td><td>true / false</td><td><code>hello</code> / (idle)</td><td>monitor + RTT pinger</td></tr>
+    <tr><td>m3</td><td>true / false</td><td><code>hello</code> / (idle)</td><td>monitor + RTT pinger</td></tr>
+  </table>
+  </div>
+  <ul>
+    <li><strong>Streaming monitor.</strong> The monitor sends <code>hello</code> with its last <code>topologyVersion</code> and <code>maxAwaitTimeMS</code> = <code>heartbeatFrequencyMS</code> (10 s). The server holds the request and answers when its state changes, or when the 10 s run out. With the <code>exhaustAllowed</code> flag it can keep answering without new requests (that's OP_MSG's <code>moreToCome</code>, <a href="0008-op-msg.html">lesson 8</a>).<a class="cite" href="https://specifications.readthedocs.io/en/latest/server-discovery-and-monitoring/server-monitoring/#streaming-protocol">streaming protocol</a><a class="cite" href="https://github.com/mongodb/node-mongodb-native/blob/v7.7.0/src/sdam/monitor.ts#L342">monitor.ts</a> In the lab the heartbeats per member arrived at +14 ms, +10.5 s and +20.5 s. So a step-down reaches the client in milliseconds, not in "up to 10 s".</li>
+    <li><strong>RTT pinger.</strong> A parked hello can't measure latency, so streaming needs "an extra thread and an extra socket for each monitor to perform RTT calculations." The client keeps the minimum and average over the last 10 samples.<a class="cite" href="https://specifications.readthedocs.io/en/latest/server-discovery-and-monitoring/server-monitoring/#measuring-rtt">measuring RTT</a> (On FaaS platforms like Lambda, <code>serverMonitoringMode: "auto"</code> switches to polling, with no RTT socket.)</li>
+    <li><strong>Not in the pool, no auth.</strong> Monitoring uses "a dedicated socket that does not count toward the pool's maximum size", and drivers "MUST NOT authenticate on sockets used for monitoring".<a class="cite" href="https://specifications.readthedocs.io/en/latest/server-discovery-and-monitoring/server-monitoring/#servers-are-monitored-with-dedicated-sockets">dedicated sockets</a><a class="cite" href="https://github.com/mongodb/node-mongodb-native/blob/v7.7.0/src/sdam/monitor.ts#L144">monitor.ts</a> So the server's real count per app process is <strong>2 × members + pool sizes</strong>.</li>
+    <li><strong>When a check fails</strong> with a network error, the monitor marks the server <code>Unknown</code> and clears its pool, then checks again at once.<a class="cite" href="https://specifications.readthedocs.io/en/latest/server-discovery-and-monitoring/server-discovery-and-monitoring/#network-or-command-error-during-server-check">SDAM error handling</a> A network error on an application connection does the same.</li>
+  </ul>
+
+  <h3>Choosing among several servers: the latency window</h3>
+  <p>With <code>nearest</code> (or several eligible secondaries), selection is: take the suitable servers, keep those whose RTT is within <code>localThresholdMS</code> (15 ms) of the fastest one, then pick two of them at random and use the one with fewer operations in flight.<a class="cite" href="https://specifications.readthedocs.io/en/latest/server-selection/server-selection/#filtering-suitable-servers-based-on-the-latency-window">latency window</a><a class="cite" href="https://github.com/mongodb/node-mongodb-native/blob/v7.7.0/src/sdam/topology.ts#L1023">topology.ts</a> In the lab, all RTTs were 0–5 ms, so all three members were in the window and each got about a third of 3,000 finds (960–1,033). With <code>localThresholdMS: 0</code>, the finds went to whichever one or two members tied for the lowest RTT.</p>
+
+  <h2>4 · The pool under load</h2>
+  <p>To make the server work, the lab uses the slow version of our query: positive reviews that mention a refund, <code>find({rating: {$gte: 4}, review: /refund/})</code>. No review says "refund", so every run scans all 200,000 documents and returns nothing. Alone, it takes <strong>74–77 ms</strong> (<code>executionTimeMillis</code>). Then: 40 of them at once, for different <code>maxPoolSize</code> values. The driver's CMAP events give the checkout wait (<code>ConnectionCheckedOut.durationMS</code>), command monitoring gives the command time, and the server's slow-query log gives <code>durationMillis</code>. One or two runs each, p50 unless noted:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>maxPoolSize</th><th class="num">waiting in driver at +300 ms</th><th class="num">running on m1</th><th class="num">checkout wait</th><th class="num">command time</th><th class="num">app sees (p50 / p95)</th><th class="num">all 40 done</th></tr>
+    <tr><td>1</td><td class="num">n/a</td><td class="num">1</td><td class="num">1,733 ms</td><td class="num">80 ms</td><td class="num">1,812 / 3,248 ms</td><td class="num">3.3 s</td></tr>
+    <tr class="hot"><td>5</td><td class="num">25</td><td class="num">5</td><td class="num">411–478 ms</td><td class="num">105–123 ms</td><td class="num">515–576 / 884–1,006 ms</td><td class="num">0.89–1.01 s</td></tr>
+    <tr><td>40</td><td class="num">0</td><td class="num">38</td><td class="num">47–52 ms</td><td class="num">595–674 ms</td><td class="num">645–737 / 788–900 ms</td><td class="num">0.81–0.91 s</td></tr>
+    <tr><td>100 (default)</td><td class="num">0</td><td class="num">36</td><td class="num">72 ms</td><td class="num">572 ms</td><td class="num">644 / 764 ms</td><td class="num">0.77 s</td></tr>
+  </table>
+  </div>
+  <p>Read the yellow row first. That's the symptom from your win: the server's slow log said <code>durationMillis</code> ≈ <strong>103 ms</strong>, and the app saw <strong>~550 ms</strong>. 80% of the latency was the wait queue, and the server can't see it: at +300 ms, <code>$currentOp</code> showed 5 finds while 25 more were queued in the driver. The answer to warm-up question 2: the last one took about 0.9 s, roughly 40 ÷ 5 = 8 rounds of ~110 ms.</p>
+  <p>Now the surprise. With 40 connections, the driver wait went away, but the <em>command</em> time grew to ~600 ms, and the total hardly moved. The slow log shows where: <code>durationMillis</code> ~585 ms, <code>workingMillis</code> ~170 ms, and <code>queues.execution.totalTimeQueuedMicros</code> ≈ 500,000–640,000. The finds were waiting for an <em>execution ticket</em> inside mongod (8.0's throughput-probing admission control limits how many operations run in the storage engine at once).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/admission/README.md">execution control README</a> CPU per find (<code>cpuNanos</code>) was ~95–125 ms either way.</p>
+  <div class="callout">
+    <p><strong>A bigger pool doesn't create capacity. It moves the queue.</strong> With 5 connections the queue is in your driver, invisible to the server. With 40 it's in mongod's admission queue, visible in the slow log as <code>durationMillis</code> − <code>workingMillis</code>. The work is the same 40 collection scans. The fix for this query is an index, not a pool size. Lessons 9 and 10 go inside mongod's side of this.</p>
+  </div>
+
+  <h3>How long does a request wait for a connection?</h3>
+  <p>In Node 7.7.0, <code>waitQueueTimeoutMS</code> defaults to <strong>0, which means no limit</strong>. Without <code>timeoutMS</code>, the checkout has no timeout at all.<a class="cite" href="https://github.com/mongodb/node-mongodb-native/blob/v7.7.0/src/timeout.ts#L368">timeout.ts</a> With <code>timeoutMS</code> set (client-side operation timeout, the spec's replacement for <code>waitQueueTimeoutMS</code>), the checkout counts against the same budget as server selection.<a class="cite" href="https://specifications.readthedocs.io/en/latest/connection-monitoring-and-pooling/connection-monitoring-and-pooling/#connection-pool-options">CMAP options</a><a class="cite" href="https://github.com/mongodb/node-mongodb-native/blob/v7.7.0/src/timeout.ts#L263">timeout.ts</a> With <code>maxPoolSize: 5, waitQueueTimeoutMS: 200</code>, the same 40 finds gave <strong>10–14 ok and 26–30 <code>MongoWaitQueueTimeoutError</code></strong>. That's what you want: a fast, explicit "pool exhausted" error instead of a request that hangs.</p>
+
+  <h2>5 · Connection storms: <code>maxConnecting</code> and failovers</h2>
+  <p>A cold pool and a burst of work is the moment a pool can hurt the server. <code>maxConnecting</code> (default 2) is the number of connections one pool may be opening at the same time.<a class="cite" href="https://github.com/mongodb/node-mongodb-native/blob/v7.7.0/src/cmap/connection_pool.ts#L775">connection_pool.ts</a> The lab fired 100 fast finds (<code>find({rating: {$gte: 4}}).limit(1)</code>) at a brand-new client:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>maxConnecting</th><th class="num">connections opened</th><th class="num">setup time, p50</th><th class="num">app sees, p50</th><th class="num">all 100 done</th></tr>
+    <tr><td>2 (default)</td><td class="num">11–13</td><td class="num">6–8 ms</td><td class="num">29–42 ms</td><td class="num">42–63 ms</td></tr>
+    <tr><td>10</td><td class="num">31</td><td class="num">16 ms</td><td class="num">45 ms</td><td class="num">61 ms</td></tr>
+    <tr><td>100</td><td class="num">100</td><td class="num">35–62 ms</td><td class="num">60–98 ms</td><td class="num">76–108 ms</td></tr>
+  </table>
+  </div>
+  <p>With 2 at a time, connections finished and were reused before the driver needed more: 100 finds were served by ~12 connections. With 100 at a time, the client opened 100 connections, each one took about 5–10× longer to set up, and the burst finished <em>later</em>. Each connection costs the server too: on 8.0 a new connection gets its own thread (<a href="0009-ingress.html">lesson 9</a>).</p>
+
+  <h3>Failover</h3>
+  <p>The <code>failover</code> experiment ran 20 workers doing finds with <code>maxPoolSize: 20</code>, then made the primary go away in two ways:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th></th><th>Planned: <code>replSetStepDown</code></th><th>Crash: <code>docker kill lab7-m1</code></th></tr>
+    <tr><td>Driver saw m1 change</td><td>4–22 ms after the command (streaming hello)</td><td>almost at once: network errors on its sockets</td></tr>
+    <tr><td>m1's pool cleared?</td><td>no</td><td>yes (<code>PoolCleared</code>)</td></tr>
+    <tr><td>New primary</td><td>m2, 30–36 ms after the command</td><td>m3, 10.8 s later</td></tr>
+    <tr><td>Slowest find</td><td>30 ms</td><td><strong>10,853 ms</strong></td></tr>
+    <tr><td>Errors</td><td>0</td><td>0</td></tr>
+    <tr><td>New connections</td><td>20 to m2</td><td>20 to m3</td></tr>
+  </table>
+  </div>
+  <ul>
+    <li><strong>A step-down doesn't close client connections,</strong> and the stepped-down primary nominates a secondary to call an election immediately.<a class="cite" href="https://www.mongodb.com/docs/manual/reference/command/replSetStepDown/">replSetStepDown</a> The driver only clears a pool for "node is shutting down" errors, not for "not writable primary".<a class="cite" href="https://specifications.readthedocs.io/en/latest/server-discovery-and-monitoring/server-discovery-and-monitoring/#not-writable-primary-and-node-is-recovering">SDAM</a> So when <code>m1</code> took over again 10 s later (it has priority 2), its 20 connections were still there.</li>
+    <li><strong>A crash costs the election timeout.</strong> Nobody nominates anyone. The secondaries wait <code>electionTimeoutMillis</code> (10 s by default) before they call an election.<a class="cite" href="https://www.mongodb.com/docs/manual/core/replica-set-elections/">elections</a> There were no errors because every find sat in <em>server selection</em> (step 2) waiting for a primary, and that wait is allowed up to 30 s. To your app it looks like a 10.8 s query.</li>
+    <li><strong>The storm.</strong> Each process opened its pool to the new primary right away. Here that was 20 connections from one process. With 50 app instances at <code>maxPoolSize: 100</code>, that's up to 5,000 new connections (with SCRAM and maybe TLS) hitting one mongod in the seconds after an election, on top of the 2 monitoring sockets each process keeps on every member (100 per member for 50 instances). Deploying 50 instances at once creates the same wave. <code>maxConnecting</code> slows each process's share of it.</li>
+  </ul>
+
+  <h2>6 · So in production you should…</h2>
+  <div class="callout">
+    <p><strong>Rule: measure the checkout wait in the driver, size the pool for the concurrency the server can actually run, and give every request a time budget, so pool exhaustion fails fast instead of looking like a slow query.</strong></p>
+  </div>
+  <ol>
+    <li><strong>Subscribe to CMAP events</strong> (or your APM's equivalent) and graph checkout wait next to command time. <code>connectionCheckedOut.durationMS</code> is the number the server will never show you. Set <code>appName</code> on every client so its connections can be found in <code>$currentOp</code> and the slow log.</li>
+    <li><strong>Don't fix latency by raising <code>maxPoolSize</code></strong> unless the server is idle. If <code>durationMillis</code> − <code>workingMillis</code> grows when you raise it, you moved the queue into mongod. Fix the query (here: an index), or add capacity.</li>
+    <li><strong>Set <code>timeoutMS</code></strong> (or at least <code>waitQueueTimeoutMS</code>). The Node default waits for a connection forever. A bounded wait turns a hidden pile-up into an error you can count and alert on.</li>
+    <li><strong>Leave <code>maxConnecting</code> at 2</strong> unless you've measured that warm-up is too slow. Raising it made the burst slower, not faster.</li>
+    <li><strong>Do the connection math for the whole fleet:</strong> instances × (pool in use + 2 per member). Compare it with <code>serverStatus().connections</code> on the primary, and expect the pool part to arrive all at once after a failover or a deploy. A <code>minPoolSize</code> keeps a warm pool, but on <em>every</em> member, so it also adds idle connections.<a class="cite" href="https://specifications.readthedocs.io/en/latest/connection-monitoring-and-pooling/connection-monitoring-and-pooling/#why-do-we-set-minpoolsize-across-all-members-of-a-replicaset-when-most-traffic-will-be-against-a-primary">CMAP rationale</a></li>
+    <li><strong>Prefer planned step-downs</strong> (rolling maintenance) over killing a primary: 30 ms vs. 10.8 s in the lab. And remember that a step-down kills writes that are in progress; retryable writes cover one retry.<a class="cite" href="https://www.mongodb.com/docs/manual/reference/command/replSetStepDown/">replSetStepDown</a></li>
+  </ol>
+
+  <h3>Diagnosis table</h3>
+  <table>
+    <tr><th>Symptom</th><th>Mechanism</th><th>Proof</th></tr>
+    <tr><td>App latency ≫ server <code>durationMillis</code></td><td>Wait queue: pool exhausted</td><td>CMAP checkout <code>durationMS</code> high; <code>$currentOp</code> shows only <code>maxPoolSize</code> ops from that <code>appName</code></td></tr>
+    <tr><td>Server <code>durationMillis</code> ≫ <code>workingMillis</code></td><td>Admission queue in mongod</td><td><code>queues.execution.totalTimeQueuedMicros</code> in the slow log</td></tr>
+    <tr><td><code>MongoWaitQueueTimeoutError</code> / "Timed out during connection checkout"</td><td>Pool exhausted, with a bounded wait</td><td>Same as row 1; count the errors</td></tr>
+    <tr><td>Every query takes ~10 s at once, no errors</td><td>No primary: waiting in server selection</td><td><code>serverDescriptionChanged</code> → <code>Unknown</code>; <code>rs.status()</code> shows the election</td></tr>
+    <tr><td><code>connections.current</code> jumps after a failover or deploy</td><td>Connection storm</td><td><code>connections.totalCreated</code> rate; <code>ConnectionCreated</code> events per process</td></tr>
+  </table>
+
+  <div class="lab">
+    <p>About 20 minutes. Run these from the <code>mongodb/</code> folder. Your times will differ; the shape (where the time goes) should match.</p>
+    <ol>
+      <li>Start a 3-node replica set and seed 200,000 reviews:
+<pre class="terminal"><code>docker network create lab7
+for i in 1 2 3; do
+  docker run -d --name lab7-m$i --hostname m$i --network lab7 -m 1g mongo:8.0 \
+    --replSet rs0 --bind_ip_all --wiredTigerCacheSizeGB 0.25
+done
+sleep 5
+docker exec lab7-m1 mongosh --quiet --eval 'rs.initiate({_id: "rs0", members: [
+  {_id: 0, host: "m1:27017", priority: 2}, {_id: 1, host: "m2:27017"}, {_id: 2, host: "m3:27017"}]})'
+sleep 15
+docker cp lessons/code/seed-reviews.js lab7-m1:/seed-reviews.js
+docker exec lab7-m1 mongosh store --quiet --eval 'const N = 200000' --file /seed-reviews.js</code></pre></li>
+      <li>Time the slow query alone, on the server:
+<pre class="terminal"><code>docker exec lab7-m1 mongosh store --quiet --eval \
+  'db.reviews.find({rating: {$gte: 4}, review: /refund/}).explain("executionStats").executionStats.executionTimeMillis'</code></pre>
+<pre class="output"><code>74</code></pre></li>
+      <li>Start a Node container on the same network and install the driver:
+<pre class="terminal"><code>docker run -d --name lab7-node --network lab7 -m 512m -v "$PWD/lessons/code":/code node:22-alpine sleep infinity
+docker exec lab7-node sh -c 'cd /tmp &amp;&amp; npm i -s mongodb@7.7.0'
+alias lab7='docker exec -e NODE_PATH=/tmp/node_modules lab7-node node /code/0007-pool-lab.js'</code></pre>
+      The script is <a href="code/0007-pool-lab.js"><code>lessons/code/0007-pool-lab.js</code></a>. Read the <code>pool()</code> function first; it's 30 lines.</li>
+      <li>Count the sockets. <strong>Predict the number first.</strong>
+<pre class="terminal"><code>lab7 monitor</code></pre>
+      Check: heartbeats every ~10 s per member, and in the table one active <code>hello</code> (with <code>maxAwaitTimeMS: 10000</code>) plus one idle socket per member, plus one more idle socket on <code>m1</code>.</li>
+      <li>Pile up 40 slow finds. <strong>Predict "app sees" for pool 5 first.</strong>
+<pre class="terminal"><code>lab7 pool 5
+lab7 pool 40</code></pre>
+<pre class="output"><code>40 concurrent find({rating: {$gte: 4}, review: /refund/}) with maxPoolSize 5: wall 888.2 ms, connections created 5
+  at +300 ms: 25 waiting in the driver's wait queue, 5 finds running on m1 ($currentOp)
+checkout wait          p50 411 ms   p95 799 ms   max 803 ms
+command (wire+server)  p50 105 ms   p95 137 ms   max 141 ms
+app sees               p50 515.3 ms   p95 884.4 ms   max 885 ms</code></pre></li>
+      <li>See the server's side of both runs. Log every operation, rerun, then read the slow-log fields:
+<pre class="terminal"><code>docker exec lab7-m1 mongosh store --quiet --eval 'db.setProfilingLevel(0, {slowms: 0})'
+lab7 pool 40
+docker logs lab7-m1 2>&amp;1 | grep '"Slow query"' | grep '"appName":"lab7-pool"' | grep '"find":"reviews"' | tail -1 \
+  | python3 -c 'import sys, json; a = json.loads(sys.stdin.read())["attr"]; print(a["durationMillis"], a["workingMillis"], a["queues"])'
+docker exec lab7-m1 mongosh store --quiet --eval 'db.setProfilingLevel(0, {slowms: 100})'</code></pre>
+<pre class="output"><code>706 185 {'ingress': {'admissions': 1}, 'execution': {'admissions': 12, 'totalTimeQueuedMicros': 521829}}</code></pre>
+      Run it with <code>pool 5</code> too: <code>durationMillis</code> and <code>workingMillis</code> are both ~100 ms there, and the queue is gone, because it was in the driver.</li>
+      <li>Bound the wait: <code>lab7 timeout</code>. Most of the 40 finds fail fast with <code>MongoWaitQueueTimeoutError</code>.</li>
+      <li>Warm up a cold pool: <code>lab7 burst 2</code>, then <code>lab7 burst 100</code>. Compare "connections created" and "all done".</li>
+      <li>Fail over. First the planned way: <code>lab7 failover</code>. Then a crash: run <code>lab7 failover kill</code>, and when it prints <code>&gt;&gt;&gt; kill the primary now</code>, in a second terminal run <code>docker kill lab7-m1</code>. Afterwards, <code>docker start lab7-m1</code> and wait ~20 s for it to take the primary back.</li>
+      <li>Optional: <code>lab7 nearest</code> (the latency window), and <code>lab7 connect</code> (connection setup time). For SCRAM, start <code>docker run -d --name lab7-auth --hostname auth --network lab7 -m 1g -e MONGO_INITDB_ROOT_USERNAME=lab -e MONGO_INITDB_ROOT_PASSWORD=lab mongo:8.0</code> and run <code>docker exec -e NODE_PATH=/tmp/node_modules -e MONGO_URI='mongodb://lab:lab@auth/?directConnection=true' lab7-node node /code/0007-pool-lab.js connect</code>.</li>
+      <li>Clean up: <code>docker rm -f lab7-node lab7-auth lab7-m1 lab7-m2 lab7-m3 &amp;&amp; docker network rm lab7</code></li>
+    </ol>
+  </div>
+
+  <h2>7 · Check yourself</h2>
+  <p>From memory. The first question comes from lesson 2.1 on purpose.</p>
+  <div id="quiz"></div>
+
+  <h2>Where this fits</h2>
+  <ol>
+    <li><strong>Hop 1, the driver: pool, monitoring, server selection</strong> (today)</li>
+    <li>Hop 2, the wire: <a href="0008-op-msg.html">OP_MSG in depth</a>: flag bits (<code>moreToCome</code>, <code>exhaustAllowed</code>, which the streaming hello uses), document sequences, compression</li>
+    <li>Hop 3, transport: <a href="0009-ingress.html">server ingress</a>: what each of those connections costs mongod</li>
+    <li>Hop 4, dispatch: <a href="0010-dispatch.html">command dispatch and interruption</a>: <code>maxTimeMS</code>, <code>killOp</code>, <code>currentOp</code></li>
+    <li>Recap: <a href="0011-transport-recap.html">diagnose a latency spike across hops 1–4</a></li>
+  </ol>
+
+  <div class="callout source">
+    <p>Read the <a href="https://specifications.readthedocs.io/en/latest/connection-monitoring-and-pooling/connection-monitoring-and-pooling/">Connection Monitoring and Pooling spec</a>: the "Connection Pool Behaviors" section (checkout, wait queue, clearing) and the event list. Then the <a href="https://specifications.readthedocs.io/en/latest/server-discovery-and-monitoring/server-monitoring/">Server Monitoring spec</a>: "Streaming protocol" and "Measuring RTT". Every official driver implements these, so what you learn transfers from Node to Java or Python. To see one implementation, open <a href="https://github.com/mongodb/node-mongodb-native/blob/v7.7.0/src/cmap/connection_pool.ts#L724"><code>processWaitQueue</code> in the Node driver (v7.7.0)</a>. It's 90 lines.</p>
+  </div>
+
+  <div class="callout ask">
+    <p>Try it on your own system: add a <code>connectionCheckedOut</code> listener to one of your services and log <code>durationMS</code> next to the command time for an hour. Paste me the numbers and your pool settings, and we'll size the pool together. Ask me anything that's unclear.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="0006-one-write.html">← Lesson 6: One write, end to end</a>
+    <a href="../reference/architecture-map.html">Reference: architecture map</a>
+    <a href="0008-op-msg.html">Lesson 8: OP_MSG in depth →</a>
+  </nav>
+</main>
+
+<script src="../../assets/quiz.js"></script>
+<script>
+const NODE = 'https://github.com/mongodb/node-mongodb-native/blob/v7.7.0/src/';
+const CMAP = 'https://specifications.readthedocs.io/en/latest/connection-monitoring-and-pooling/connection-monitoring-and-pooling/';
+const MON = 'https://specifications.readthedocs.io/en/latest/server-discovery-and-monitoring/server-monitoring/';
+const SEL = 'https://specifications.readthedocs.io/en/latest/server-selection/server-selection/';
+const BTREE = 'https://source.wiredtiger.com/develop/arch-btree.html';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0007-driver-pool',
+  questions: [
+    { layer: 'review',
+      q: '<em>From lesson 2.1:</em> you keep inserting reviews tagged <code>"battery"</code>. A <strong>non-root</strong> leaf page of the <code>{tags: 1}</code> index is full and splits. What happens to the tree\'s height?',
+      options: ['It grows by one level', 'It stays the same height', 'It shrinks by one level', 'It doubles, then it rebalances'], answer: 1,
+      explain: `The leaf splits in two and the median key moves up into the parent. Height only grows when the <em>root</em> splits, because a new root is created above it.${c(BTREE, 'WT B-trees')}` },
+
+    { layer: 'pool',
+      q: 'With <code>maxPoolSize: 5</code>, 40 concurrent finds show <code>durationMillis</code> ≈ 100 ms in the slow log, but the app measures ≈ 550 ms. Where did most of the time go?',
+      options: ['Waiting in the driver\'s queue', 'Waiting for an execution ticket', 'Scanning more documents per find', 'Opening a new connection each'], answer: 0,
+      explain: `Only 5 finds can be on the wire at once, so 35 wait in the pool's wait queue. The checkout wait was p50 411–478 ms. The server can't see it: <code>$currentOp</code> showed 5 finds.${c(CMAP + '#waitqueue', 'CMAP WaitQueue')}` },
+
+    { layer: 'monitor',
+      q: 'One MongoClient (streaming monitoring, the default) connects to a 3-member replica set and runs one find on the primary. How many sockets does it hold?',
+      options: ['1', '3', '7', '9'], answer: 2,
+      explain: `Per member: one monitor socket (the parked streaming <code>hello</code>) and one RTT socket = 6. Plus 1 pooled connection on the primary = 7. Monitoring sockets don't count toward <code>maxPoolSize</code>.${c(MON + '#servers-are-monitored-with-dedicated-sockets', 'server monitoring')}` },
+
+    { layer: 'pool',
+      q: 'Node driver 7.7.0, default options, no <code>timeoutMS</code>. All pooled connections are busy. What happens to a new <code>find</code>?',
+      options: ['It fails with an error', 'It opens one extra connection', 'It goes to a secondary', 'It waits with no limit'], answer: 3,
+      explain: `<code>waitQueueTimeoutMS</code> defaults to 0, and without <code>timeoutMS</code> the checkout has no timeout. Set <code>timeoutMS</code> (or <code>waitQueueTimeoutMS</code>) to fail fast; in the lab, 200 ms gave <code>MongoWaitQueueTimeoutError</code> for most of the 40 finds.${c(NODE + 'timeout.ts#L368', 'timeout.ts')}` },
+
+    { layer: 'pool',
+      q: 'What does <code>maxConnecting</code> (default 2) limit?',
+      options: ['Commands sent on one connection', 'Connections being opened at once', 'Clients allowed per app process', 'Retries after a network error'], answer: 1,
+      explain: `It caps the pool's <em>pending</em> connections. In the lab, 100 finds on a cold pool opened 11–13 connections with 2, and 100 connections with 100, which made each setup about 5–10× slower and the burst finish later.${c(NODE + 'cmap/connection_pool.ts#L775', 'connection_pool.ts')}` },
+
+    { layer: 'pool',
+      q: 'In the lab, raising <code>maxPoolSize</code> from 5 to 40 removed the driver wait. Why did the 40 finds still take about as long in total?',
+      options: ['The driver retried every find', 'The new connections used TLS', 'They queued for mongod tickets', 'The pool was cleared midway'], answer: 2,
+      explain: `<code>durationMillis</code> rose to ~585 ms while <code>workingMillis</code> stayed ~170 ms: the finds waited in mongod's execution admission queue (<code>totalTimeQueuedMicros</code> ≈ 500,000). A bigger pool moves the queue; it doesn't add CPU.${c('https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/admission/README.md', 'execution control')}` },
+
+    { layer: 'monitor',
+      q: 'The primary crashes. For ~11 s every find is slow, but none fails. Where were those finds waiting?',
+      options: ['In server selection, for a primary', 'In the pool, for a connection', 'In the old primary\'s socket buffers', 'In mongod\'s queue for admission tickets'], answer: 0,
+      explain: `With no suitable server, selection requests an immediate check and blocks, up to <code>serverSelectionTimeoutMS</code> (30 s). The secondaries waited <code>electionTimeoutMillis</code> (10 s) before electing m3; then the finds went there.${c(SEL + '#server-selection-algorithm', 'selection loop')}` },
+
+    { layer: 'select',
+      q: '<code>readPreference: "nearest"</code>, default <code>localThresholdMS</code> (15 ms). RTTs: m1 4 ms, m2 12 ms, m3 40 ms. Which members can serve the read?',
+      options: ['Only m1, the nearest', 'm1 and m2 together', 'All three of them', 'Only m3, the farthest'], answer: 1,
+      explain: `The latency window is from the fastest RTT (4 ms) to 4 + 15 = 19 ms. m1 and m2 are inside, m3 is not. Between those two, the driver picks two at random and takes the one with fewer operations in flight.${c(SEL + '#filtering-suitable-servers-based-on-the-latency-window', 'latency window')}` }
+  ]
+});
+</script>
+</body>
+</html>

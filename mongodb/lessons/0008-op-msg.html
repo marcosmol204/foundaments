@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 8 · OP_MSG in Depth</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<link rel="stylesheet" href="../../assets/quiz.css">
+<style>
+  /* Lesson-local: byte maps and capture lines */
+  table.bytes td:first-child { font: .78rem 'JetBrains Mono', monospace; color: var(--muted); white-space: nowrap; }
+  table.bytes td:nth-child(2) { font: .78rem 'JetBrains Mono', monospace; white-space: nowrap; }
+  table.num td:not(:first-child), table.num th:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }
+  .hop { display: inline-block; min-width: 1.5em; text-align: center; font: 600 .78rem/1.5 'JetBrains Mono', monospace; color: var(--accent); border: 1px solid var(--accent); border-radius: 50%; margin-right: .3rem; }
+  .table-scroll { overflow-x: auto; }
+  svg .seg-hdr { fill: var(--code-bg); stroke: var(--tier-1); stroke-width: 1.2; }
+  svg .seg-flag { fill: var(--warn-bg); stroke: var(--warn); stroke-width: 1.2; }
+  svg .seg-doc { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.2; }
+  svg .seg-crc { fill: var(--bad-bg); stroke: var(--bad); stroke-width: 1.2; }
+</style>
+</head>
+<body>
+<main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>
+  <div class="kicker">MongoDB Internals · Lesson 0008 · Phase 2: Transport &amp; wire</div>
+  <h1>OP_MSG in depth</h1>
+  <p class="subtitle">Lesson 6 showed one insert as one 483-byte OP_MSG with nothing special in it. This lesson opens the parts that were empty there: the three flag bits, the second kind of section, and the compressed wrapper. Hop <span class="hop">2</span>, all the way down.</p>
+
+  <p><strong>Your win today:</strong> read one line of a wire capture and say, from the bytes alone, <em>whether a reply will come, how many replies will come, how the reviews are packed, and whether (and how) the message is compressed</em>. Then use measured numbers to choose batching, compression and write concern for a real link. This is hop 2 of the "trace one write end to end" goal in your <a href="../MISSION.md">mission</a>.</p>
+
+  <h2>0 · Warm-up from lesson 6</h2>
+  <p>From memory, before reading on.</p>
+  <ol>
+    <li>The lesson 6 insert started <code>e3 01 00 00 · 0b 00 00 00 · 00 00 00 00 · dd 07 00 00</code>. Name the four fields. Which one lets the driver match the reply to the request?</li>
+    <li>Its <code>flagBits</code> were <code>00 00 00 00</code>. Name two things those zeros told the server.</li>
+  </ol>
+  <p>Keep your answers. Section 1 gives the first one back; section 2 is about the second.</p>
+
+  <h2>1 · The message, one more time</h2>
+  <p>Every message starts with the same 16-byte <code>MsgHeader</code>: <code>messageLength</code>, <code>requestID</code>, <code>responseTo</code>, <code>opCode</code>, all little-endian. A reply's <code>responseTo</code> is the request's <code>requestID</code>.<a class="cite" href="https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/">wire protocol (9.0)</a> After that, an OP_MSG (opCode 2013) has three parts:<a class="cite" href="https://specifications.readthedocs.io/en/latest/message/OP_MSG/">OP_MSG spec</a></p>
+  <ol>
+    <li><strong><code>flagBits</code></strong>, 4 bytes: what the receiver should expect (section 2).</li>
+    <li><strong>One or more sections</strong>, each starting with one <em>kind</em> byte. Exactly one kind 0 (the command body). Kind 1 is a document sequence (section 3).</li>
+    <li><strong>An optional CRC-32C</strong>, 4 bytes at the end, only if <code>checksumPresent</code> is set.</li>
+  </ol>
+  <p>And any message can be wrapped in OP_COMPRESSED (opCode 2012, section 4). Here are three real messages from this lesson's lab, drawn to the same pattern (not to scale):</p>
+
+  <figure>
+    <svg viewBox="0 0 680 270" role="img" aria-label="Three messages as byte bars. First, a w:0 insert of 250 bytes: 16-byte header, flagBits 02 00 00 00 meaning moreToCome, a 76-byte kind 0 body, and a 152-byte kind 1 section called documents holding one review. Second, a ping of 55 bytes: header, flagBits 01 00 00 00 meaning checksumPresent, a 30-byte body, and a 4-byte CRC-32C. Third, a zstd-compressed getMore reply of 2,083,772 bytes: header with opCode 2012, then originalOpcode 2013, uncompressedSize 14,776,124 and compressorId 3, then the zstd bytes.">
+      <text class="lbl-title" x="20" y="22">w:0 insert · 250 B · no reply</text>
+      <rect class="seg-hdr" x="20" y="32" width="120" height="40" rx="3"/><text class="lbl-sm" x="28" y="50">MsgHeader</text><text class="lbl-sm" x="28" y="64">16 B</text>
+      <rect class="seg-flag" x="140" y="32" width="110" height="40" rx="3"/><text class="lbl-sm" x="148" y="50">02 00 00 00</text><text class="lbl-sm" x="148" y="64">moreToCome</text>
+      <rect class="seg-doc" x="250" y="32" width="150" height="40" rx="3"/><text class="lbl-sm" x="258" y="50">kind 0 · body</text><text class="lbl-sm" x="258" y="64">insert, w: 0 · 76 B</text>
+      <rect class="seg-doc" x="400" y="32" width="260" height="40" rx="3"/><text class="lbl-sm" x="408" y="50">kind 1 · 'documents'</text><text class="lbl-sm" x="408" y="64">1 review · 152 B</text>
+
+      <text class="lbl-title" x="20" y="108">ping with a checksum · 55 B</text>
+      <rect class="seg-hdr" x="20" y="118" width="120" height="40" rx="3"/><text class="lbl-sm" x="28" y="136">MsgHeader</text><text class="lbl-sm" x="28" y="150">16 B</text>
+      <rect class="seg-flag" x="140" y="118" width="110" height="40" rx="3"/><text class="lbl-sm" x="148" y="136">01 00 00 00</text><text class="lbl-sm" x="148" y="150">checksumPresent</text>
+      <rect class="seg-doc" x="250" y="118" width="300" height="40" rx="3"/><text class="lbl-sm" x="258" y="136">kind 0 · body</text><text class="lbl-sm" x="258" y="150">{ping: 1, $db: "admin"} · 30 B</text>
+      <rect class="seg-crc" x="550" y="118" width="110" height="40" rx="3"/><text class="lbl-sm" x="558" y="136">CRC-32C</text><text class="lbl-sm" x="558" y="150">4 B</text>
+
+      <text class="lbl-title" x="20" y="194">zstd getMore reply · 2,083,772 B on the wire</text>
+      <rect class="seg-hdr" x="20" y="204" width="120" height="40" rx="3"/><text class="lbl-sm" x="28" y="222">MsgHeader</text><text class="lbl-sm" x="28" y="236">opCode 2012</text>
+      <rect class="seg-flag" x="140" y="204" width="260" height="40" rx="3"/><text class="lbl-sm" x="148" y="222">2013 · 14,776,124 · 3</text><text class="lbl-sm" x="148" y="236">original op · size · zstd (9 B)</text>
+      <rect class="seg-doc" x="400" y="204" width="260" height="40" rx="3"/><text class="lbl-sm" x="408" y="222">zstd bytes of the OP_MSG</text><text class="lbl-sm" x="408" y="236">(flagBits + sections)</text>
+    </svg>
+    <figcaption>Blue: header. Yellow: what to expect. Green: the documents. Red: the checksum. The compressed message keeps the header and hides everything after it.</figcaption>
+  </figure>
+  <p>Lab setup for all numbers below: <code>mongo:8.0</code> (8.0.34) standalone in Docker, 250,000 seeded reviews (avg 164 B), and two clients on the same Docker network: pymongo 4.19 (in a <code>python:3.12-slim</code> container) and mongosh 2.13 (Node driver 7.5.0). Each capture was taken with <code>tcpdump</code> next to mongod and decoded with this lesson's parser, <code>lessons/code/0008-opmsg.py</code>.</p>
+
+  <h2>2 · flagBits: three bits that change the conversation</h2>
+  <p>OP_MSG is request–reply: one message per turn. The flags change that. "The low 16 bits declare what the current message contains, and what the expectations of the recipient are." Unknown low bits are an error, and unknown high bits are ignored.<a class="cite" href="https://specifications.readthedocs.io/en/latest/message/OP_MSG/#flagbits">OP_MSG spec</a> mongod 8.0 knows exactly three, and rejects any other bit in the low 16 with <code>IllegalOpMsgFlag</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/rpc/op_msg.h#L79-L81">op_msg.h</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/rpc/op_msg.cpp#L75-L80">op_msg.cpp</a></p>
+  <table>
+    <tr><th>Bit</th><th>Name</th><th>Bytes</th><th>Means</th></tr>
+    <tr><td>0</td><td><code>checksumPresent</code></td><td><code>01 00 00 00</code></td><td>The last 4 bytes are a CRC-32C of everything before them.</td></tr>
+    <tr><td>1</td><td><code>moreToCome</code></td><td><code>02 00 00 00</code></td><td>On a request: "don't reply". On a reply: "another reply follows".</td></tr>
+    <tr><td>16</td><td><code>exhaustAllowed</code></td><td><code>00 00 01 00</code></td><td>On a request: "I can take many replies." (optional bit)</td></tr>
+  </table>
+
+  <h3>2a · <code>moreToCome</code> on a request: the <code>w: 0</code> insert</h3>
+  <p>One example, step by step. pymongo inserts one review with <code>WriteConcern(w=0)</code>, then inserts it <em>again</em> with the same <code>_id</code>.</p>
+<pre class="output"><code>0.001s c>s len=250  id=1957747793 re=0  OP_MSG flags=[moreToCome] insert body 76 B · seq 'documents' 152 B, 1 docs (138–138 B)
+0.001s c>s len=250  id=424238335  re=0  OP_MSG flags=[moreToCome] insert body 76 B · seq 'documents' 152 B, 1 docs (138–138 B)
+c>s: 2 messages, 500 bytes on the wire
+s>c: 0 messages, 0 bytes on the wire</code></pre>
+  <ol>
+    <li><strong>The driver sets <code>moreToCome</code></strong> and puts <code>writeConcern: {w: 0}</code> in the body. The spec requires both: "Clients doing unacknowledged writes MUST set the <code>moreToCome</code> flag, and MUST set the writeConcern to <code>w=0</code>."<a class="cite" href="https://specifications.readthedocs.io/en/latest/message/OP_MSG/#moretocome-on-requests">OP_MSG spec</a></li>
+    <li><strong>The server runs the insert, then builds no reply.</strong> In <code>makeCommandResponse</code>, a <code>moreToCome</code> request ends with <code>return {};  // Don't reply.</code><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L2306-L2318">service_entry_point_common.cpp</a> The <code>SessionWorkflow</code> (hop 3) even asserts that it never answers a "fire-and-forget request".<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_workflow.cpp#L839-L842">session_workflow.cpp</a></li>
+    <li><strong>The second insert fails with a duplicate key, and nobody hears it.</strong> pymongo returned <code>acknowledged=False</code> twice, raised nothing, and the collection held one copy. "Malformed operation or errors such as duplicate key errors are not discoverable and will be swallowed by the server."<a class="cite" href="https://specifications.readthedocs.io/en/latest/message/OP_MSG/#q-a">OP_MSG spec, Q&amp;A</a></li>
+    <li><strong>One error is not swallowed: "not primary".</strong> The server throws <code>NotWritablePrimary</code>, which closes the connection, "to get client to go through server selection again".<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L2306-L2318">service_entry_point_common.cpp</a> The driver only notices the next time it uses that socket, so "at least one unacknowledged write operation will be lost".<a class="cite" href="https://specifications.readthedocs.io/en/latest/message/OP_MSG/#q-a">OP_MSG spec, Q&amp;A</a></li>
+  </ol>
+  <p>Notice also: the body is only 76 B because an unacknowledged write sends no <code>lsid</code>. No session, so no retryable write. And mongosh uses the same flag for its own cleanup: when it exits, it sends <code>endSessions</code> with <code>moreToCome</code> and doesn't wait.</p>
+
+  <h3>2b · <code>exhaustAllowed</code> + <code>moreToCome</code> on replies: one request, many answers</h3>
+  <p>The other direction. A client sets <code>exhaustAllowed</code> to say "I can read several replies in a row". Only then may the server set <code>moreToCome</code> on its replies, and it does so only for <code>getMore</code> and <code>hello</code>.<a class="cite" href="https://specifications.readthedocs.io/en/latest/message/OP_MSG/#exhaustallowed">OP_MSG spec</a> Inside the server, the <code>SessionWorkflow</code> sends each reply and then <em>makes up the next request itself</em> ("synthesizes a new WorkItem"), until a reply says it's the last one.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/README.md">transport README</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_workflow.cpp#L321-L363">makeExhaustMessage</a></p>
+  <p><strong>Exhaust cursor.</strong> pymongo reads the first hour of 2026-01-01 (3,600 reviews) with <code>CursorType.EXHAUST</code> and <code>batch_size=1000</code>:</p>
+<pre class="output"><code>0.003s c>s len=133     id=424238335 re=0          OP_MSG flags=[exhaustAllowed] getMore body 112 B
+0.004s s>c len=168754  id=121       re=424238335  OP_MSG flags=[moreToCome] cursor body 168733 B
+0.005s s>c len=169501  id=122       re=121        OP_MSG flags=[moreToCome] cursor body 169480 B
+0.005s s>c len=101724  id=123       re=122        OP_MSG flags=[none] cursor body 101703 B</code></pre>
+  <ol>
+    <li>One <code>getMore</code> goes out with <code>exhaustAllowed</code> (the <code>find</code> before it returned the first 1,000).</li>
+    <li>Three replies come back with no request between them. Each <code>responseTo</code> is the <em>previous reply's</em> id (424238335 → 121 → 122), exactly as the spec says.<a class="cite" href="https://specifications.readthedocs.io/en/latest/message/OP_MSG/#moretocome-on-responses">OP_MSG spec</a></li>
+    <li>The last reply has no <code>moreToCome</code>: the cursor is done. Until then, the client "MUST NOT send any more requests on this connection".</li>
+  </ol>
+  <p><strong>Streaming hello.</strong> You didn't ask for this one: pymongo's monitor does it on its own connection. An idle client for 25 s:</p>
+<pre class="output"><code> 0.001s c>s len=154  id=846930886 re=0          OP_MSG flags=[exhaustAllowed] hello body 133 B
+10.015s s>c len=313  id=186       re=846930886  OP_MSG flags=[moreToCome] isWritablePrimary body 292 B
+20.027s s>c len=313  id=188       re=186        OP_MSG flags=[moreToCome] isWritablePrimary body 292 B</code></pre>
+  <p>The request carries <code>topologyVersion</code> and <code>maxAwaitTimeMS: 10000</code>. The server answers when the topology changes, or after 10 s with no change. So one request gives a reply every 10 seconds, forever, without a round trip each time. This "streaming protocol" (MongoDB 4.4+) is how drivers learn of a failover right away instead of at the next poll.<a class="cite" href="https://specifications.readthedocs.io/en/latest/server-discovery-and-monitoring/server-monitoring/">server monitoring spec</a> <a href="0007-driver-pool.html">Lesson 7</a> covers the monitor's side of this.</p>
+
+  <h3>2c · <code>checksumPresent</code>: a CRC-32C nobody in your app sends</h3>
+  <p>Drivers don't set it. To see it, the lab builds a <code>ping</code> by hand in Python with <code>flagBits = 1</code> and a CRC-32C at the end:</p>
+<pre class="output"><code>0.000s c>s len=55  id=901 re=0    OP_MSG flags=[checksumPresent] ping body 30 B · CRC-32C ok
+0.000s s>c len=42  id=125 re=901  OP_MSG flags=[checksumPresent] ok body 17 B · CRC-32C ok
+0.001s c>s len=55  id=900 re=0    OP_MSG flags=[checksumPresent] ping body 30 B · CRC-32C MISMATCH
+                                  (no reply: the server closed the connection)</code></pre>
+  <ul>
+    <li><strong>The reply has a checksum because the request had one</strong>, and only on a non-TLS connection.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_workflow.cpp#L847-L848">session_workflow.cpp</a> mongod computes it with WiredTiger's CRC-32C function.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/rpc/op_msg.cpp#L93-L100">op_msg.cpp</a></li>
+    <li><strong>A wrong CRC kills the connection.</strong> The log said <code>ChecksumMismatch: OP_MSG checksum does not match contents</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/rpc/op_msg.cpp#L252-L257">op_msg.cpp</a></li>
+    <li><strong>Who uses it?</strong> mongod and mongos, among themselves, when they don't use TLS. With TLS they skip it, because TLS already protects the bytes.<a class="cite" href="https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/">wire protocol (9.0)</a></li>
+  </ul>
+  <p>Answer to warm-up question 2: <code>00 00 00 00</code> meant "no checksum at the end" and "I want a reply" (no <code>moreToCome</code>), and also "only one reply, please" (no <code>exhaustAllowed</code>).</p>
+
+  <h2>3 · Kind 1: a thousand reviews without an array</h2>
+  <p>A kind 1 section is a <em>document sequence</em>: an int32 size, a name (cstring), then BSON documents "back to back with no separators". The name is the body field it replaces, and that field "MUST NOT also exist in the body".<a class="cite" href="https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/">wire protocol (9.0)</a> The server accepts it for three arguments only: <code>insert.documents</code>, <code>update.updates</code>, <code>delete.deletes</code>.<a class="cite" href="https://specifications.readthedocs.io/en/latest/message/OP_MSG/#command-arguments-as-payload">OP_MSG spec</a></p>
+
+  <h3>One example: <code>insertMany</code> of 1,000 reviews</h3>
+  <p>The same 1,000 seed reviews (without <code>_id</code>, so the driver makes new ones), sent by two drivers:</p>
+<pre class="output"><code># pymongo 4.19
+0.005s c>s len=164256  id=1649760492 re=0  OP_MSG flags=[none] insert body 86 B · seq 'documents' 164148 B, 1000 docs (125–212 B)
+0.016s s>c len=45      id=83 re=1649760492 OP_MSG flags=[none] n body 24 B
+# mongosh 2.13 (Node driver 7.5.0)
+0.087s c>s len=169147  id=15 re=0          OP_MSG flags=[none] insert body 169126 B
+0.098s s>c len=45      id=108 re=15        OP_MSG flags=[none] n body 24 B</code></pre>
+  <ol>
+    <li><strong>pymongo splits the command in two sections.</strong> A kind 0 body of 86 B: <code>{insert: "scratch", ordered: true, lsid, $db: "store"}</code>. Then a kind 1 section named <code>documents</code>: 4 B size + <code>documents\0</code> (10 B) + 1,000 reviews = 164,148 B. Total 16 + 4 + 1 + 86 + 1 + 164,148 = <strong>164,256 B</strong>.</li>
+    <li><strong>mongosh puts the reviews in the body</strong>, as one BSON array <code>documents: [ … ]</code> of 169,029 B. The spec says bulk writes "SHOULD use Payload Type 1"<a class="cite" href="https://specifications.readthedocs.io/en/latest/message/OP_MSG/">OP_MSG spec</a>, but this Node driver version didn't. Both work: the server treats the two forms the same.</li>
+    <li><strong>The difference is the array keys.</strong> A BSON array is a document whose keys are <code>"0"</code>, <code>"1"</code>, … <code>"999"</code>. Each element costs a type byte, the key, and a NUL: 1,000 + 2,890 + 1,000 = <strong>4,890 B</strong>. That's the whole gap (169,029 = 4 + 4,890 + 164,134 + 1). About 3% here, on 164-byte reviews.</li>
+    <li><strong>One reply for 1,000 reviews: 45 B</strong>, <code>{n: 1000, ok: 1}</code>. Compare lesson 6: one review cost a 483 B request and a 230 B reply.</li>
+  </ol>
+  <p>The bytes saved are small. The bigger point of kind 1 is the limit it avoids, as the next example shows.</p>
+
+  <h3>The three limits, and how drivers split a batch</h3>
+  <p>The server announces them in every <code>hello</code> reply. The lab's values:</p>
+  <table>
+    <tr><th>Limit (from <code>hello</code>)</th><th>Value</th><th>Applies to</th></tr>
+    <tr><td><code>maxBsonObjectSize</code></td><td>16,777,216 (16 MiB)</td><td>Each BSON document: each review, and the body.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/bson/util/builder.h#L76">builder.h</a></td></tr>
+    <tr><td><code>maxMessageSizeBytes</code></td><td>48,000,000 (48 MB)</td><td>One whole message.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/rpc/message.h#L51">message.h</a></td></tr>
+    <tr><td><code>maxWriteBatchSize</code></td><td>100,000</td><td>Operations in one write command.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/ops/write_ops.h#L85">write_ops.h</a></td></tr>
+  </table>
+  <p>Now <code>insertMany</code> of all 250,000 reviews (about 41 MB of BSON). <strong>Predict the number of messages for each driver before reading on.</strong></p>
+  <div class="table-scroll">
+  <table class="num">
+    <tr><th>Driver</th><th>Messages</th><th>Reviews per message</th><th>Bytes per message</th><th>Split by</th></tr>
+    <tr><td>pymongo (kind 1)</td><td>3</td><td>100,000 / 100,000 / 50,000</td><td>16.43 M / 16.44 M / 8.22 M</td><td>count</td></tr>
+    <tr><td>mongosh (body array)</td><td>3</td><td>97,911 / 97,897 / 54,192</td><td>16.77 M / 16.77 M / 9.27 M</td><td>16 MiB body</td></tr>
+  </table>
+  </div>
+  <ul>
+    <li><strong>pymongo stops at 100,000</strong>, <code>maxWriteBatchSize</code>. Its sequence is 16,434,499 B, <em>bigger</em> than 16 MiB, and that's allowed: in a sequence the 16 MiB limit is per document. Only the 48 MB message limit applies to the whole.</li>
+    <li><strong>mongosh stops just under 16 MiB</strong>, because its array lives inside the body, and the body is one BSON document. With bigger documents (≈ 500 B or more), kind 1 would also be the one that packs more per message: up to 48 MB instead of 16 MiB.</li>
+    <li><strong>The split is invisible to you.</strong> Both drivers sent three commands and returned one result with 250,000 ids. On this laptop both took 1.3–1.75 s.</li>
+  </ul>
+  <p>The 8.0 parser also allows at most two sequences per message, and rejects a name that's also in the body.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/rpc/op_msg.cpp#L197-L250">op_msg.cpp</a> (There is also a kind 2, a security token for server-internal use only, and the 9.0 spec adds a kind 3 for telemetry, which 8.0 doesn't accept.)</p>
+
+  <h2>4 · OP_COMPRESSED: the same message, smaller</h2>
+  <p>OP_COMPRESSED keeps the 16-byte header (with opCode 2012) and adds 9 bytes: <code>originalOpcode</code> (int32), <code>uncompressedSize</code> (int32, without the header), <code>compressorId</code> (uint8: 0 noop, 1 snappy, 2 zlib, 3 zstd). Then the compressed bytes of everything after the original header.<a class="cite" href="https://specifications.readthedocs.io/en/latest/compression/OP_COMPRESSED/">compression spec</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/message_compressor_manager.h#L58-L81">CompressionHeader</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/message_compressor_base.h#L42-L47">compressor ids</a> So <code>flagBits</code> and sections are hidden inside. The parser decompresses them to show you.</p>
+
+  <h3>One example: a client with <code>compressors=snappy</code></h3>
+  <ol>
+    <li><strong>Handshake, uncompressed.</strong> The driver's first command is the handshake <code>hello</code> (pymongo sends it as legacy <code>ismaster</code>), with <code>compression: ["snappy"]</code>. The server replies with the names it also supports, in the client's order: <code>compression: ["snappy"]</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/message_compressor_manager.cpp#L235-L288">serverNegotiate</a> mongod 8.0 supports <code>snappy,zstd,zlib</code> by default (<code>net.compression.compressors</code>).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/message_compressor_options_server.idl#L33-L38">options IDL</a></li>
+    <li><strong>The client picks</strong> "the first compressor in the client's configured compressors list that is also in the servers list", and compresses every request with it.<a class="cite" href="https://specifications.readthedocs.io/en/latest/compression/OP_COMPRESSED/">compression spec</a></li>
+    <li><strong>Except a fixed list, never compressed:</strong> <code>hello</code> and legacy hello, <code>saslStart</code>, <code>saslContinue</code>, <code>getnonce</code>, <code>authenticate</code>, <code>createUser</code>, <code>updateUser</code> (and old <code>copydb*</code> commands), "to mitigate against current and previous attacks".<a class="cite" href="https://specifications.readthedocs.io/en/latest/compression/OP_COMPRESSED/#messages-not-allowed-to-be-compressed">compression spec</a> In the capture, the handshake and the monitor's streaming <code>hello</code> stayed plain OP_MSG.</li>
+    <li><strong>The server answers in kind.</strong> It decompresses a request, remembers its <code>compressorId</code>, and compresses the reply with the same one. A plain request gets a plain reply.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_workflow.cpp#L624-L641">session_workflow.cpp</a> If the compressed buffer could exceed 48 MB, it sends the message uncompressed.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/message_compressor_manager.cpp#L72-L101">compressMessage</a></li>
+  </ol>
+<pre class="output"><code>0.769s s>c len=346      … OP_MSG flags=[none] … (handshake reply, contains compression: ['snappy'])
+0.771s s>c len=4752     … OP_COMPRESSED(snappy) originalOpcode=2013 uncompressedSize=16965 → 16981 B inside: OP_MSG … cursor
+0.866s s>c len=3364424  … OP_COMPRESSED(snappy) originalOpcode=2013 uncompressedSize=14776124 → 14776140 B inside: OP_MSG … cursor</code></pre>
+
+  <h3>How much it saves on <code>reviews</code>, and what it costs</h3>
+  <p>The test: read one day of reviews, <code>find({_id: {$gte: ObjectId(2026-01-01), $lt: ObjectId(2026-01-02)}})</code>, which is 86,400 reviews. That's two replies: the first batch of 101 reviews (16,981 B), and one <code>getMore</code> with the other 86,299 (14,776,140 B, under the 16 MiB batch limit). pymongo, best of 3 runs, two lab runs each.</p>
+  <div class="table-scroll">
+  <table class="num">
+    <tr><th>compressors=</th><th>Bytes on the wire</th><th>Ratio</th><th>Same host</th><th>100 Mbit/s + 20 ms</th></tr>
+    <tr><td>(none)</td><td>14,793,121</td><td>1.0×</td><td>158–182 ms</td><td>1,437–1,441 ms</td></tr>
+    <tr><td>snappy</td><td>3,369,176</td><td>4.4×</td><td>174–188 ms</td><td>491–501 ms</td></tr>
+    <tr><td>zstd</td><td>2,086,947</td><td>7.1×</td><td>185–214 ms</td><td>397–431 ms</td></tr>
+    <tr><td>zlib</td><td>1,625,844</td><td>9.1×</td><td>391–426 ms</td><td>578–609 ms</td></tr>
+  </table>
+  </div>
+  <ul>
+    <li><strong>On a fast link, compression only costs.</strong> Same host, the network is not the bottleneck: snappy and zstd were a little slower, zlib more than twice as slow. CPU is spent on both sides.</li>
+    <li><strong>On a slow link, it wins big.</strong> I limited mongod's outgoing traffic with <code>tc netem</code> to 100 Mbit/s plus 20 ms delay, a rough stand-in for a cross-region link. 14.8 MB then takes ~1.2 s just to transmit. zstd cut the read from 1.44 s to about 0.4 s. It had the best balance: almost zlib's ratio at a fraction of its CPU. mongod uses zstd's default level and zlib's default level (6).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/message_compressor_zstd.cpp#L53-L59">zstd</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/message_compressor_zlib.cpp#L60-L64">zlib</a></li>
+    <li><strong>The seed reviews are very repetitive</strong> (24 sentence pieces, 10 tags), so they compress unusually well. Real review text will compress less. Measure your own ratio: <code>serverStatus().network.compression.&lt;name&gt;.compressor.bytesIn / bytesOut</code>. In the lab it gave 4.39 / 7.09 / 9.10, the same as the capture. And <code>network.physicalBytesOut</code> (on the wire) vs <code>network.bytesOut</code> (before compression) shows the total effect.<a class="cite" href="https://www.mongodb.com/docs/manual/reference/command/serverStatus/">serverStatus</a></li>
+  </ul>
+
+  <h2>5 · Read the wire in the source</h2>
+  <p>All at tag <code>r8.0.34</code>, the lab's version. About ten minutes.</p>
+  <ol>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/rpc/op_msg.cpp#L152-L257"><code>rpc/op_msg.cpp</code> L152–257</a>: <code>OpMsg::parse</code>. Find the flag check, the <code>switch</code> on section kind, the "at most 2 sequences" rule, and the checksum check at the end.</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L2299-L2332"><code>db/service_entry_point_common.cpp</code> L2299–2332</a>: <code>makeCommandResponse</code>. <code>moreToCome</code> → no reply; <code>exhaustAllowed</code> → ask the command whether to run again.</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/session_workflow.cpp#L321-L363"><code>transport/session_workflow.cpp</code> L321–363</a>: <code>makeExhaustMessage</code> builds the synthetic next request and sets <code>moreToCome</code> on the reply. Then L624–641: decompress the request, compress the reply with the same compressor.</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/transport/message_compressor_manager.cpp#L72-L124"><code>transport/message_compressor_manager.cpp</code> L72–124</a>: <code>compressMessage</code> writes the 9-byte header and the compressed bytes.</li>
+  </ol>
+
+  <h2>6 · So in production you should…</h2>
+  <div class="callout">
+    <p><strong>Rule: send writes in batches, turn on <code>zstd</code> compression where the network is the bottleneck (not everywhere), and never use <code>w: 0</code> for data you'd miss.</strong></p>
+  </div>
+  <ol>
+    <li><strong>Batch writes with <code>insertMany</code> / <code>bulkWrite</code>, and let the driver split.</strong> 1,000 reviews cost one 164 KB message and one 45 B reply, not 1,000 round trips. The driver already splits at 100,000 operations, 16 MiB or 48 MB. Your own batch size is about latency and memory: a few thousand small documents per call is a good start. Each batch is still one command on one connection (hop 3), so a huge one holds that connection for its whole run.</li>
+    <li><strong>Turn on compression for cross-region or cross-AZ traffic and for big reads</strong> (exports, analytics, large result batches), with <code>?compressors=zstd,snappy</code> in the connection string. On a fast, same-zone link it only adds CPU. Check the effect with <code>network.compression</code> counters and <code>physicalBytesOut</code>. Cross-AZ and cross-region bytes are usually billed, so a 4–7× ratio can matter for cost as well as speed.</li>
+    <li><strong>Prefer zstd; use snappy when CPU is tight.</strong> In the lab zstd got 7.1× for about the CPU of snappy's 4.4×. zlib squeezed most but was the slowest everywhere. Remember the driver must ship the library: mongosh 2.13 in the <code>mongo:8.0</code> image only had zlib, and pymongo needed extra packages for zstd and snappy.</li>
+    <li><strong>Know what <code>w: 0</code> gives up.</strong> You get no reply, so: no errors (a duplicate <code>_id</code> or a validation failure just vanishes), no write count, no retryable write (no <code>lsid</code>), and on a failover at least one write is silently lost before the driver notices. What you save is one round trip. A batched <code>w: 1</code> write saves almost as much and tells you what happened.</li>
+    <li><strong>Leave the other flags to the driver.</strong> Streaming <code>hello</code> (exhaust) is on by default and is why failover detection is fast. Exhaust cursors pin a connection until the stream ends. Checksums are for mongod-to-mongod traffic without TLS; use TLS instead.</li>
+  </ol>
+
+  <h3>Diagnosis table</h3>
+  <table>
+    <tr><th>Symptom</th><th>Wire cause</th><th>Proof</th></tr>
+    <tr><td>Writes "succeed" but some reviews are missing</td><td><code>w: 0</code>: errors swallowed</td><td>Capture shows <code>moreToCome</code> and no reply; the driver result says <code>acknowledged: false</code></td></tr>
+    <tr><td>Bulk load is slow, the server's command time is small</td><td>One message per document</td><td><code>network.numRequests</code> ≈ number of documents; the slow log shows <code>ninserted: 1</code> lines</td></tr>
+    <tr><td>Big reads slow across regions; server time is low</td><td>Bandwidth, no compression</td><td><code>physicalBytesOut</code> = <code>bytesOut</code>; the handshake has no <code>compression</code> field</td></tr>
+    <tr><td>Higher CPU on app and server after enabling compression</td><td>Compression on a fast link</td><td><code>network.compression</code> counters climbing, no latency gain</td></tr>
+    <tr><td>Connection closed after a failover, one write lost</td><td><code>w: 0</code> on a stepped-down primary</td><td><code>serverStatus().metrics.repl.network.notPrimaryUnacknowledgedWrites</code> rising on the old primary<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L210-L213">counter</a></td></tr>
+  </table>
+
+  <div class="lab">
+    <p>About 20 minutes. Run these from the <code>mongodb/</code> folder. You need Python 3.14+ on the host for the zstd decoding (your 3.15 is fine). Ids, times and ports will differ; the byte counts should match.</p>
+    <ol>
+      <li>Start one mongod, seed 250,000 reviews, and read the limits:
+<pre class="terminal"><code>docker network create lab8-net
+docker run -d --name lab8-m1 --hostname m1 --network lab8-net -m 1g mongo:8.0 --bind_ip_all
+sleep 5
+docker cp lessons/code/seed-reviews.js lab8-m1:/seed-reviews.js
+docker exec lab8-m1 mongosh store --quiet --eval 'const N = 250000' --file /seed-reviews.js
+docker exec lab8-m1 mongosh --quiet --eval 'const h = db.hello(); printjson({ maxBsonObjectSize: h.maxBsonObjectSize, maxMessageSizeBytes: h.maxMessageSizeBytes, maxWriteBatchSize: h.maxWriteBatchSize })'</code></pre>
+<pre class="output"><code>{ maxBsonObjectSize: 16777216, maxMessageSizeBytes: 48000000, maxWriteBatchSize: 100000 }</code></pre></li>
+      <li>Batches. <strong>Predict the messages for 250,000 reviews first.</strong> The first run of the capture script also builds the <code>lab8-py</code> container (pymongo).
+<pre class="terminal"><code>sh lessons/code/0008-capture.sh batch
+python3 lessons/code/0008-opmsg.py batch.pcap --cmd insert
+sh lessons/code/0008-capture.sh mongosh
+python3 lessons/code/0008-opmsg.py mongosh.pcap --cmd insert --detail | head -8</code></pre>
+<pre class="output"><code>c>s len=164256   … insert body 86 B · seq 'documents' 164148 B, 1000 docs (125–212 B)
+c>s len=16434607 … insert body 86 B · seq 'documents' 16434499 B, 100000 docs (120–217 B)
+c>s len=16438292 … insert body 86 B · seq 'documents' 16438184 B, 100000 docs (120–217 B)
+c>s len=8216552  … insert body 86 B · seq 'documents' 8216444 B, 50000 docs (120–215 B)
+…
+c>s len=169147   … insert body 169126 B
+       45      documents: array, 169029 B  (169040 B)</code></pre></li>
+      <li>Fire and forget. <strong>Predict how many replies you'll see.</strong>
+<pre class="terminal"><code>sh lessons/code/0008-capture.sh w0
+python3 lessons/code/0008-opmsg.py w0.pcap --cmd insert --detail</code></pre>
+      Find <code>flags=[moreToCome]</code>, <code>w: 0</code> in the body, and <code>s>c: 0 messages</code>.</li>
+      <li>Many replies to one request: an exhaust cursor, then an idle client's streaming <code>hello</code> (takes 25 s).
+<pre class="terminal"><code>sh lessons/code/0008-capture.sh exhaust
+python3 lessons/code/0008-opmsg.py exhaust.pcap --cmd getMore
+sh lessons/code/0008-capture.sh monitor
+python3 lessons/code/0008-opmsg.py monitor.pcap | grep -E 'exhaustAllowed|moreToCome'</code></pre>
+      Follow the <code>re=</code> column: each reply points to the one before it.</li>
+      <li>Compression. <strong>Predict the order of the four ratios first.</strong>
+<pre class="terminal"><code>sh lessons/code/0008-capture.sh find
+python3 lessons/code/0008-opmsg.py find.pcap --cmd getMore | grep 's>c'
+docker exec lab8-m1 mongosh --quiet --eval 'const c = db.serverStatus().network.compression; for (const k of ["snappy", "zstd", "zlib"]) print(k, (Number(c[k].compressor.bytesIn) / Number(c[k].compressor.bytesOut)).toFixed(2))'</code></pre>
+<pre class="output"><code>snappy 4.39
+zstd 7.09
+zlib 9.10</code></pre></li>
+      <li>Make the link slow and time it again (removes the limit at the end):
+<pre class="terminal"><code>docker run --rm --cap-add NET_ADMIN --net container:lab8-m1 alpine:3.20 sh -c 'apk add -q iproute2-tc &amp;&amp; tc qdisc add dev eth0 root netem delay 20ms rate 100mbit'
+docker exec lab8-py python /code/0008-wire-lab.py find
+docker run --rm --cap-add NET_ADMIN --net container:lab8-m1 alpine:3.20 sh -c 'apk add -q iproute2-tc &amp;&amp; tc qdisc del dev eth0 root'</code></pre>
+<pre class="output"><code>find: one day, compressors=none: 86,400 reviews, best of 3 = 1441 ms
+find: one day, compressors=snappy: 86,400 reviews, best of 3 = 491 ms
+find: one day, compressors=zstd: 86,400 reviews, best of 3 = 431 ms
+find: one day, compressors=zlib: 86,400 reviews, best of 3 = 609 ms</code></pre></li>
+      <li>Optional: the checksum. Read <code>checksum()</code> in <code>lessons/code/0008-wire-lab.py</code> first: it builds an OP_MSG with nothing but <code>struct.pack</code>.
+<pre class="terminal"><code>sh lessons/code/0008-capture.sh checksum
+python3 lessons/code/0008-opmsg.py checksum.pcap | grep ping -A1
+docker logs lab8-m1 2>&amp;1 | grep ChecksumMismatch | tail -1</code></pre></li>
+      <li>Clean up: <code>docker rm -f lab8-m1 lab8-py &amp;&amp; docker network rm lab8-net &amp;&amp; rm -f *.pcap</code></li>
+    </ol>
+  </div>
+
+  <h2>7 · Check yourself</h2>
+  <p>From memory. The first question comes from lesson 2.1 on purpose.</p>
+  <div id="quiz"></div>
+
+  <h2>Where this fits</h2>
+  <ol>
+    <li><s>Phase 1, the engine: B-trees, cache, concurrency, durability, one write end to end</s> ✓</li>
+    <li>Phase 2, transport &amp; wire:
+      <ol>
+        <li><a href="0007-driver-pool.html">Lesson 7: the driver's pool, monitoring and server selection</a> (hop 1)</li>
+        <li><strong>OP_MSG in depth: flagBits, document sequences, compression</strong> (hop 2, today)</li>
+        <li><a href="0009-ingress.html">Lesson 9: server ingress, sessions and the thread model</a> (hop 3, next)</li>
+        <li><a href="0010-dispatch.html">Lesson 10: command dispatch and interruption</a> (hop 4)</li>
+        <li>Lesson 11: diagnose a latency spike across hops 1–4</li>
+      </ol>
+    </li>
+  </ol>
+
+  <div class="callout source">
+    <p>Read the <a href="https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/">wire protocol page (manual 9.0)</a>, sections OP_MSG, Flag Bits, Sections and OP_COMPRESSED. Then the <a href="https://specifications.readthedocs.io/en/latest/message/OP_MSG/">OP_MSG spec</a>, mostly its "moreToCome", "exhaustAllowed" and "Q &amp; A" parts, and the short <a href="https://specifications.readthedocs.io/en/latest/compression/OP_COMPRESSED/">compression spec</a>. Keep one of your own captures open in the parser while you read.</p>
+  </div>
+
+  <div class="callout ask">
+    <p>Try it on your own system: check your app's connection string for <code>compressors=</code> and its write concern, then run <code>db.serverStatus().network</code> on a production node and compare <code>bytesOut</code> with <code>physicalBytesOut</code>. Paste me the numbers and where your app runs relative to the cluster, and we'll decide together whether compression pays. Ask me anything that's unclear.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="0007-driver-pool.html">← Lesson 7: The driver's side</a>
+    <a href="../reference/architecture-map.html">Reference: architecture map</a>
+    <a href="0009-ingress.html">Lesson 9: Server ingress →</a>
+  </nav>
+</main>
+
+<script src="../../assets/quiz.js"></script>
+<script>
+const R = 'https://github.com/mongodb/mongo/blob/r8.0.34/';
+const BTREE = 'https://source.wiredtiger.com/develop/arch-btree.html';
+const WIRE = 'https://www.mongodb.com/docs/manual/reference/mongodb-wire-protocol/';
+const OPMSG = 'https://specifications.readthedocs.io/en/latest/message/OP_MSG/';
+const COMP = 'https://specifications.readthedocs.io/en/latest/compression/OP_COMPRESSED/';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0008-op-msg',
+  questions: [
+    { layer: 'review',
+      q: '<em>From lesson 2.1:</em> the <code>_id</code> index of <code>store.reviews</code> is 3 levels deep. New reviews (rising ObjectIds) fill the rightmost leaf, which is <strong>not</strong> the root, and it splits. How deep is the tree now?',
+      options: ['It grows to 4', 'It drops to 2', 'It stays at 3', 'It doubles to 6'], answer: 2,
+      explain: `The leaf splits in two and its median key moves up into the parent. Height only grows when the <em>root</em> splits, because then a new root is made above it.${c(BTREE, 'WT B-trees')}` },
+
+    { layer: 'wire',
+      q: 'A driver sends an <code>insert</code> whose <code>flagBits</code> are <code>02 00 00 00</code>. What comes back from the server?',
+      options: ['No reply at all', 'One normal reply back', 'Several replies in sequence', 'One reply with checksum'], answer: 0,
+      explain: `Bit 1 is <code>moreToCome</code>. On a request it means "don't reply": that's how <code>w: 0</code> works. In the lab, two such inserts gave <code>s>c: 0 messages</code>.${c(OPMSG + '#moretocome-on-requests', 'OP_MSG spec')}` },
+
+    { layer: 'wire',
+      q: 'A <code>getMore</code> with <code>exhaustAllowed</code> gets three replies. What is the <code>responseTo</code> of the <strong>second</strong> reply?',
+      options: ['the getMore\'s request ID', 'the first reply\'s ID', 'zero, like any request', 'the cursor\'s numeric ID'], answer: 1,
+      explain: `"The <code>responseTo</code> field of every follow-up response will be the <code>messageId</code> of the previous response." In the lab: 424238335 → 121 → 122.${c(OPMSG + '#moretocome-on-responses', 'OP_MSG spec')}` },
+
+    { layer: 'wire',
+      q: 'The same 1,000 reviews were 164,256 B as a kind 1 sequence and 169,147 B as a body array. Where do the extra ~4.9 kB come from?',
+      options: ['A checksum per review', 'Compressing the sequence section', 'Extra driver session metadata', 'Array keys per element'], answer: 3,
+      explain: `A BSON array is a document with keys "0", "1", …, "999". Each element pays a type byte, its key and a NUL: 1,000 + 2,890 + 1,000 = 4,890 B. A sequence just puts the documents back to back.${c(WIRE, 'wire protocol')}` },
+
+    { layer: 'wire',
+      q: 'pymongo inserts 250,000 reviews (~164 B each) with one <code>insert_many</code>. How many <code>insert</code> messages go on the wire?',
+      options: ['One: under 48 MB', 'Two: split by size', 'Five: split at 50,000', 'Three: split at 100,000'], answer: 3,
+      explain: `<code>maxWriteBatchSize</code> is 100,000, so 100,000 + 100,000 + 50,000. Each 16.4 MB sequence is fine: in a kind 1 section the 16 MiB limit applies per document. mongosh also sent three, but split at the 16 MiB body limit.${c(R + 'src/mongo/db/ops/write_ops.h#L85', 'write_ops.h')}` },
+
+    { layer: 'compression',
+      q: 'A client connects with <code>compressors=zstd,snappy</code> to a default mongod 8.0. How is its handshake <code>hello</code> sent?',
+      options: ['Compressed with zstd, first', 'Compressed with snappy, default', 'Uncompressed, by spec rule', 'Compressed with zlib, fallback'], answer: 2,
+      explain: `Nothing is negotiated yet, and <code>hello</code> is on the list that "MUST NOT be compressed" (with the auth commands). The <em>next</em> requests use zstd: the client's first choice that the server also supports.${c(COMP + '#messages-not-allowed-to-be-compressed', 'compression spec')}` },
+
+    { layer: 'compression',
+      q: 'Which compressor does mongod use for the reply to a compressed request?',
+      options: ['the first one in its config', 'the same one the request used', 'always zstd, since it compresses best', 'always snappy, its first default name'], answer: 1,
+      explain: `The <code>SessionWorkflow</code> keeps the request's <code>compressorId</code> and compresses the reply with it. A plain request gets a plain reply.${c(R + 'src/mongo/transport/session_workflow.cpp#L624-L641', 'session_workflow.cpp')}` },
+
+    { layer: 'production',
+      q: 'Reading one day of reviews (14.8 MB) over a 100 Mbit/s, +20 ms link took 1.44 s uncompressed. About how long with zstd?',
+      options: ['About 1.4 s', 'About 2.9 s', 'About 0.04 s', 'About 0.4 s'], answer: 3,
+      explain: `zstd sent 2.09 MB instead of 14.8 MB (7.1×), and the read took 0.40–0.43 s. On the same host, with no bandwidth limit, the same zstd read was a little <em>slower</em> than no compression: there, it only costs CPU.${c(COMP, 'compression spec')}` },
+
+    { layer: 'production',
+      q: 'An app writes with <code>w: 0</code>. The primary steps down just before one of those writes arrives. What happens?',
+      options: ['The server just closes the connection', 'The driver gets an error reply', 'The write is redirected to primary', 'The server queues it for later'], answer: 0,
+      explain: `It can't reply, so it throws <code>NotWritablePrimary</code> and closes the connection, to force server selection again. The driver only notices on its next use of the socket, so that write is lost.${c(R + 'src/mongo/db/service_entry_point_common.cpp#L2306-L2318', 'service_entry_point_common.cpp')}` }
+  ]
+});
+</script>
+</body>
+</html>

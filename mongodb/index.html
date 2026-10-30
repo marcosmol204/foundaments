@@ -52,6 +52,34 @@
       <span class="desc">One majority insert through the driver, the real OP_MSG bytes, one storage transaction, the oplog and the commit point.</span>
     </a></li>
   </ol>
+  <h3>Phase 2 · Transport &amp; wire</h3>
+  <ol class="index-list">
+    <li><a href="lessons/0007-driver-pool.html">
+      <span class="num">0007</span>
+      <span class="title">The driver's side: pool and monitoring</span>
+      <span class="desc">Hop 1: monitoring sockets, server selection and the connection pool. Prove a slow query is really a wait for a connection, and size the pool.</span>
+    </a></li>
+    <li><a href="lessons/0008-op-msg.html">
+      <span class="num">0008</span>
+      <span class="title">OP_MSG in depth</span>
+      <span class="desc">Hop 2: flag bits (moreToCome, exhaustAllowed, checksum), document sequences and batch splitting, and compression measured on reviews.</span>
+    </a></li>
+    <li><a href="lessons/0009-ingress.html">
+      <span class="num">0009</span>
+      <span class="title">Server ingress: threads and sessions</span>
+      <span class="desc">Hop 3: one dedicated thread per connection, the SessionWorkflow loop, what idle connections cost, and the connection limit.</span>
+    </a></li>
+    <li><a href="lessons/0010-dispatch.html">
+      <span class="num">0010</span>
+      <span class="title">Command dispatch and interruption</span>
+      <span class="desc">Hop 4: parse, auth, deadline, run, slow log, and why maxTimeMS and killOp only stop a command at its next interrupt check.</span>
+    </a></li>
+    <li><a href="lessons/0011-transport-recap.html">
+      <span class="num">0011</span>
+      <span class="title">Recap: diagnose a latency spike across hops 1–4</span>
+      <span class="desc">Split one slow query's time into hops 1–4 and name the metric that proves each.</span>
+    </a></li>
+  </ol>
 
   <h2>Reference</h2>
   <ol class="index-list">
