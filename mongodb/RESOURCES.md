@@ -117,3 +117,9 @@
 - [Spec: Client Side Operations Timeout (CSOT)](https://specifications.readthedocs.io/en/latest/client-side-operations-timeout/client-side-operations-timeout/)
   `timeoutMS` covers server selection, checkout and all getMores in wall-clock time; the driver appends maxTimeMS = remaining time − minRTT. Use for: client-side timeouts.
 - Docs (Manual 9.0): [killOp](https://www.mongodb.com/docs/manual/reference/command/killOp/), [cursor.maxTimeMS](https://www.mongodb.com/docs/manual/reference/method/cursor.maxTimeMS/), [$currentOp](https://www.mongodb.com/docs/manual/reference/operator/aggregation/currentOp/), [Terminate Running Operations](https://www.mongodb.com/docs/manual/tutorial/terminate-running-operations/), [Atomicity](https://www.mongodb.com/docs/manual/core/write-operations-atomicity/). Use for: operator procedures and kill semantics.
+
+### Latency split (added 2026-10-30)
+- [Spec: Command Logging and Monitoring](https://specifications.readthedocs.io/en/latest/command-logging-and-monitoring/command-logging-and-monitoring/)
+  `commandStarted`/`Succeeded`/`Failed` events; duration runs from send to reply and may include BSON encoding and decoding. Use for: the driver-side "command duration" in a latency split.
+- [Source: `CurOp::_sumBlockedTimeTotal` + `workingMillis` (`curop.cpp`, r8.0.34)](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/curop.cpp#L568)
+  `workingMillis` = `durationMillis` − lock waits − execution-ticket queueing − flow control. Use for: separating waiting from working in hop 4 (lesson 11).

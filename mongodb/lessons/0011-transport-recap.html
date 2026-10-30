@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 11 · Diagnose a Latency Spike</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<link rel="stylesheet" href="../../assets/quiz.css">
+<style>
+  /* Lesson-local: hop badge (as in lessons 6-10), the time-budget bar, case files */
+  .hop { display: inline-block; min-width: 1.5em; text-align: center; font: 600 .78rem/1.5 'JetBrains Mono', monospace; color: var(--accent); border: 1px solid var(--accent); border-radius: 50%; margin-right: .3rem; }
+  .table-scroll { overflow-x: auto; }
+  svg .seg1 { fill: var(--code-bg); stroke: var(--tier-1); stroke-width: 1.2; }
+  svg .seg2 { fill: var(--warn-bg); stroke: var(--warn); stroke-width: 1.2; }
+  svg .seg4 { fill: var(--bad-bg); stroke: var(--bad); stroke-width: 1.2; }
+  svg .seg5 { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.2; }
+  svg .seg-wc { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.2; stroke-dasharray: 4 3; }
+  svg .brace { stroke: var(--fg); stroke-width: 1.2; fill: none; }
+  svg .brace-acc { stroke: var(--accent); stroke-width: 1.4; fill: none; }
+  .case { border: 1px solid var(--rule); border-radius: 8px; padding: .9rem 1.1rem .3rem; margin: 1.4rem 0; }
+  .case h3 { margin-top: 0; }
+  .case .predict { font-style: italic; color: var(--muted); }
+  pre.snip::before { content: "evidence, from the lab"; display: block; color: var(--muted); font-size: .7rem; margin-bottom: .35rem; }
+  pre.snip { font-size: .8rem; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+</style>
+</head>
+<body>
+<main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>
+  <div class="kicker">MongoDB Internals · Lesson 0011 · Phase 2: Transport &amp; wire (recap)</div>
+  <h1>Diagnose a latency spike across hops 1–4</h1>
+  <p class="subtitle">Lessons 7 to 10 each opened one hop. This lesson puts them back in a line, as one time budget, and gives you a method: four measurements, three subtractions, and the biggest gap names the hop.</p>
+
+  <p><strong>Your win today:</strong> someone tells you "p99 of <code>find({rating: {$gte: 4}})</code> on <code>store.reviews</code> jumped from 20 ms to 900 ms". You split that time into hops 1–4, say which hop grew, and name the one metric that proves it. Then you do it for real, on a lab cluster with a hidden fault. This is goal 1 of your <a href="../MISSION.md">mission</a> ("diagnose a production symptom by naming the internal mechanism behind it and the metric that proves it"), for the whole transport layer.</p>
+
+  <h2>0 · Warm-up from lessons 7 to 10</h2>
+  <p>From memory, before reading on.</p>
+  <ol>
+    <li>Lesson 7: 40 slow finds, <code>maxPoolSize: 5</code>. The slow log said ≈ 103 ms, the app saw ≈ 550 ms. Where were the other 450 ms?</li>
+    <li>Lesson 7 again: with <code>maxPoolSize: 40</code>, <code>durationMillis</code> was ~585 ms but <code>workingMillis</code> only ~170 ms. What was the find doing for the difference?</li>
+    <li>Lesson 9: what is mongod's thread for an idle pooled connection doing right now?</li>
+  </ol>
+  <p>Answers: (1) in the driver's wait queue, waiting to check out a connection; (2) waiting in mongod for an execution ticket; (3) sleeping in <code>sourceMessage</code>. If all three came back, you already have the method. Section 1 just puts it on one line.</p>
+
+  <h2>1 · One request as a time budget</h2>
+  <p>Take one <code>find</code>, from the moment your code calls it to the moment it gets the documents. Every millisecond of it sits in one of these segments, in this order:</p>
+
+  <figure>
+    <svg viewBox="0 0 680 342" role="img" aria-label="One request drawn as a horizontal bar of segments, left to right: server selection and pool checkout (hop 1, in the driver), the request on the wire (hop 2) and the server reading it (hop 3), the wait for an execution ticket (hop 4), the working time, an optional write-concern wait for writes, and the reply on the wire back. Below the bar, four brackets: app sees spans everything; the driver's command duration spans from the request on the wire to the reply; the slow log's durationMillis spans the ticket wait, the work and the write-concern wait; workingMillis spans only the work and the write-concern wait.">
+      <text class="lbl-sm" x="20" y="22">time →</text>
+      <!-- hop labels -->
+      <text class="lbl" x="44" y="46"><tspan font-weight="600">1</tspan> driver</text>
+      <text class="lbl" x="196" y="46"><tspan font-weight="600">2–3</tspan> wire</text>
+      <text class="lbl" x="318" y="46"><tspan font-weight="600">4</tspan> dispatch + run</text>
+      <text class="lbl" x="560" y="46"><tspan font-weight="600">2–3</tspan></text>
+      <!-- the bar -->
+      <rect class="seg2" x="20" y="58" width="80" height="44" rx="3"/><text class="lbl-sm" x="26" y="77">server</text><text class="lbl-sm" x="26" y="92">selection</text>
+      <rect class="seg2" x="100" y="58" width="80" height="44" rx="3"/><text class="lbl-sm" x="106" y="77">pool</text><text class="lbl-sm" x="106" y="92">checkout</text>
+      <rect class="seg1" x="180" y="58" width="100" height="44" rx="3"/><text class="lbl-sm" x="186" y="77">request out</text><text class="lbl-sm" x="186" y="92">RTT/2 + bytes</text>
+      <rect class="seg4" x="280" y="58" width="90" height="44" rx="3"/><text class="lbl-sm" x="286" y="77">ticket</text><text class="lbl-sm" x="286" y="92">queue</text>
+      <rect class="seg5" x="370" y="58" width="110" height="44" rx="3"/><text class="lbl-sm" x="376" y="77">working</text><text class="lbl-sm" x="376" y="92">plan, scan, CPU</text>
+      <rect class="seg-wc" x="480" y="58" width="70" height="44" rx="3"/><text class="lbl-sm" x="486" y="77">w wait</text><text class="lbl-sm" x="486" y="92">writes</text>
+      <rect class="seg1" x="550" y="58" width="110" height="44" rx="3"/><text class="lbl-sm" x="556" y="77">reply back</text><text class="lbl-sm" x="556" y="92">RTT/2 + bytes</text>
+      <!-- brackets -->
+      <path class="brace" d="M20 124 L20 132 L660 132 L660 124"/>
+      <text class="lbl" x="24" y="150">app sees: your timer, your APM</text>
+      <path class="brace" d="M180 170 L180 178 L660 178 L660 170"/>
+      <text class="lbl" x="184" y="196">command duration: driver's commandSucceeded</text>
+      <path class="brace-acc" d="M280 216 L280 224 L550 224 L550 216"/>
+      <text class="lbl" x="284" y="242">durationMillis: slow-query log</text>
+      <path class="brace-acc" d="M370 262 L370 270 L550 270 L550 262"/>
+      <text class="lbl" x="374" y="288">workingMillis</text>
+      <text class="lbl-sm" x="20" y="314">gaps: app − command = hop 1 · command − durationMillis = hops 2–3</text>
+      <text class="lbl-sm" x="58" y="330">durationMillis − workingMillis = waiting in hop 4</text>
+    </svg>
+    <figcaption>Not to scale. In the healthy lab the whole bar is 1.4 ms (p50). A spike is one segment that got fat. The brackets are the four numbers you can actually read.</figcaption>
+  </figure>
+
+  <p>You can't time each segment directly. But four numbers are easy to get, and each one covers a known part of the bar:</p>
+  <ol>
+    <li><strong>App sees.</strong> Your own timer around the call. Everything.</li>
+    <li><strong>Command duration</strong> (driver). The driver's command monitoring event (<code>commandSucceeded</code> / <code>commandFailed</code>) times one command from "sent" to "reply received". The spec allows it to include BSON encoding and decoding.<a class="cite" href="https://specifications.readthedocs.io/en/latest/command-logging-and-monitoring/command-logging-and-monitoring/">command monitoring spec</a> It does <em>not</em> include server selection or the pool checkout, which happen before the command exists on a connection. The checkout itself has its own event: <code>connectionCheckedOut.durationMS</code>.<a class="cite" href="https://specifications.readthedocs.io/en/latest/connection-monitoring-and-pooling/connection-monitoring-and-pooling/">CMAP spec</a></li>
+    <li><strong><code>durationMillis</code></strong> (slow-query log, or the profiler). CurOp's clock, which starts in dispatch, after the bytes were read and parsed, and stops when the reply is built (<a href="0010-dispatch.html">lesson 10</a>, steps 6 to 8). So it doesn't contain the network.</li>
+    <li><strong><code>workingMillis</code></strong>. <code>durationMillis</code> minus the time the operation was <em>blocked</em>: lock waits, the queue for execution tickets, and flow control.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/curop.cpp#L568">curop.cpp L568</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/curop.cpp#L642">L642</a> The ticket wait is also logged on its own, as <code>queues.execution.totalTimeQueuedMicros</code>.</li>
+  </ol>
+  <p>Then subtract:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Gap</th><th>What lives in it</th><th>Hop</th><th>Lesson</th></tr>
+    <tr><td>app sees − command duration</td><td>server selection; pool checkout (with a new connection's setup, if one was opened)</td><td><span class="hop">1</span></td><td><a href="0007-driver-pool.html">7</a></td></tr>
+    <tr><td>command duration − <code>durationMillis</code></td><td>network round trip and transfer, compression, the server's thread reading the socket and parsing</td><td><span class="hop">2</span><span class="hop">3</span></td><td><a href="0008-op-msg.html">8</a>, <a href="0009-ingress.html">9</a></td></tr>
+    <tr><td><code>durationMillis</code> − <code>workingMillis</code></td><td>waiting for an execution ticket, a lock, flow control</td><td><span class="hop">4</span></td><td><a href="0007-driver-pool.html">7</a>, <a href="0010-dispatch.html">10</a></td></tr>
+    <tr><td><code>workingMillis</code></td><td>the work itself: plan, scan, cache misses, and for writes the write-concern wait (<code>waitForWriteConcernDurationMillis</code>)</td><td><span class="hop">4</span> and below</td><td><a href="0006-one-write.html">6</a>; Phase 3</td></tr>
+  </table>
+  </div>
+  <p>Two cautions from earlier lessons. A cursor is many commands: the slow log has one line per <code>find</code> and per <code>getMore</code>, and the time your app spends between batches is in no server number at all (<a href="0010-dispatch.html">lesson 10</a>: 1,017 ms of server time, 7.4 s of waiting). And the server can't see hop 1 at all: if you only read the slow log, a pool problem looks like "the server is fast, so it's not the database".</p>
+
+  <h2>2 · The walkthrough: one spike, four subtractions</h2>
+  <p>One real example from this lesson's lab, step by step. The lab is a 3-member replica set on <code>mongo:8.0</code> (8.0.34) in Docker, <code>-m 1g</code> each, 1,000,000 seeded reviews, and an index <code>{rating: 1}</code> so our query is a plain <code>IXSCAN</code>. The app, <code>reviews-api</code>, is 8 workers looping <code>find({rating: {$gte: 4}}).limit(20)</code> on the Node.js driver <strong>7.7.0</strong> (the same version as lessons 7 and 10), <code>maxPoolSize: 10</code>. Healthy, it does about 600 finds a second at <strong>p50 1.3–1.5 ms, p99 3.4–3.9 ms</strong>. The lab can't give you 20 → 900 ms exactly, but it gives the same shape: a p99 that grows 20× to 60×.</p>
+  <ol>
+    <li><strong>The symptom.</strong> p99 went from ~3.6 ms to <strong>72–227 ms</strong> (three runs), with no errors. The app's view, from <code>load</code>:
+<pre class="snip"><code>                         p50      p99      max   (ms)
+app sees                   41      227      377
+checkout wait             0.0      0.0       36
+command (wire+server)      41      226      376
+mean per op: app 55 = checkout 0.1 + command 55 + other 0.4 (selection, driver)</code></pre></li>
+    <li><strong>Hop 1? No.</strong> App time ≈ command time. Checkout p99 is 0.0 ms and "other" (server selection) is 0.4 ms. The driver got a server and a connection at once.</li>
+    <li><strong>Hops 2–3? No.</strong> The slowest sampled slow-log line for our find said <code>durationMillis: 245</code>, about the command time. The driver's RTT to the primary stayed at a few milliseconds (4–9 ms; 2–6 ms when healthy). The time is inside mongod's clock.</li>
+    <li><strong>Hop 4: waiting or working?</strong> The same line:
+<pre class="snip"><code>"command":{"find":"reviews","filter":{"rating":{"$gte":4}},"limit":20, …}, "appName":"reviews-api",
+"planSummary":"IXSCAN { rating: 1 }", "keysExamined":20, "docsExamined":20, "nreturned":20,
+"cpuNanos":202915, "numYields":0,
+"queues":{"execution":{"admissions":2,"totalTimeQueuedMicros":245360},"ingress":{"admissions":1}},
+"workingMillis":0, "durationMillis":245</code></pre>
+      <code>workingMillis: 0</code>, 20 keys, 0.2 ms of CPU: the query itself is as cheap as ever. All 245 ms are <code>totalTimeQueuedMicros</code>: it waited for an <strong>execution ticket</strong>. Over a minute of samples, our finds had <code>durationMillis</code> p99 96 ms and <code>workingMillis</code> p99 1 ms.</li>
+    <li><strong>Who holds the tickets?</strong> Execution tickets limit how many operations run in the storage engine at once; in 8.0, throughput probing raises or lowers that number based on measured throughput.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/admission/README.md">execution control README</a> <code>serverStatus().queues.execution.read</code> showed <code>out</code> 61–63 of <code>totalTickets</code> 66–70. And <code>$currentOp</code>, grouped by <code>appName</code>:
+<pre class="snip"><code>admin-search: 64 running, plan COLLSCAN, max secs_running 5, maxTimeMS set: none</code></pre>
+      An internal search page runs <code>countDocuments({review: /battery/i})</code> in 64 parallel loops, with no time limit. Each one scans all 1,000,000 reviews (3.3–5.4 s, 100–165 yields). It holds a ticket while it works and queues for a new one after each yield (one search's own line: <code>admissions: 102</code>, 1,278 ms queued). Our tiny find waits in the same line.</li>
+    <li><strong>Name it, prove it, fix it.</strong> Mechanism: runaway scans with no deadline fill the read tickets, so other reads queue in hop 4. Proof: <code>durationMillis − workingMillis</code> (equivalently <code>totalTimeQueuedMicros</code>) is the whole spike, and <code>$currentOp</code> shows who holds the tickets. Fix now: <code>killOp</code> them by <code>opid</code> and check for <code>killPending</code> (lesson 10). Fix for good: <code>timeoutMS</code> on the search client, a <code>defaultMaxTimeMS.readOperations</code> safety net, and a real index for word search instead of <code>/battery/i</code>. In the lab, stopping the searches brought p99 back to 3.6–3.9 ms.</li>
+  </ol>
+  <p>Notice what the slow log of <em>our</em> find did not show: <code>COLLSCAN</code>, many <code>docsExamined</code>, high <code>cpuNanos</code>. If you had only looked for "slow query plans", you'd have found nothing wrong with it. The gap told you to look at the neighbours.</p>
+
+  <h2>3 · The decision table</h2>
+  <p>Every row is a mechanism from lessons 6–10. Find the gap first (section 1), then the row.</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>What you see</th><th>Hop · mechanism</th><th>Metric that proves it</th><th>Fix</th></tr>
+    <tr><td>app ≫ command; checkout wait high</td><td><span class="hop">1</span>pool exhausted (wait queue)</td><td>CMAP <code>connectionCheckedOut.durationMS</code>; <code>$currentOp</code> shows <code>maxPoolSize</code> ops from that <code>appName</code></td><td>Find what holds the connections; separate clients for slow jobs; <code>timeoutMS</code>. Raising the pool only moves the queue (L7)</td></tr>
+    <tr><td>app ≫ command; no checkout; stalls or <code>MongoServerSelectionError</code></td><td><span class="hop">1</span>no suitable server: server selection waits</td><td><code>serverDescriptionChanged</code> → <code>Unknown</code>, <code>connectionPoolCleared</code>; election in <code>rs.status()</code></td><td>Planned step-downs; a selection budget longer than an election (~10 s), or <code>timeoutMS</code> and retries</td></tr>
+    <tr><td>first requests after start are slow; checkout max high</td><td><span class="hop">1</span>cold pool: connection setup</td><td><code>connectionCreated</code> / <code>connectionReady.durationMS</code></td><td>Leave <code>maxConnecting</code> at 2; warm up before traffic (L7)</td></tr>
+    <tr><td>command ≫ <code>durationMillis</code>; driver RTT high</td><td><span class="hop">2</span>network latency</td><td><code>roundTripTime</code> in the driver's topology description; command − <code>durationMillis</code> ≈ RTT</td><td>Put the app near the primary; fewer round trips (batch, L8)</td></tr>
+    <tr><td>command ≫ <code>durationMillis</code> on big replies only</td><td><span class="hop">2</span>bandwidth</td><td><code>network.physicalBytesOut</code> = <code>bytesOut</code> (no compression)</td><td><code>compressors=zstd</code> on slow links only (L8)</td></tr>
+    <tr><td>new instances can't connect: "connection &lt;monitor&gt; … closed"</td><td><span class="hop">3</span>connection limit reached</td><td><code>connections.available</code> ≈ 0, <code>.rejected</code> rising; "Connection refused because there are too many open connections"; connections by <code>appName</code></td><td>Smaller pools and <code>minPoolSize</code>; exempt admins; establishment rate limiter (L9)</td></tr>
+    <tr><td>mongod RSS high, cache not full, <code>current</code> ≫ <code>active</code></td><td><span class="hop">3</span>idle connections: 1 thread + ~100 KB each</td><td><code>connections.current</code> vs <code>.active</code>; thread count</td><td>Size pools to real concurrency (L9)</td></tr>
+    <tr><td><code>durationMillis</code> ≫ <code>workingMillis</code></td><td><span class="hop">4</span>queue for execution tickets</td><td><code>queues.execution.totalTimeQueuedMicros</code>; <code>serverStatus().queues.execution</code> <code>out</code> ≈ <code>totalTickets</code>; <code>$currentOp</code></td><td>Stop what holds the tickets: deadlines, <code>killOp</code>, an index</td></tr>
+    <tr><td><code>workingMillis</code> high; <code>COLLSCAN</code>, high <code>docsExamined</code></td><td><span class="hop">4</span>the query itself is slow</td><td><code>planSummary</code>, <code>docsExamined</code>, <code>cpuNanos</code></td><td>An index (Phase 3); <code>maxTimeMS</code> as a guard</td></tr>
+    <tr><td>query ran past its <code>maxTimeMS</code>; <code>killOp</code> "ok" but still there</td><td><span class="hop">4</span>no interrupt checks reached</td><td><code>numYields: 0</code>; <code>killPending: true</code> (L10)</td><td>Confirm kills; find the code path that doesn't yield</td></tr>
+    <tr><td>a write: <code>waitForWriteConcernDurationMillis</code> ≈ <code>durationMillis</code></td><td>hops 7–8: secondaries behind</td><td>member optimes in <code>rs.status()</code> (L6)</td><td>Fix replication, not the primary</td></tr>
+  </table>
+  </div>
+
+  <h2>4 · Case files</h2>
+  <p>Four more faults from the same lab. For each: read the evidence, <strong>say the hop and the proving metric out loud before you open the answer</strong>. That's the retrieval that makes it stick.</p>
+
+  <div class="case">
+    <h3>Case A · "The export feature shipped this morning"</h3>
+    <p>p99 of our find went from 3.6 ms to over a second. No errors. The only change today: a CSV export of positive reviews that mention a refund, in the same service.</p>
+<pre class="snip"><code>                         p50      p99      max   (ms)
+app sees                  310    1,209    1,218
+checkout wait             309    1,207    1,214
+command (wire+server)     1.0       21       25
+
+slow log (5% sample), finds on store.reviews by appName and filter shape:
+  reviews-api {rating}         IXSCAN { rating: 1 }: durationMillis p50 0     p99 0
+  reviews-api {rating, review} IXSCAN { rating: 1 }: durationMillis p50 1098  p99 1558
+$currentOp:  reviews-api: 10 running, plan IXSCAN { rating: 1 }</code></pre>
+    <p class="predict">Which hop? Which number proves it?</p>
+    <details><summary>Answer</summary>
+      <p><strong>Hop 1, the pool.</strong> App ≈ checkout wait; command time p50 is still 1.0 ms and our find's <code>durationMillis</code> is 0. The proof is <code>connectionCheckedOut.durationMS</code> (p99 1,207 ms), and <code>$currentOp</code> showing exactly <code>maxPoolSize</code> = 10 operations from <code>reviews-api</code>. They're the export: 12 export workers share our <code>MongoClient</code>, each export find runs 1.1–1.6 s, so they hold all 10 connections and our fast finds wait in the same queue (lesson 7). Note the trap: <code>$currentOp</code> shows <code>reviews-api</code> and the same <code>IXSCAN { rating: 1 }</code> plan. Only the filter shape (<code>{rating, review}</code>) tells the export apart, so tag code paths with <code>comment</code>.</p>
+      <p><strong>Fix:</strong> give the export its own <code>MongoClient</code> with a small pool (one pool per client, per server), or limit its concurrency; set <code>timeoutMS</code> so a pile-up fails fast; and give the export an index that fits it. In the lab, <code>maxPoolSize: 100</code> also helped (p99 13 ms): the 12 exports no longer block the pool, but now they run on the server and our finds queue a little for tickets there (<code>durationMillis</code> p99 8 ms, <code>workingMillis</code> p99 1 ms). That's lesson 7's "a bigger pool moves the queue". It's only small here because there are 12 slow scans, not 64 as in the walkthrough.</p>
+    </details>
+  </div>
+
+  <div class="case">
+    <h3>Case B · "The new deploy won't start"</h3>
+    <p>A colleague just deployed a new service, <code>recs-service</code>: 40 instances with <code>minPoolSize: 10</code>. Now every new <code>reviews-api</code> instance fails at startup. Old instances still serve. (The lab sets <code>maxIncomingConnections: 400</code>, with 127.0.0.1 exempt, so this fits on a laptop.)</p>
+<pre class="snip"><code>startup attempt 1 failed after 5,009 ms: MongoServerSelectionError: connection &lt;monitor&gt; to 172.18.0.2:27017 closed
+startup attempt 2 failed after 5,009 ms: MongoServerSelectionError: connection &lt;monitor&gt; to 172.18.0.2:27017 closed
+
+lab11-m1 current 405 available -5 active 43 rejected 3051 · refused/60s 2931
+lab11-m2 current 405 available -5 active 41 rejected 3165 · refused/60s 3045
+connections by appName on m1:  recs-service: 390 connections, 40 active · mongosh 2.13.0: 5 · OplogFetcher: 2
+
+{"ctx":"listener","msg":"Connection refused because there are too many open connections",
+ "attr":{"remote":"172.18.0.5:36400","connectionId":22553,"connectionCount":400}}</code></pre>
+    <p class="predict">Which hop? Which number proves it?</p>
+    <details><summary>Answer</summary>
+      <p><strong>Hop 3, the connection limit.</strong> The error looks like hop 1 (server selection), but selection failed <em>because</em> the driver's monitor sockets were refused at accept time: the server is at its limit. Proof: <code>connections.available</code> ≤ 0 and <code>rejected</code> rising on every member, plus the "Connection refused" log line from the <code>listener</code> thread (lesson 9). Who: <code>recs-service</code> holds 390 of 400 on the primary. <code>minPoolSize</code> applies to every member, so 40 × (10 + 2 monitoring) = 480 per member, more than the limit. Its pools keep retrying, which is why <code>rejected</code> climbs by thousands a minute. "40 active" are its 40 parked streaming <code>hello</code>s, not work.</p>
+      <p>The 5 extra connections over the limit are the exempt <code>mongosh</code>: without <code>maxIncomingConnectionsOverride</code> you couldn't even look. In production the limit is min(<code>maxConns</code>, the file-descriptor rule, 20% of memory ÷ 16 KiB): 13,107 in a 1 GB container.</p>
+      <p><strong>Fix:</strong> do the fleet math before deploying (instances × (pool + 2) per member), drop or shrink <code>minPoolSize</code>, keep admin IPs exempt, and consider the establishment rate limiter with a queue for storms (lesson 9).</p>
+    </details>
+  </div>
+
+  <div class="case">
+    <h3>Case C · "Eight errors and a five-second hole"</h3>
+    <p>For a few seconds, every request hung, then 8 failed. Then everything was normal again. The app sets <code>serverSelectionTimeoutMS: 5000</code>.</p>
+<pre class="snip"><code>ops ok 12,535, errors 8
+  8 × MongoServerSelectionError: getaddrinfo ENOTFOUND m1
+                         p50      p99      max   (ms)
+app sees                  1.4      3.6    5,014
+checkout wait             0.0      0.0       10
+command (wire+server)     1.0      3.0       11
+mean per op: app 7.5 = checkout 0.0 + command 1.3 + other 6.2 (selection, driver)
+p99 per 5 s: 0s 3.8 | 5s 3.6 | 10s 5,014 | 15s 3.7 | 20s 3.3
+driver events: connections created 16, pool cleared 1
+  +7.9 s m1:27017 RSPrimary -> Unknown
+  +7.9 s pool cleared m1:27017
+  +17.3 s m2:27017 RSSecondary -> RSPrimary</code></pre>
+    <p class="predict">Which hop? Which number proves it?</p>
+    <details><summary>Answer</summary>
+      <p><strong>Hop 1, server selection: no primary.</strong> Checkout and command times never moved; the whole hole is in "other", the time before a connection is even requested. Proof: the SDAM events, <code>m1 RSPrimary → Unknown</code> plus <code>pool cleared</code> (a network error, so a crash, not a step-down), and a new primary 9.4 s later (8.3–9.4 s in two runs; lesson 7 measured 10.8 s). That's the election timeout: nobody nominated a successor. The 8 errors are the 8 workers whose selection ran out its 5 s budget before the election finished. (<code>ENOTFOUND</code> is a Docker detail: a killed container's hostname disappears. In production you'd see a timeout or "connection refused".)</p>
+      <p>With the default <code>serverSelectionTimeoutMS</code> of 30 s, the same crash gives <em>no</em> errors and a ~10 s request, as in lesson 7. Neither is wrong; choose on purpose.</p>
+      <p><strong>Fix:</strong> prefer planned step-downs for maintenance (30 ms in lesson 7). Make your request budget (<code>timeoutMS</code>) and retry policy fit a ~10 s election, and keep retryable reads/writes on.</p>
+    </details>
+  </div>
+
+  <div class="case">
+    <h3>Case D · "Everything is 40 ms slower"</h3>
+    <p>Not a spike, a shift: every request got slower by the same amount, p50 and p99 alike. The infra team "moved some network things" last night.</p>
+<pre class="snip"><code>                         p50      p99      max   (ms)
+app sees                   45       54      248
+checkout wait             0.0      1.0      206
+command (wire+server)      44       53       55
+topology at end: m1 RSPrimary rtt 42 ms · m2 RSSecondary rtt 3.0 ms · m3 RSSecondary rtt 5.0 ms
+
+slow log, reviews-api {rating} IXSCAN { rating: 1 }: durationMillis p50 0 · workingMillis p50 0</code></pre>
+    <p class="predict">Which hop? Which number proves it? And why is checkout max 206 ms?</p>
+    <details><summary>Answer</summary>
+      <p><strong>Hop 2, the network to the primary.</strong> Command ≈ app, so not hop 1. <code>durationMillis</code> is 0, so command − <code>durationMillis</code> ≈ 44 ms is all outside mongod's clock. Proof: the driver's own RTT to m1 is 42 ms, while m2 and m3 are 3–5 ms. (The lab added 40 ms with <code>tc netem</code> on m1's network interface, the same tool as lesson 8.) A <code>limit(20)</code> reply is a few KB, so this is latency, not bandwidth: compression wouldn't help.</p>
+      <p>The 206 ms checkout is a <strong>new connection</strong> being opened at startup: TCP, the <code>hello</code> handshake and the first command are several round trips, each 40 ms (lesson 7). Slow links make cold pools expensive.</p>
+      <p><strong>Fix:</strong> put the app in the same zone as the primary, and cut round trips per user request (batch writes, one query instead of three). Each round trip you remove saves 40 ms here.</p>
+    </details>
+  </div>
+
+  <h2>5 · So in production you should…</h2>
+  <div class="callout">
+    <p><strong>Rule: record four numbers for every slow request (app time, checkout wait, command duration, and the server's <code>durationMillis</code> / <code>workingMillis</code>), subtract, and go to the hop with the biggest gap. Don't start with the query plan.</strong></p>
+  </div>
+  <ol>
+    <li><strong>Make hop 1 visible.</strong> Export CMAP checkout time and command duration to your APM, per service. The server will never show you hop 1.</li>
+    <li><strong>Tag everything.</strong> <code>appName</code> per service and <code>comment</code> per code path. In case A, only the filter shape told the export apart from our find; a comment would have named it.</li>
+    <li><strong>One client per workload.</strong> A pool belongs to one <code>MongoClient</code>. Don't let batch jobs and user requests share it.</li>
+    <li><strong>Give every request a budget</strong> with <code>timeoutMS</code>: it bounds selection, checkout and server time together (lesson 10). Add <code>defaultMaxTimeMS.readOperations</code> as the server-side net for clients you don't control.</li>
+    <li><strong>Do the connection math fleet-wide</strong> before each deploy, and keep an exempt way in for admins (lesson 9).</li>
+    <li><strong>Watch the ticket queue.</strong> Alert on <code>durationMillis − workingMillis</code> (or <code>queues.execution.totalTimeQueuedMicros</code>) for your critical queries. When it grows, look at <code>$currentOp</code>, not at your query.</li>
+  </ol>
+
+  <h3>Phase 2 on one page</h3>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Hop</th><th>Defaults that matter (Node 7.7.0 · mongod 8.0.34)</th><th>Where to look</th></tr>
+    <tr><td><span class="hop">1</span>driver</td><td><code>maxPoolSize</code> 100 · <code>maxConnecting</code> 2 · <code>waitQueueTimeoutMS</code> 0 (no limit) · <code>serverSelectionTimeoutMS</code> 30 s · <code>heartbeatFrequencyMS</code> 10 s · <code>localThresholdMS</code> 15 ms · 2 monitoring sockets per member</td><td>CMAP and SDAM events, command monitoring</td></tr>
+    <tr><td><span class="hop">2</span>wire</td><td>16 MiB document · 48 MB message · 100,000 writes per batch · server compressors <code>snappy,zstd,zlib</code>, driver <code>compressors</code> none</td><td>driver RTT, <code>network</code> counters, a <code>tcpdump</code> capture</td></tr>
+    <tr><td><span class="hop">3</span>ingress</td><td>1 thread (1 MiB stack, ≈100 KB RSS) per connection · limit = min(<code>maxConns</code>, fd rule, 20% memory ÷ 16 KiB) · rate limiter off</td><td><code>serverStatus().connections</code>, "Connection accepted/refused" logs</td></tr>
+    <tr><td><span class="hop">4</span>dispatch</td><td>slowms 100 · yield/interrupt check every 10 ms · no default <code>maxTimeMS</code> · tickets set by throughput probing</td><td>slow log (<code>durationMillis</code>, <code>workingMillis</code>, <code>queues</code>), <code>$currentOp</code></td></tr>
+  </table>
+  </div>
+
+  <div class="lab">
+    <p>The mystery. About 25 minutes, plus 2 for setup. One script, <a href="code/0011-mystery.sh"><code>lessons/code/0011-mystery.sh</code></a>, runs everything with <code>docker exec</code>. Run from the <code>mongodb/</code> folder. It uses containers <code>lab11-*</code>, network <code>lab11</code> and host ports 27210–27212.</p>
+    <ol>
+      <li>Build the cluster and the app (3 members, 1,000,000 reviews, the <code>{rating: 1}</code> index, a Node container with driver 7.7.0):
+<pre class="terminal"><code>bash lessons/code/0011-mystery.sh setup</code></pre></li>
+      <li>Learn what healthy looks like. Run the app for 30 s:
+<pre class="terminal"><code>bash lessons/code/0011-mystery.sh load</code></pre>
+<pre class="output"><code>reviews-api, 30 s, 8 workers, find({rating: {$gte: 4}}).limit(20), maxPoolSize 10
+ops ok 19,487, errors 0
+                         p50      p99      max   (ms)
+app sees                  1.3      3.4       12
+checkout wait             0.0      0.0       10
+command (wire+server)     1.0      3.0      8.0
+mean per op: app 1.4 = checkout 0.0 + command 1.2 + other 0.2 (selection, driver)
+p99 per 5 s: 0s 3.2 | 5s 3.2 | 10s 3.4 | 15s 3.1 | 20s 3.5 | 25s 3.8 | 30s 3.3
+driver events: connections created 8, pool cleared 0
+topology at end: m1 RSPrimary rtt 5.7 ms · m2 RSSecondary rtt 4.0 ms · m3 RSSecondary rtt 5.3 ms</code></pre>
+      And the server's side, in a second terminal while <code>load</code> runs: <code>bash lessons/code/0011-mystery.sh evidence</code>. It prints, per member, <code>serverStatus().connections</code> and "Connection refused" lines; on the primary, connections and running operations by <code>appName</code> (<code>$currentOp</code>), and the slow-log numbers for finds on <code>store.reviews</code> by filter shape.</li>
+      <li>Arm a secret fault, then look:
+<pre class="terminal"><code>bash lessons/code/0011-mystery.sh inject
+bash lessons/code/0011-mystery.sh load        # terminal 1
+bash lessons/code/0011-mystery.sh evidence    # terminal 2, ~15 s into the load</code></pre></li>
+      <li><strong>Diagnose before you reveal.</strong> Write down four numbers (app p99, checkout p99, command p99, our find's <code>durationMillis</code> − <code>workingMillis</code>), the gap that grew, the hop, the mechanism, and the one metric that proves it. Use section 3. You may run your own commands too, for example <code>docker exec lab11-m1 mongosh --quiet --eval 'db.serverStatus().queues.execution.read'</code>.</li>
+      <li>Check yourself, undo the fault, and go again until you've seen all five:
+<pre class="terminal"><code>bash lessons/code/0011-mystery.sh reveal
+bash lessons/code/0011-mystery.sh heal</code></pre>
+      Four of the five faults are the case files and the walkthrough. One is new to you. The <code>network</code> fault pulls <code>iproute2-tc</code> from the Alpine mirrors, so it needs internet. The <code>failover</code> fault kills <code>m1</code> 8 s into the next <code>load</code>; <code>heal</code> restarts it and waits ~15 s for it to become primary again.</li>
+      <li>Optional: re-run a fault by name (<code>inject pool</code>, <code>storm</code>, <code>failover</code>, <code>regex</code>, <code>network</code>) and change one thing. For case A, <strong>predict the new split first</strong>, then run the app with a bigger pool: <code>POOL=100 bash lessons/code/0011-mystery.sh load</code>, with <code>evidence</code> in the second terminal.</li>
+      <li>Clean up: <code>bash lessons/code/0011-mystery.sh teardown</code></li>
+    </ol>
+  </div>
+
+  <h2>6 · Check yourself</h2>
+  <p>From memory. The questions jump between hops on purpose, and two come from Phase 1.</p>
+  <div id="quiz"></div>
+
+  <h2>Where this fits</h2>
+  <ol>
+    <li><s>Phase 1, the engine: B-trees, cache, concurrency, durability, one write end to end</s> ✓ (lessons 2–6)</li>
+    <li><s>Phase 2, transport &amp; wire</s> ✓: <a href="0007-driver-pool.html">driver pool and monitoring</a> (hop 1) · <a href="0008-op-msg.html">OP_MSG</a> (hop 2) · <a href="0009-ingress.html">ingress</a> (hop 3) · <a href="0010-dispatch.html">dispatch and interruption</a> (hop 4) · <strong>recap: diagnose across hops 1–4</strong> (today)</li>
+    <li><strong>Next, Phase 3: the layers built on the engine.</strong> First the query engine: what happens inside <code>workingMillis</code>, the last segment of today's bar (planning, the plan cache, classic vs. SBE).</li>
+  </ol>
+
+  <div class="callout source">
+    <p>Read the <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/admission/README.md">Execution Control README at r8.0.34</a> (throughput probing: how the ticket count in the walkthrough is chosen), then <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/curop.cpp#L568"><code>CurOp::_sumBlockedTimeTotal</code> and the <code>workingMillis</code> computation in <code>curop.cpp</code></a>: ten lines that define the most useful subtraction in this lesson. For the driver side, the event lists in the <a href="https://specifications.readthedocs.io/en/latest/connection-monitoring-and-pooling/connection-monitoring-and-pooling/">CMAP spec</a> and the <a href="https://specifications.readthedocs.io/en/latest/command-logging-and-monitoring/command-logging-and-monitoring/">command monitoring spec</a>.</p>
+  </div>
+
+  <div class="callout ask">
+    <p>Try it on your own system: pick one slow endpoint and get the four numbers for one bad request: app time, checkout wait, command duration, and the slow-log line's <code>durationMillis</code> and <code>workingMillis</code>. Paste them to me (remove the values from the command) and we'll name the hop together. If you can't get one of the four, that's the first thing to fix. Ask me anything that's unclear.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="0010-dispatch.html">← Lesson 10: Command dispatch</a>
+    <a href="../reference/architecture-map.html">Reference: architecture map</a>
+    <span>Phase 3: the query engine (next)</span>
+  </nav>
+</main>
+
+<script src="../../assets/quiz.js"></script>
+<script>
+const R = 'https://github.com/mongodb/mongo/blob/r8.0.34/';
+const BTREE = 'https://source.wiredtiger.com/develop/arch-btree.html';
+const EVICT = 'https://source.wiredtiger.com/develop/arch-eviction.html';
+const CMAP = 'https://specifications.readthedocs.io/en/latest/connection-monitoring-and-pooling/connection-monitoring-and-pooling/';
+const SEL = 'https://specifications.readthedocs.io/en/latest/server-selection/server-selection/';
+const CUROP = R + 'src/mongo/db/curop.cpp#L568';
+const CMON = 'https://specifications.readthedocs.io/en/latest/command-logging-and-monitoring/command-logging-and-monitoring/';
+const MON = 'https://specifications.readthedocs.io/en/latest/server-discovery-and-monitoring/server-monitoring/';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0011-transport-recap',
+  questions: [
+    { layer: 'review',
+      q: '<em>From lesson 2.1:</em> the lab\'s new <code>{rating: 1}</code> index has 3 levels. Inserting 5★ reviews fills a <strong>non-root</strong> leaf, and it splits. Its parent has room. How many levels does the index have now?',
+      options: ['Four levels', 'Three levels', 'Two levels', 'Six levels'], answer: 1,
+      explain: `The leaf splits in two and one separator key moves up into the parent. Only a <em>root</em> split adds a level, because a new root is made above it.${c(BTREE, 'WT B-trees')}` },
+
+    { layer: 'hop 4',
+      q: 'Our find\'s slow-log line says <code>durationMillis: 245</code>, <code>workingMillis: 0</code>, <code>keysExamined: 20</code>. Where did the 245 ms go?',
+      options: ['Waiting for an execution ticket', 'Scanning the index on rating', 'Waiting in the driver\'s pool', 'Sending the reply over network'], answer: 0,
+      explain: `<code>workingMillis</code> is <code>durationMillis</code> minus lock waits, ticket queueing and flow control. The line also said <code>totalTimeQueuedMicros: 245360</code>. The pool and the network are outside <code>durationMillis</code> altogether.${c(CUROP, 'curop.cpp')}` },
+
+    { layer: 'hop 1',
+      q: 'App p99 is 1,209 ms. The driver\'s command duration p99 is 21 ms, and the server\'s <code>durationMillis</code> is 0. Which metric proves the cause?',
+      options: ['The mongod connections current count', 'The driver\'s CMAP checkout wait', 'The slow log execution queue', 'The driver\'s monitor round trip'], answer: 1,
+      explain: `App − command is the hop 1 gap: selection plus checkout. <code>connectionCheckedOut.durationMS</code> (p99 1,207 ms in case A) shows it's the wait queue: all connections are busy.${c(CMAP + '#waitqueue', 'CMAP wait queue')}` },
+
+    { layer: 'hop 3',
+      q: 'After a deploy, new app instances fail with "connection &lt;monitor&gt; to … closed". Which <code>serverStatus().connections</code> fields prove the connection limit is the cause?',
+      options: ['active high, totalCreated flat', 'current low, active zero', 'threaded high, exhaustHello rising', 'available zero, rejected rising'], answer: 3,
+      explain: `At the limit, the listener refuses new sockets: <code>available</code> ≤ 0 and <code>rejected</code> climbs, with a "Connection refused because there are too many open connections" log line. The driver's monitor is refused first, so it shows up as a selection error.${c(R + 'src/mongo/transport/session_manager_common.cpp#L325', 'session_manager_common.cpp')}` },
+
+    { layer: 'review',
+      q: '<em>From lesson 3:</em> the cache passes 95% (the eviction trigger), so application threads must evict pages before they can read. In the slow log of a read, where does that time show up?',
+      options: ['In the execution ticket queue', 'In workingMillis, as working time', 'In the driver\'s checkout wait', 'Nowhere, eviction is in background'], answer: 1,
+      explain: `Past the trigger, the application thread itself does eviction work inside the operation, so it counts as working time. <code>workingMillis</code> only subtracts lock waits, ticket queueing and flow control.${c(EVICT, 'WT eviction')}${c(CUROP, 'curop.cpp')}` },
+
+    { layer: 'hop 2',
+      q: 'Command duration p50 is 44 ms, <code>durationMillis</code> is 0, and checkout wait is 0. What should you check first?',
+      options: ['The pool\'s maxPoolSize setting', 'The query\'s planSummary line', 'The driver\'s primary RTT', 'The server\'s ticket counts'], answer: 2,
+      explain: `Command − <code>durationMillis</code> is time outside mongod's clock: hops 2–3. The driver's topology description has each server's <code>roundTripTime</code>; in case D it was 42 ms for m1 and 3–5 ms for the others.${c(MON + '#measuring-rtt', 'measuring RTT')}` },
+
+    { layer: 'hop 1',
+      q: 'The primary crashes. The app has <code>serverSelectionTimeoutMS: 5000</code>, and the election takes about 9 s. What do in-flight finds do?',
+      options: ['Fail after five seconds of selection', 'Run on a secondary right away', 'Wait in the pool for checkout', 'Queue in mongod for a ticket'], answer: 0,
+      explain: `With no primary there is no suitable server, so selection blocks until its budget runs out: <code>MongoServerSelectionError</code> at 5,014 ms in the lab. With the 30 s default they would have waited ~10 s and succeeded (lesson 7).${c(SEL + '#server-selection-algorithm', 'selection loop')}` },
+
+    { layer: 'hop 4',
+      q: 'An internal search page runs <code>countDocuments({review: /battery/i})</code> in 64 loops with no time limit. Which server-side setting stops such reads without changing that client?',
+      options: ['A higher maxIncomingConnections limit', 'A smaller reviews-api maxPoolSize', 'A defaultMaxTimeMS read limit', 'The connection establishment limiter'], answer: 2,
+      explain: `The <code>defaultMaxTimeMS</code> cluster parameter (8.0), field <code>readOperations</code>, gives every read without its own <code>maxTimeMS</code> a deadline, enforced at interrupt checks. Users with <code>bypassDefaultMaxTimeMS</code> (like <code>root</code>) skip it (lesson 10).${c(R + 'src/mongo/db/default_max_time_ms_cluster_parameter.cpp#L36', 'default_max_time_ms')}` },
+
+    { layer: 'method',
+      q: 'Which subtraction isolates hops 2–3 (network, compression, the server reading the socket)?',
+      options: ['App latency minus command duration', 'Server durationMillis minus its workingMillis', 'Server workingMillis minus its cpuNanos', 'Command duration minus server durationMillis'], answer: 3,
+      explain: `The driver's command duration runs from "sent" to "reply received"; <code>durationMillis</code> starts in dispatch, after the message was read and parsed. What's left is the trip both ways plus hop 3.${c(CMON, 'command monitoring')}` }
+  ]
+});
+</script>
+</body>
+</html>

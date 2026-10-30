@@ -9,6 +9,7 @@
 # Usage (from the mongodb/ folder; needs only Docker):
 #   bash lessons/code/0011-mystery.sh setup      # 3-node replica set lab11-m1..m3 + app container (~2 min)
 #   bash lessons/code/0011-mystery.sh load       # baseline: run the app 30 s, read its time split
+#   POOL=100 bash lessons/code/0011-mystery.sh load   # the same with another maxPoolSize (default 10)
 #   bash lessons/code/0011-mystery.sh inject     # arm ONE random fault (it stays secret)
 #   bash lessons/code/0011-mystery.sh load       # the symptom
 #   bash lessons/code/0011-mystery.sh evidence   # server-side metrics for hops 2-4, per member
@@ -66,7 +67,8 @@ async function app() {
   const SECS = Number(process.argv[3] || 30), WORKERS = 8;
   let features = {};
   try { features = JSON.parse(fs.readFileSync('/app/features.json', 'utf8')); } catch {}
-  const opts = { appName: 'reviews-api', maxPoolSize: 10, serverSelectionTimeoutMS: 5000, monitorCommands: true };
+  const POOL = Number(process.env.POOL || 10);
+  const opts = { appName: 'reviews-api', maxPoolSize: POOL, serverSelectionTimeoutMS: 5000, monitorCommands: true };
   let c = new MongoClient(URI, opts);
   const t0 = Date.now(), at = () => `+${((Date.now() - t0) / 1000).toFixed(1)} s`;
   const checkout = [], command = [], appT = [], events = [];
@@ -116,7 +118,7 @@ async function app() {
   const exporter = async () => { while (!stop) { try { await coll.find({ rating: { $gte: 4 }, review: /refund/ }).toArray(); } catch {} } };
   const all = [...Array.from({ length: WORKERS }, worker), ...(features.csvExport ? Array.from({ length: 12 }, exporter) : [])];
   await sleep(SECS * 1000); stop = true; await Promise.all(all);
-  console.log(`reviews-api, ${SECS} s, ${WORKERS} workers, find({rating: {$gte: 4}}).limit(20), maxPoolSize 10`);
+  console.log(`reviews-api, ${SECS} s, ${WORKERS} workers, find({rating: {$gte: 4}}).limit(20), maxPoolSize ${POOL}`);
   console.log(`ops ok ${ok.toLocaleString('en-US')}, errors ${Object.values(errors).reduce((a, b) => a + b, 0)}`);
   for (const [k, n] of Object.entries(errors)) console.log(`  ${n} × ${k}`);
   console.log(`                         p50      p99      max   (ms)`);
@@ -185,7 +187,7 @@ load)
     echo "failover-fired" > "$STATE"
   fi
   write_app   # refresh the app code from this script
-  docker exec -e NODE_PATH=/app/node_modules $APP node /app/lab.js app "${2:-30}"
+  docker exec -e NODE_PATH=/app/node_modules -e POOL="${POOL:-10}" $APP node /app/lab.js app "${2:-30}"
   wait
   ;;
 inject)
@@ -265,5 +267,5 @@ teardown)
   rm -f "$STATE"
   ;;
 *)
-  sed -n '2,24p' "$0"; exit 1 ;;
+  sed -n '2,25p' "$0"; exit 1 ;;
 esac
