@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 16 · Phase 3 Recap: One Review Across the Whole Cluster</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<link rel="stylesheet" href="../../assets/quiz.css">
+<style>
+  /* Lesson-local: scrolling tables */
+  .table-scroll { overflow-x: auto; }
+</style>
+</head>
+<body>
+<main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>
+  <div class="kicker">MongoDB Internals · Lesson 0016 · Phase 3: Layers over the engine (recap)</div>
+  <h1>Phase 3 recap: one review across the whole cluster</h1>
+  <p class="subtitle">Follow one review from the driver to a shard's disk and its secondaries, naming the layer at each step and the number that proves it. No new lab: every number comes from lessons 6–15.</p>
+
+  <p><strong>Your win today:</strong> you can take a vague complaint ("reviews are slow", "a review disappeared", "one shard is on fire") and say which layer to look at first, which metric to read, and which lesson explains it.</p>
+
+  <h2>0 · Warm-up from lessons 3 and 9</h2>
+  <ol>
+    <li>Lesson 3: a query reads pages that are not in the WiredTiger cache. Whose time is that, and where does it show up in the slow log?</li>
+    <li>Lesson 9: how many threads does MongoDB 8.0 use per client connection?</li>
+  </ol>
+  <p>Answers: (1) The command's own work: it's in <code>workingMillis</code> (and <code>storage.data.bytesRead</code>/timeReadingMicros). (2) One dedicated thread per connection.</p>
+
+  <h2>1 · The trace</h2>
+  <p>Insert one review through a sharded cluster whose shard key is <code>{_id: "hashed"}</code>, with <code>w: "majority"</code>. Each step is a layer we studied:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>#</th><th>What happens</th><th>Layer · lesson</th><th>If it's slow or wrong, look at</th></tr>
+    <tr><td>1</td><td>The driver picks a <code>mongos</code>, checks out a pooled connection</td><td>Driver pool · <a href="0007-driver-pool.html">7</a></td><td>Checkout wait; <code>maxPoolSize</code> 100, <code>waitQueueTimeoutMS</code></td></tr>
+    <tr><td>2</td><td>The insert is an <code>OP_MSG</code> (kind 0 + a kind 1 sequence for batches)</td><td>Wire · <a href="0008-op-msg.html">8</a></td><td>16 MiB body / 48,000,000 B message limits</td></tr>
+    <tr><td>3</td><td><code>mongos</code>'s connection thread picks it up (one thread per connection)</td><td>Ingress · <a href="0009-ingress.html">9</a></td><td>Connection count, <code>maxConns</code>, ≈100 KB RSS each</td></tr>
+    <tr><td>4</td><td>Dispatch: parse, auth, deadline, then <code>mongos</code> hashes <code>_id</code> and finds the chunk</td><td>Dispatch + routing · <a href="0010-dispatch.html">10</a>, <a href="0015-sharding.html">15</a></td><td><code>maxTimeMS</code>/<code>timeoutMS</code>; <code>explain</code> shows <code>SINGLE_SHARD</code></td></tr>
+    <tr><td>5</td><td>The shard's primary repeats steps 3–4, then writes inside one storage transaction: the collection B-tree, every index (5 keys for a review with 3 tags), and the oplog entry</td><td>Engine · <a href="0004-concurrency.html">4</a>, <a href="0006-one-write.html">6</a>, <a href="0002-two-lookups.html">2</a></td><td><code>keysInserted</code>, write conflicts, tickets</td></tr>
+    <tr><td>6</td><td>The pages are dirty in cache; the journal is flushed (every 100 ms, or at once for <code>j: true</code>/majority)</td><td>Cache + durability · <a href="0003-the-cache.html">3</a>, <a href="0005-durability.html">5</a></td><td>Dirty cache %, journal sync time</td></tr>
+    <tr><td>7</td><td>Secondaries of that shard fetch, write and apply the entry; they report positions</td><td>Replication · <a href="0013-oplog-and-sync.html">13</a></td><td><code>writtenOpTime</code> vs <code>appliedOpTime</code>; oplog window</td></tr>
+    <tr><td>8</td><td>The commit point passes the entry; the command thread wakes and replies</td><td>Commit point · <a href="0014-elections-and-rollback.html">14</a>, <a href="0006-one-write.html">6</a></td><td><code>waitForWriteConcernDurationMillis</code> in the slow log</td></tr>
+    <tr><td>9</td><td>Later, a read for this review: <code>find({_id})</code> is planned (cache hit or trial), runs on one shard</td><td>Query · <a href="0012-query-planning.html">12</a></td><td><code>planCacheKey</code>, <code>replanned</code>, <code>keysExamined</code> vs <code>nreturned</code></td></tr>
+  </table>
+  </div>
+
+  <h2>2 · Phase 3 on one page</h2>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Layer</th><th>Core mechanism</th><th>Numbers we measured (8.0.34)</th><th>Rule</th></tr>
+    <tr><td>Query planning (12)</td><td>Race candidate plans for 101 results; cache winner by shape; replan if the cached plan needs &gt; 10× its works</td><td>3 candidates × 195 works; entry inactive → active on run 2; replan at 1,010 works; no replan for a plan only 20% worse</td><td>Make one index obviously best; read <code>replanned</code> and <code>planCacheKey</code></td></tr>
+    <tr><td>Oplog &amp; sync (13)</td><td>Idempotent entries; secondaries pull: fetch → write → apply (parallel by document)</td><td>70,090 modified → 70,090 entries, 12.2 MB (182 B); caught up ≈450 ms after the write; one frozen member: majority 1 ms, <code>w: 3</code> times out</td><td>Size the oplog window for peak write rate; lag = op-time difference</td></tr>
+    <tr><td>Elections &amp; rollback (14)</td><td>10 s election timeout, terms, majority commit point; rollback to the common point into <code>removed.*.bson</code></td><td>Old primary stepped down at ≈10 s; new primary at 13 s; 2 inserts reverted; <code>local</code> read 1 doc, <code>majority</code> 0</td><td>Use <code>w: "majority"</code> for what you can't lose; treat a wtimeout as "unknown"</td></tr>
+    <tr><td>Sharding (15)</td><td>Shard key → chunks → shards; <code>mongos</code> routes; balancer moves by data size; donor keeps orphans</td><td>Hashed: 30,038 / 29,962; ranged monotonic: 60,000 / 0; <code>{rating:1}</code>: all chunks jumbo; scan read 295,880 of 200,000</td><td>Put the shard key in hot queries; high cardinality; never a monotonic ranged key</td></tr>
+  </table>
+  </div>
+
+  <h2>3 · Symptom → layer</h2>
+  <p>This is the table to learn. It adds Phase 3 to the one from lesson 11.</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Complaint</th><th>Ask first</th><th>Proof</th><th>Layer</th></tr>
+    <tr><td>"This query used to be fast and now isn't"</td><td>Did the plan change?</td><td><code>planSummary</code>, <code>replanned</code>, an index build/drop just before</td><td>Query (12)</td></tr>
+    <tr><td>"It's slow for some customers only"</td><td>Same shape, different constants?</td><td>Same <code>planCacheKey</code>, very different <code>keysExamined</code></td><td>Query (12)</td></tr>
+    <tr><td>"The replica is behind"</td><td>Which step? Is it just an idle gap?</td><td><code>writtenOpTime</code> vs <code>appliedOpTime</code> vs primary</td><td>Replication (13)</td></tr>
+    <tr><td>"A secondary can't catch up"</td><td>Is the oplog window shorter than the outage?</td><td><code>rs.printReplicationInfo()</code>; "too far ahead" in the log</td><td>Replication (13)</td></tr>
+    <tr><td>"Writes failed for 10–15 seconds"</td><td>Was there an election?</td><td>Log: <code>Election succeeded</code>; term +1</td><td>Elections (14)</td></tr>
+    <tr><td>"A review we confirmed is gone"</td><td>Was it <code>w:1</code> across a failover?</td><td><code>rollback/…/removed.*.bson</code>; <code>Operations reverted by rollback</code></td><td>Rollback (14)</td></tr>
+    <tr><td>"One shard is on fire"</td><td>Where do new writes go? Is the key monotonic?</td><td>Per-shard <code>opcounters</code>; the max chunk's owner</td><td>Sharding (15)</td></tr>
+    <tr><td>"Sharded queries are slower than before"</td><td>Is the shard key in the filter?</td><td><code>explain</code>: <code>SHARD_MERGE</code>, shards listed</td><td>Sharding (15)</td></tr>
+    <tr><td>"The counts per shard don't add up"</td><td>Orphans after a migration?</td><td><code>countDocuments</code> via <code>mongos</code>; <code>config.rangeDeletions</code></td><td>Sharding (15)</td></tr>
+    <tr><td>"Everything is slow at once"</td><td>Which of the four numbers from lesson 11?</td><td>App time, checkout, <code>durationMillis</code>, <code>workingMillis</code></td><td>Hops 1–4 (11), then back to this table</td></tr>
+  </table>
+  </div>
+
+  <h2>4 · Check yourself</h2>
+  <p>From memory. The questions jump between layers, and three come from earlier phases.</p>
+  <div id="quiz"></div>
+
+  <h2>Where this fits</h2>
+  <ol>
+    <li><s>Phase 1, the engine</s> ✓ · <s>Phase 2, transport &amp; wire</s> ✓ · <s>Phase 3, layers over the engine</s> ✓ (lessons 12–16).</li>
+    <li><strong>Not yet covered</strong>, from the mission: <strong>multi-document transactions</strong> (the oplog's transaction entries and, across shards, the two-phase commit with a prepared state; both are in the replication README), aggregation execution (SBE in depth), change streams, and the shard-key analyzer. Pick one, or ask for a different direction.</li>
+  </ol>
+
+  <div class="callout source">
+    <p>Choose one of the READMEs we leaned on and read it end to end: <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#transactions">transactions in the replication README</a> is the natural next one, because it ties together snapshots (lesson 4), the oplog (13), commit points (14) and shards (15).</p>
+  </div>
+
+  <div class="callout ask">
+    <p>Try it on your own system: take the last production incident you remember, and place it in the table in section 3. Which row fits, and was the first number you looked at the right one? Tell me and we'll go through it.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="0015-sharding.html">← Lesson 15: Sharding</a>
+    <a href="../reference/architecture-map.html">Reference: architecture map</a>
+    <span>Next: your pick</span>
+  </nav>
+</main>
+
+<script src="../../assets/quiz.js"></script>
+<script>
+const R = 'https://github.com/mongodb/mongo/blob/r8.0.34/';
+const REPL = R + 'src/mongo/db/repl/README.md';
+const SH = R + 'src/mongo/db/s/';
+const QR = R + 'src/mongo/db/query/README.md';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0016-layers-recap',
+  questions: [
+    { layer: 'review',
+      q: '<em>From lesson 5:</em> when is a <code>w: 1</code> write on a replica-set member durable on that member?',
+      options: ['At the next checkpoint only', 'When the journal is flushed (every 100 ms, or at once with j: true)', 'Immediately, in the cache', 'When a majority has it'], answer: 1,
+      explain: `The write is in the cache first; the journal is synced periodically or on demand. A checkpoint (every 60 s) is the on-disk tree, not what makes a single write survive a crash.${c('https://www.mongodb.com/docs/manual/core/journaling/', 'journaling')}` },
+
+    { layer: 'review',
+      q: '<em>From lesson 10:</em> a scan never reaches an interrupt check. You set <code>maxTimeMS: 500</code>. What happens?',
+      options: ['It stops at 500 ms regardless', 'The deadline is ignored until the work ends or reaches a check', 'The server kills the thread', 'The client times out the socket'], answer: 1,
+      explain: `Interruption is cooperative: deadlines and <code>killOp</code> land only at <code>checkForInterrupt</code>.${c(R + 'src/mongo/db/operation_context.cpp#L220', 'checkForInterrupt')}` },
+
+    { layer: 'review',
+      q: '<em>From lesson 11:</em> <code>durationMillis</code> 900 and <code>workingMillis</code> 150 on a find. Where did the other 750 ms go?',
+      options: ['In the B-tree', 'Waiting (execution tickets, locks, flow control) before or between the work', 'In the network round trip', 'In the driver pool'], answer: 1,
+      explain: `<code>workingMillis</code> = duration − lock wait − ticket queue − flow control. The difference is queueing inside the server. Pool checkout and the network are outside both numbers.${c(R + 'src/mongo/db/curop.cpp#L569', 'curop.cpp')}` },
+
+    { layer: 'query',
+      q: 'The slow log shows <code>replanned: true</code> every few minutes for one query shape. What does it suggest?',
+      options: ['The plan cache is full', 'One cached plan doesn\'t suit all constants of this shape', 'The disk is slow', 'An election happened'], answer: 1,
+      explain: `The cached plan exceeded 10× its recorded works for some constants, so it was dropped and the query replanned. Pin the index (hint / Query Settings) or give the shape a better index.${c(QR + '#cached-plan-replanning', 'replanning')}` },
+
+    { layer: 'replication',
+      q: 'A bulk <code>updateMany</code> on 100,000 reviews modified 70,090. A secondary shows 8 s of lag right after, then 0 s 450 ms later. What is the best explanation?',
+      options: ['The network dropped packets', 'Lag is op-time difference: the secondary\'s last entry was old; it caught up quickly', 'The secondary was rolled back', 'The primary paused'], answer: 1,
+      explain: `Lag compares op-times. After an idle gap the first burst makes the gap look large, and parallel apply closes it fast.${c(REPL + '#oplog-entry-application', 'oplog application')}` },
+
+    { layer: 'failover',
+      q: 'The primary is partitioned away from both secondaries. An app on the old primary writes with <code>w: 1</code> and gets <code>ok</code>. Later the set heals. The write is…',
+      options: ['Kept, as it was acknowledged', 'Rolled back into a removed.*.bson file', 'Merged into the new primary', 'Kept on the old primary only, forever'], answer: 1,
+      explain: `It was never on a majority. The new primary's history doesn't have it; the old primary rolled it back and saved it to the rollback directory.${c(REPL + '#rollback-recover-to-a-timestamp-rtt', 'rollback')}` },
+
+    { layer: 'sharding',
+      q: 'Which combination spreads <em>new</em> review inserts evenly and still lets <code>find({_id})</code> hit one shard?',
+      options: ['<code>{_id: 1}</code> (ranged)', '<code>{_id: "hashed"}</code>', '<code>{rating: 1}</code>', '<code>{verified: 1, rating: 1}</code>'], answer: 1,
+      explain: `Hashing spreads consecutive ids (30,038 / 29,962 in the lab), and an equality on the hashed key is routed to one chunk. Ranged <code>_id</code> sent 60,000 / 0; low-cardinality keys go jumbo.${c(SH + 'README_balancer.md', 'balancer README')}` },
+
+    { layer: 'diagnosis',
+      q: 'A sharded collection\'s <code>$collStats</code> per shard add up to 295,880 documents, but <code>countDocuments</code> says 200,000. Which is right, and why the gap?',
+      options: ['$collStats; countDocuments is cached', 'countDocuments; the extra are orphans a donor shard keeps until the range deleter runs', 'Neither; there are duplicates', 'countDocuments, but only because of the plan cache'], answer: 1,
+      explain: `<code>mongos</code> filters orphans out of counts. Per-shard storage stats don't. This is also why a scatter-gather scan reads more than the collection holds.${c(SH + 'README_migrations.md', 'migrations README')}` }
+  ]
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 13 · The Oplog and How Secondaries Sync</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<link rel="stylesheet" href="../../assets/quiz.css">
+<style>
+  /* Lesson-local: scrolling tables */
+  .table-scroll { overflow-x: auto; }
+</style>
+</head>
+<body>
+<main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>
+  <div class="kicker">MongoDB Internals · Lesson 0013 · Phase 3: Layers over the engine</div>
+  <h1>The oplog and how secondaries sync</h1>
+  <p class="subtitle">Lesson 6 ended with "the secondaries pull the entry". Today: what an oplog entry really contains, how a secondary fetches, writes and applies it, and what "replication lag" measures.</p>
+
+  <p><strong>Your win today:</strong> a secondary is behind. You can name which of the three steps (fetch, write, apply) is slow, say how long the oplog will last before the secondary falls off it, and predict which write concerns still work.</p>
+
+  <h2>0 · Warm-up from lessons 6 and 12</h2>
+  <p>From memory, before reading on.</p>
+  <ol>
+    <li>Lesson 6: a <code>w: "majority"</code> insert returns. Where was the write already durable, and what did the command wait for?</li>
+    <li>Lesson 12: a cached plan with <code>works: 101</code> needs 1,500 works on new constants. Replan or keep?</li>
+  </ol>
+  <p>Answers: (1) Durable on the primary's journal when <code>j: true</code> applies; the command thread waited for the majority commit point (secondaries' acknowledgements). Today's lesson explains where those acknowledgements come from. (2) Replan: the limit is 10 × 101 = 1,010.</p>
+
+  <h2>1 · What the oplog holds</h2>
+  <p>The oplog is a capped collection, <code>local.oplog.rs</code>. Every write on the primary adds entries to it in the same storage transaction as the write itself (lesson 6). Secondaries replay these entries. The replication README says the entries "are rewritten from the initial operation to make them idempotent".<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#doing-a-write">repl README</a> Here is what I saw on <code>store.reviews</code> after these writes:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>You ran</th><th>Oplog entry (trimmed)</th><th>Notice</th></tr>
+    <tr><td><code>updateOne({_id}, {$inc: {rating: 1}})</code></td><td><code>op:"u", o:{$v:2, diff:{u:{rating:4}}}, o2:{_id:…}</code></td><td>The <em>result</em> (4), not "+1". Replaying it twice gives the same state.</td></tr>
+    <tr><td><code>updateOne({_id}, {$push: {tags: "battery"}})</code></td><td><code>o:{$v:2, diff:{stags:{a:true, u1:"battery"}}}</code></td><td>"In array <code>tags</code>, set index 1 to battery". Not "append".</td></tr>
+    <tr><td><code>insertOne({review:"oplog demo", …})</code></td><td><code>op:"i", o:{_id:…, review:…, rating:5, …}</code></td><td>The full document.</td></tr>
+    <tr><td><code>deleteOne</code></td><td><code>op:"d", o:{_id:…}</code></td><td>Only the key.</td></tr>
+    <tr><td><code>updateMany({_id: {$gte: …}}, {$set: {verified: false}})</code></td><td>One <code>op:"u"</code> entry <em>per document</em></td><td>A multi-document write is many entries, each with its own <code>ts</code>.</td></tr>
+  </table>
+  </div>
+  <p>Each entry also has <code>ts</code> (a timestamp: seconds + a counter), <code>t</code> (the election term), <code>ns</code>, the collection <code>ui</code> and <code>wall</code> (wall-clock time). The diff format (<code>$v: 2</code>) is why a one-field change to a big review costs bytes, not the whole document.</p>
+  <p>Two more facts from the lab:</p>
+  <ul>
+    <li><strong>No-op updates write nothing.</strong> <code>updateMany({}, {$set: {verified: false}})</code> on 100,000 reviews matched 100,000 but <em>modified</em> 70,090 (the rest were already <code>false</code>), and the oplog grew by exactly 70,090 entries: 12.2 MB, about 182 B per entry.</li>
+    <li><strong>The oplog is sized on disk, not by time.</strong> In my container it was 1,954 MB (the default is 5% of free disk, within bounds the manual sets at 990 MB to 50 GB).<a class="cite" href="https://www.mongodb.com/docs/manual/core/replica-set-oplog/">oplog size</a> How long that lasts depends on your write rate (section 4).</li>
+  </ul>
+
+  <h2>2 · Three jobs on the secondary, step by step</h2>
+  <p>Secondaries <strong>pull</strong>. The primary never pushes. In 8.0 the README splits a secondary's work into separate threads with an in-memory queue between them:<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#life-as-a-secondary">life as a secondary</a></p>
+
+  <figure>
+    <svg viewBox="0 0 700 200" role="img" aria-label="Steady-state replication on one secondary. The OplogFetcher thread runs a tailable getMore with awaitData against the sync source's oplog and puts batches into a buffer. The OplogWriter takes batches, writes them to the secondary's own oplog, flushes the journal and advances lastWritten. The OplogApplier splits each batch among writer threads by document, applies it to the collections and indexes, and advances lastApplied. A feedback thread sends the positions back to the sync source with replSetUpdatePosition.">
+      <defs><marker id="ah13" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+      <rect class="box" x="10" y="20" width="150" height="70" rx="5"/>
+      <text class="lbl" x="22" y="42">Sync source</text><text class="lbl-sm" x="22" y="60">its oplog.rs</text><text class="lbl-sm" x="22" y="76">(primary or secondary)</text>
+      <rect class="box-accent" x="195" y="20" width="150" height="70" rx="5"/>
+      <text class="lbl" x="207" y="42">① OplogFetcher</text><text class="lbl-sm" x="207" y="60">getMore, awaitData</text><text class="lbl-sm" x="207" y="76">→ in-memory buffer</text>
+      <rect class="box-accent" x="380" y="20" width="150" height="70" rx="5"/>
+      <text class="lbl" x="392" y="42">② OplogWriter</text><text class="lbl-sm" x="392" y="60">writes own oplog.rs,</text><text class="lbl-sm" x="392" y="76">journal flush → lastWritten</text>
+      <rect class="box-accent" x="545" y="20" width="145" height="70" rx="5"/>
+      <text class="lbl" x="557" y="42">③ OplogApplier</text><text class="lbl-sm" x="557" y="60">parallel by document</text><text class="lbl-sm" x="557" y="76">→ lastApplied</text>
+      <path class="edge" d="M160 55 H195" marker-end="url(#ah13)"/><path class="edge" d="M345 55 H380" marker-end="url(#ah13)"/><path class="edge" d="M530 55 H545" marker-end="url(#ah13)"/>
+      <rect class="box" x="195" y="130" width="495" height="46" rx="5"/>
+      <text class="lbl" x="207" y="151">④ feedback: replSetUpdatePosition to the sync source</text>
+      <text class="lbl-sm" x="207" y="167">sends written / applied / durable positions; this is what the primary counts for w: N and w: "majority"</text>
+      <path class="edge" d="M620 90 V130" marker-end="url(#ah13)"/>
+    </svg>
+    <figcaption>One secondary in steady state. Each box is its own thread; the arrows between ①②③ are in-memory queues.</figcaption>
+  </figure>
+
+  <ol>
+    <li><strong>Fetch.</strong> The fetcher keeps one connection to the sync source and runs a tailable <code>getMore</code> on <code>local.oplog.rs</code> that waits for new data. On the primary, <code>$currentOp</code> shows these as <code>op: "getmore"</code>, <code>appName: "OplogFetcher"</code>, one per secondary: I saw two. The reply carries metadata (term, the commit point) as well as the entries.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#oplog-fetching">oplog fetching</a></li>
+    <li><strong>Write.</strong> Since 8.0, a dedicated <code>OplogWriter</code> writes the batch to the secondary's own oplog, tells the storage engine to flush the journal, and advances <code>lastWritten</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#oplog-entry-persistence">oplog persistence</a> (<code>replSetGetStatus</code> shows <code>writtenOpTime</code>, <code>appliedOpTime</code> and <code>durableOpTime</code> separately.)</li>
+    <li><strong>Apply.</strong> The applier batches entries, splits them among writer threads, and applies them to collections and indexes. "The only restriction ... has to do with the documents": operations on one document stay on one thread, in order; different documents run in parallel. Commands like <code>dropDatabase</code> get a batch of their own. Then it advances <code>lastApplied</code>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#oplog-entry-application">oplog application</a></li>
+    <li><strong>Report.</strong> The secondary tells its sync source its positions. The primary needs these to answer <code>w: 2</code> or <code>w: "majority"</code>.</li>
+  </ol>
+  <p>Where does a secondary fetch from? Not always the primary. With <code>chainingAllowed: true</code> (the default) it picks the closest eligible member by ping time. In my lab both secondaries chose the primary (<code>syncSourceHost</code> in <code>rs.status()</code>), since all pings were 0 ms. It skips members that are too far behind (<code>maxSyncSourceLagSecs</code>) and members whose oldest oplog entry is newer than its own last entry.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#sync-source-selection">sync source selection</a></p>
+
+  <h2>3 · What the lab showed</h2>
+  <p>3-node replica set in Docker (<code>mongo:8.0.34</code>), 100,000 reviews, all members on one machine.</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Test</th><th>Result</th></tr>
+    <tr><td><code>updateMany</code> touching 70,090 reviews</td><td>780 ms on the primary; both secondaries caught up about 450 ms after the primary finished</td></tr>
+    <tr><td><code>fsyncLock()</code> on one secondary, then writes on the primary</td><td><code>w: 1</code> median 1 ms; <code>w: "majority"</code> median 1 ms (the other secondary still acknowledges); lag of the frozen member grew to 5 s</td></tr>
+    <tr><td><code>w: 3, wtimeout: 2000</code> with that member frozen</td><td><code>MongoWriteConcernError: waiting for replication timed out</code> (the write itself stayed on the primary and the unfrozen secondary)</td></tr>
+    <tr><td><code>fsyncUnlock()</code></td><td>Lag 0 s on the next sample, less than a second later</td></tr>
+  </table>
+  </div>
+  <p>Four things to take from it. First, with 3 members <code>majority</code> = 2 of 3, so one slow secondary doesn't slow <code>majority</code> writes; <code>w: 3</code> does. Second, lag is measured in operation time (next section). Third, the secondaries recovered in well under a second once they could apply: they apply in parallel, so a pause costs less time than the primary needed to produce the writes. Fourth, a write timing out on write concern is <em>not</em> a failed write: it succeeded on the primary (lesson 6).</p>
+
+  <h2>4 · What "lag" measures, and the oplog window</h2>
+  <p><strong>Replication lag</strong> is the difference between the primary's newest <code>optime</code> and the secondary's (<code>optimeDate</code> in <code>replSetGetStatus</code>, or <code>rs.printSecondaryReplicationInfo()</code>). It's in <em>operation time</em>, not wall-clock delay. Two consequences:</p>
+  <ul>
+    <li>Right after a long idle gap, the first write makes lag look huge for an instant: I saw "8 s" for a burst whose secondaries were fully caught up 450 ms later, because the secondaries' last entry was 8 s older. An idle primary writes a no-op entry about every 10 s so lag stays meaningful.</li>
+    <li>It doesn't say <em>which step</em> is slow. Compare <code>writtenOpTime</code>, <code>appliedOpTime</code> and <code>durableOpTime</code> on the secondary: written far ahead of applied means the applier is the bottleneck (disk, cache pressure from lessons 3 and 5); written behind the primary's newest means fetching (network, sync source busy).</li>
+  </ul>
+  <p>The <strong>oplog window</strong> is how much history the oplog holds: its size ÷ your write rate in bytes. Using my numbers, that bulk update wrote 12.2 MB; the 1,954 MB oplog would hold about 160 of them. If a secondary stays down longer than the window, the oldest entry on its sync source is newer than the secondary's newest entry: it can't catch up from the oplog and needs a full resync (initial sync). The README describes this as the sync source being "too far ahead" and the secondary waiting for manual intervention.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#sync-source-probing">sync source probing</a> Check yours with <code>rs.printReplicationInfo()</code> ("log length start to end").</p>
+
+  <h2>5 · Lab: watch the entries and make a secondary lag</h2>
+  <div class="lab">
+    <p>About 15 minutes.</p>
+    <ol>
+      <li>A 3-node replica set and 100,000 reviews:
+<pre class="terminal"><code>docker network create lab13
+for i in 1 2 3; do docker run -d --name lab13-m$i --network lab13 -m 1g mongo:8.0 \
+  --replSet rs0 --bind_ip_all --wiredTigerCacheSizeGB 0.25; done
+docker exec lab13-m1 mongosh --quiet --eval 'rs.initiate({_id:"rs0", members:[
+  {_id:0, host:"lab13-m1:27017", priority:2}, {_id:1, host:"lab13-m2:27017"}, {_id:2, host:"lab13-m3:27017"}]})'
+docker cp lessons/code/seed-reviews.js lab13-m1:/seed-reviews.js
+docker exec lab13-m1 mongosh store --quiet --eval 'const N = 100000' --file /seed-reviews.js</code></pre></li>
+      <li>Read the oplog for your own writes. Run one <code>$inc</code>, one <code>$push</code>, one <code>updateMany</code>, then:
+<pre><code>db.getSiblingDB("local").oplog.rs.find({ns: "store.reviews"}).sort({$natural: -1}).limit(5)</code></pre></li>
+      <li>See the fetchers on the primary:
+<pre><code>db.getSiblingDB("admin").aggregate([{$currentOp: {allUsers: true}}, {$match: {ns: "local.oplog.rs"}}])</code></pre></li>
+      <li>Freeze one secondary, write, compare write concerns, then unfreeze:
+<pre class="terminal"><code>docker exec lab13-m3 mongosh --quiet --eval 'db.fsyncLock()'
+# on the primary: insertOne with w:1, "majority", then w:3 with wtimeout:2000
+docker exec lab13-m3 mongosh --quiet --eval 'db.fsyncUnlock()'</code></pre></li>
+      <li>Predict first: with <em>both</em> secondaries frozen, which of <code>w:1</code>, <code>majority</code>, <code>w:3</code> still return? (Lesson 6 measured one of these.)</li>
+    </ol>
+  </div>
+
+  <h2>6 · Read it in the source</h2>
+  <ol>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#steady-state-replication">Replication README: steady state</a> (about 200 lines): doing a write, life as a secondary, sync source selection.</li>
+    <li>From the README's references: <code>oplog_fetcher.cpp</code> (the tailable query), <code>oplog_applier_impl.cpp</code> (parallel application), <code>sync_source_feedback.cpp</code> (<code>UpdatePositionCmd</code>).</li>
+  </ol>
+
+  <h2>7 · So in production you should…</h2>
+  <div class="callout">
+    <p><strong>Rule: treat the oplog window as a capacity number, like disk space. Know its length in hours at your <em>peak</em> write rate, and keep it longer than your longest planned secondary downtime plus the time to fix a problem.</strong></p>
+  </div>
+  <ol>
+    <li><strong>Measure the window:</strong> <code>rs.printReplicationInfo()</code> at peak (a bulk backfill like the <code>updateMany</code> above eats it fast). Resize with <code>replSetResizeOplog</code> if it's short.</li>
+    <li><strong>Use <code>w: "majority"</code> for data you can't lose, not <code>w: N</code> with N = all members.</strong> The lab: one frozen member made <code>w: 3</code> time out and <code>majority</code> unaffected.</li>
+    <li><strong>Alert on lag in two parts:</strong> <code>writtenOpTime − appliedOpTime</code> (applier/disk) and primary newest − <code>writtenOpTime</code> (fetch/network). Don't alert on a single lag number from an idle set.</li>
+    <li><strong>Batch big writes</strong> (a few thousand per batch, then check lag) instead of one huge <code>updateMany</code>: each modified document is one oplog entry and one apply step, and the window shrinks while you run it.</li>
+    <li><strong>Make writes change nothing when nothing changes.</strong> The no-op updates in the lab cost no oplog. Filter on <code>{verified: true}</code> before setting <code>verified: false</code> if you want the match count to equal the work.</li>
+    <li><strong>Reads from secondaries lag by definition.</strong> A review a user just posted may not be there yet; use read your own writes via the primary, or causal consistency (lesson 14).</li>
+  </ol>
+
+  <h3>Diagnosis table</h3>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Symptom</th><th>Cause</th><th>Proof</th></tr>
+    <tr><td>Secondary lag grows during a bulk job, then recovers</td><td>Applier is the limit, or the job's burst outran it</td><td><code>writtenOpTime</code> ahead of <code>appliedOpTime</code> on the secondary</td></tr>
+    <tr><td><code>w: 3</code> times out, <code>majority</code> doesn't</td><td>One member is behind or down</td><td><code>replSetGetStatus</code> optimes; <code>writeConcernError</code> in the reply</td></tr>
+    <tr><td>Secondary won't catch up; log says sync source is "too far ahead"</td><td>Fell off the oplog window</td><td>Oldest entry on the source is newer than the secondary's newest; needs initial sync</td></tr>
+    <tr><td>Lag looks huge for one sample on a quiet system</td><td>Optime gap across an idle period</td><td>Gone next sample; idle no-op writes every ~10 s</td></tr>
+  </table>
+  </div>
+
+  <h2>8 · Check yourself</h2>
+  <div id="quiz"></div>
+
+  <h2>Where this fits</h2>
+  <ol>
+    <li><s>Phases 1–2</s> ✓ · Phase 3: <s>query planning</s> ✓ (lesson 12) · <strong>the oplog and syncing</strong> (today) · elections and the commit point · sharding · recap.</li>
+  </ol>
+
+  <div class="callout source">
+    <p>Read the <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#steady-state-replication">steady state section of the replication README</a>, then the Zhou and Mu paper, <a href="https://www.usenix.org/conference/nsdi21/presentation/zhou">"Fault-Tolerant Replication with Pull-Based Consensus in MongoDB"</a>, for why pulling works with Raft-style guarantees.</p>
+  </div>
+
+  <div class="callout ask">
+    <p>Try it on your own system: run <code>rs.printReplicationInfo()</code> and <code>rs.printSecondaryReplicationInfo()</code> and tell me the oplog size, the log length (start to end) and each secondary's lag. We'll work out your window at peak.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="0012-query-planning.html">← Lesson 12: Query planning</a>
+    <a href="../reference/architecture-map.html">Reference: architecture map</a>
+    <a href="0014-elections-and-rollback.html">Lesson 14: Elections →</a>
+  </nav>
+</main>
+
+<script src="../../assets/quiz.js"></script>
+<script>
+const R = 'https://github.com/mongodb/mongo/blob/r8.0.34/';
+const REPL = R + 'src/mongo/db/repl/README.md';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0013-oplog-and-sync',
+  questions: [
+    { layer: 'review',
+      q: '<em>From lesson 12:</em> a query shape\'s cache entry is <code>isActive: false</code> after its first run. What does that mean?',
+      options: ['The plan is stale and will be replanned', 'The entry exists but isn\'t used until a second trial matches it', 'The index was dropped', 'The query ran on SBE'], answer: 1,
+      explain: `New entries start inactive so a high works value can't get stuck in the cache.${c('https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/query/README.md#inactive-cache-entries', 'inactive entries')}` },
+
+    { layer: 'oplog',
+      q: 'You run <code>updateOne({_id}, {$inc: {rating: 1}})</code> on a review with rating 3. What does the oplog entry contain?',
+      options: ['The operator <code>$inc: 1</code>', 'The new value, rating 4, as a diff', 'The whole old and new documents', 'Nothing; $inc isn\'t replicated'], answer: 1,
+      explain: `Entries are rewritten to be idempotent. The lab showed <code>o: {$v: 2, diff: {u: {rating: 4}}}</code>. Replaying it twice gives the same state.${c(REPL + '#doing-a-write', 'repl README')}` },
+
+    { layer: 'oplog',
+      q: '<code>updateMany({}, {$set: {verified: false}})</code> matches 100,000 reviews, but 30,000 already have <code>verified: false</code>. How many oplog entries does it write?',
+      options: ['100,000', '70,000', '1', '30,000'], answer: 1,
+      explain: `One entry per <em>modified</em> document. Documents already holding the value are no-ops and write nothing. In the lab: 100,000 matched, 70,090 modified, 70,090 oplog entries (12.2 MB).${c(REPL + '#doing-a-write', 'repl README')}` },
+
+    { layer: 'sync',
+      q: 'How does a secondary get new writes?',
+      options: ['The primary pushes each entry to every secondary', 'The secondary runs a tailable getMore on its sync source\'s oplog', 'Each secondary re-executes the original client command', 'A shared disk is mounted by all members'], answer: 1,
+      explain: `"Secondaries drive oplog replication via a pull process." The <code>OplogFetcher</code> holds a long-waiting getMore. On the primary it appears in <code>$currentOp</code> as <code>appName: "OplogFetcher"</code>.${c(REPL + '#oplog-fetching', 'oplog fetching')}` },
+
+    { layer: 'sync',
+      q: 'On a secondary, <code>writtenOpTime</code> is far ahead of <code>appliedOpTime</code>. Which step is the bottleneck?',
+      options: ['Fetching from the sync source', 'The network link to the primary', 'Applying entries to collections and indexes', 'Election timeout'], answer: 2,
+      explain: `Entries are already fetched and written to the secondary's oplog (journal-flushed), but not yet applied. Look at disk, cache pressure and long operations on the secondary.${c(REPL + '#oplog-entry-application', 'oplog application')}` },
+
+    { layer: 'sync',
+      q: 'Why can a secondary apply entries in parallel without breaking order?',
+      options: ['Entries in a batch are independent by definition', 'Operations on the same document go to the same thread, in order', 'The primary guarantees no two writes overlap', 'Parallel apply is only for inserts into different collections'], answer: 1,
+      explain: `"Operations on a document must be atomic and ordered, and are hence put on the same thread." Different documents, even in one collection, run in parallel. Commands like <code>dropDatabase</code> get a batch of one.${c(REPL + '#oplog-entry-application', 'oplog application')}` },
+
+    { layer: 'concern',
+      q: 'One of three members is frozen. Which write concern times out?',
+      options: ['<code>w: 1</code>', '<code>w: "majority"</code>', '<code>w: 3</code>', 'All three'], answer: 2,
+      explain: `Majority of 3 is 2: the primary plus the unfrozen secondary. <code>w: 3</code> needs all members. In the lab <code>w: 3</code> failed with "waiting for replication timed out" while the write stayed on two nodes.${c('https://www.mongodb.com/docs/manual/reference/write-concern/', 'write concern')}` },
+
+    { layer: 'window',
+      q: 'Your oplog holds 10 hours at normal writes. A backfill job doubles your write rate for a day. A secondary is down for 8 hours during it. What happens?',
+      options: ['It catches up, as 8 < 10', 'It may have fallen off the oplog, as the window is now about 5 hours', 'Nothing; secondaries can fetch from disk', 'It elects itself primary'], answer: 1,
+      explain: `The window is size ÷ write rate, so doubling the rate halves it. If the sync source's oldest entry is newer than the secondary's newest, the secondary needs a full initial sync.${c(REPL + '#sync-source-probing', 'sync source probing')}` }
+  ]
+});
+</script>
+</body>
+</html>

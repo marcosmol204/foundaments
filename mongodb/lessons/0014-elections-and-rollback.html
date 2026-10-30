@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 14 · Elections, the Commit Point and Rollback</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<link rel="stylesheet" href="../../assets/quiz.css">
+<style>
+  /* Lesson-local: scrolling tables, timeline */
+  .table-scroll { overflow-x: auto; }
+  svg .gone { fill: var(--warn-bg); stroke: var(--warn); stroke-width: 1.2; }
+</style>
+</head>
+<body>
+<main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>
+  <div class="kicker">MongoDB Internals · Lesson 0014 · Phase 3: Layers over the engine</div>
+  <h1>Elections, the commit point and rollback</h1>
+  <p class="subtitle">What happens when the primary disappears: who becomes primary and when, which writes survive, and why a review you saw acknowledged can still vanish.</p>
+
+  <p><strong>Your win today:</strong> you cut a primary off from its replica set, predict how long writes fail, which of its writes are lost, and where the lost documents end up. Then you pick write and read concerns for <code>store.reviews</code> to match what you can afford to lose.</p>
+
+  <h2>0 · Warm-up from lessons 7 and 13</h2>
+  <ol>
+    <li>Lesson 7: the driver's pool is cleared after <code>kill -9</code> of the primary, and the first write after it took about 10.8 s. What was it waiting for?</li>
+    <li>Lesson 13: with one of three members frozen, which write concerns still return?</li>
+  </ol>
+  <p>Answers: (1) a new primary. Today we see the 10 s inside that number. (2) <code>w: 1</code> and <code>w: "majority"</code>; <code>w: 3</code> times out.</p>
+
+  <h2>1 · Step by step: the primary is cut off</h2>
+  <p>3-node set, <code>m1</code> primary (priority 2), <code>m2</code> and <code>m3</code> secondaries, all in term 3. I isolate <code>m1</code> from the network (<code>docker network disconnect</code>) and keep writing to it through <code>docker exec</code>. Timeline from the lab:</p>
+  <figure>
+    <svg viewBox="0 0 700 270" role="img" aria-label="Timeline in seconds after the partition. At 0, m1 is cut off and keeps accepting writes. A w:1 insert is acknowledged after 7 ms. A majority insert waits and times out. At about 10 s, m1 sees no majority and steps down; m2 and m3 hit their election timeout. At 13 s, m2 wins the election in term 4 and takes writes. Majority writes on m2 succeed. At the heal, m1 reconnects, finds its oplog diverged, rolls back two inserts to a file, and rejoins as a secondary.">
+      <defs><marker id="ah14" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+      <text class="lbl" x="10" y="26">m1 (old primary)</text>
+      <rect class="box" x="130" y="10" width="135" height="26" rx="4"/><text class="lbl-sm" x="138" y="27">primary, takes writes</text>
+      <rect class="gone" x="265" y="10" width="120" height="26" rx="4"/><text class="lbl-sm" x="273" y="27">0 s: cut off</text>
+      <rect class="box" x="385" y="10" width="110" height="26" rx="4"/><text class="lbl-sm" x="393" y="27">~10 s: steps down</text>
+      <rect class="box-accent" x="560" y="10" width="130" height="26" rx="4"/><text class="lbl-sm" x="568" y="27">heal: rollback</text>
+      <text class="lbl" x="10" y="86">m2 / m3</text>
+      <rect class="box" x="130" y="70" width="255" height="26" rx="4"/><text class="lbl-sm" x="138" y="87">secondaries; no heartbeat from m1 for 10 s</text>
+      <rect class="box-accent" x="385" y="70" width="305" height="26" rx="4"/><text class="lbl-sm" x="393" y="87">13 s: m2 wins term 4 → primary, takes writes</text>
+      <text class="lbl" x="10" y="150">writes</text>
+      <text class="lbl-sm" x="130" y="150">m1, w:1 → acknowledged in 7 ms (local only)</text>
+      <text class="lbl-sm" x="130" y="170">m1, w:"majority" → waits, wtimeout error (still applied locally)</text>
+      <text class="lbl-sm" x="130" y="190">m1, readConcern local sees both; majority sees neither</text>
+      <text class="lbl-sm" x="130" y="210">m2, w:"majority" → ok once elected</text>
+      <text class="lbl-sm" x="130" y="240">after the heal: m1's two documents are gone from the collection and sit in rollback/…/removed.*.bson</text>
+    </svg>
+    <figcaption>One partition, measured. The write concern decides whether you hear "ok" for a write that is then lost.</figcaption>
+  </figure>
+  <ol>
+    <li><strong>0 s.</strong> <code>m1</code> is isolated. It's still primary and still accepts writes. An insert with <code>w: 1</code> was acknowledged after 7 ms: that write exists only on <code>m1</code>.</li>
+    <li>An insert with <code>w: "majority"</code> was applied on <code>m1</code> too, but it waits for acknowledgements that can't come, and failed with <code>MongoWriteConcernError: waiting for replication timed out</code> at my 2 s <code>wtimeout</code>. Without a <code>wtimeout</code> (and with the <em>implicit</em> default of majority from lesson 6), a plain <code>insertOne</code> waited until <code>m1</code> stepped down and then failed with <code>not primary</code>. The document existed on <code>m1</code> in both cases.</li>
+    <li><strong>≈10 s.</strong> Heartbeats go out every 2 s (<code>heartbeatIntervalMillis</code>). After <code>electionTimeoutMillis</code> = 10 s without a majority of replies, <code>m1</code> steps down on its own. <code>m2</code> and <code>m3</code> have meanwhile seen no primary for 10 s.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#step-up">repl README: step up</a></li>
+    <li><strong>13 s.</strong> A secondary runs a <em>dry-run</em> election first (would I win?), then a real one in a new <strong>term</strong> (4), asking the others for a vote. A member votes yes once per term, and only for a candidate whose oplog is at least as up to date as its own. <code>m2</code> got <code>m3</code>'s vote and 2 of 3 is a majority. It becomes primary, then does a <strong>catch-up</strong> phase (it won't take writes until it has applied all it knows others have), and writes a "new term" entry to the oplog.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#candidate-perspective">candidate perspective</a></li>
+    <li><strong>Heal.</strong> <code>m1</code> reconnects, still holding its two inserts at term 3. Its sync source's oplog doesn't contain them: the log says <code>OplogStartMissing: the sync source's oplog and our oplog have diverged, going into rollback</code>. It finds the <em>common point</em> (the last entry both share), uses <code>recoverToStableTimestamp</code> to go back to it, and writes the removed documents to a file before truncating its oplog.</li>
+  </ol>
+  <p>The rollback log line: <code>"Operations reverted by rollback": {"insert": 2, "update": 0, "delete": 0}</code>. The file <code>/data/db/rollback/&lt;collection uuid&gt;/removed.2026-10-30T07-56-11.0.bson</code> held exactly those two documents. <code>bsondump</code> prints them: <code>lost-C</code> (the <code>w:1</code> insert) and <code>lost-D</code> (the majority attempt that errored). They are not re-applied by MongoDB. Recovering them is a manual job.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#rollback-recover-to-a-timestamp-rtt">rollback (RTT)</a></p>
+
+  <h2>2 · The commit point: what "safe" means</h2>
+  <p>The <strong>majority commit point</strong> is an optime such that every entry up to it has been replicated to a majority of members. A primary computes it from the positions the secondaries report (lesson 13, step ④); secondaries learn it from heartbeats and from the metadata on every oplog fetch.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#commit-point-propagation">commit point propagation</a></p>
+  <p>The key rule: <strong>a majority-committed write is on at least one member of every possible majority, so any member that can win an election has it.</strong> A candidate must have an oplog at least as new as its voters', and any two majorities overlap. So rollback can only ever remove writes that were <em>not</em> majority-committed. In the lab, nothing before the partition was lost (<code>before3</code>, written with <code>w: "majority"</code>, was still there).</p>
+  <p>This is also what read concern means:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Read concern</th><th>Reads…</th><th>On the isolated old primary (lab)</th><th>Can see data that is later rolled back?</th></tr>
+    <tr><td><code>local</code> (default on primary)</td><td>The node's latest data</td><td>Found the <code>w:1</code> review (1 doc)</td><td>Yes</td></tr>
+    <tr><td><code>majority</code></td><td>Data at or before the commit point</td><td>0 docs</td><td>No</td></tr>
+  </table>
+  </div>
+  <p>In the lab, <code>isWritablePrimary</code> was still <code>true</code> on the old primary while this read ran, so <code>local</code> returned a review the rest of the set would soon deny existed. (<code>linearizable</code> also contacts a majority; it was not measured here.)</p>
+
+  <h2>3 · Other ways to run for election</h2>
+  <ul>
+    <li><strong>Priority takeover.</strong> Priority-2 <code>m1</code> was re-elected after it healed (the term went 4 → 5): a higher-priority member calls an election when it sees a lower-priority primary.</li>
+    <li><strong>Planned stepdown</strong> (<code>rs.stepDown()</code>): with election handoff, the old primary asks an up-to-date secondary to run immediately, skipping the 10 s wait. In lesson 7, <code>stepDown</code> gave a new primary in 30–36 ms.</li>
+    <li><strong>Catch-up takeover</strong> if a new primary's catch-up takes more than <code>catchUpTakeoverDelayMillis</code> (30 s).</li>
+  </ul>
+  <p>A crash or a partition has no handoff, so you pay the election timeout: <strong>≈ 10 s plus the election</strong> (13 s here; 8.3–10.8 s in lessons 7 and 11). During that time there's no primary and writes fail with "not primary" / <code>NotWritablePrimary</code> or wait for server selection (lesson 7). Retryable writes (on by default) retry once.</p>
+
+  <h2>4 · Lab: partition a primary</h2>
+  <div class="lab">
+    <p>About 10 minutes, on the 3-node set from <a href="0013-oplog-and-sync.html">lesson 13</a>. The script <code>lessons/code/0014-failover-lab.sh</code> runs the same steps.</p>
+    <ol>
+      <li>Write a majority document, then cut off the primary:
+<pre class="terminal"><code>docker network disconnect lab13 lab13-m1</code></pre></li>
+      <li>On <code>lab13-m1</code> (via <code>docker exec</code>), insert with <code>{writeConcern: {w: 1}}</code>. Then run the same insert with <code>{w: "majority", wtimeout: 2000}</code>. Both documents exist locally.</li>
+      <li>Watch <code>m2</code> and <code>m3</code> until one reports <code>isWritablePrimary: true</code>. Write a document there with <code>w: "majority"</code>.</li>
+      <li>Heal with <code>docker network connect lab13 lab13-m1</code>. Check the log for <code>Rollback common point</code> and <code>Operations reverted by rollback</code>, then:
+<pre class="terminal"><code>docker exec lab13-m1 sh -c 'bsondump /data/db/rollback/*/removed.*.bson'</code></pre></li>
+      <li>Predict first: repeat step 2 but with <code>readConcern: "majority"</code> reads on the old primary. How many documents does it find?</li>
+    </ol>
+  </div>
+
+  <h2>5 · Read it in the source</h2>
+  <ol>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#elections">Replication README: Elections</a> (step up, candidate and voter perspective, transitioning to primary).</li>
+    <li>The same README's "Commit Point Propagation" and "Rollback: Recover to a Timestamp".</li>
+    <li>For why this is safe: the paper <a href="https://www.usenix.org/conference/nsdi21/presentation/zhou">Fault-Tolerant Replication with Pull-Based Consensus in MongoDB</a> and <a href="https://doi.org/10.14778/3352063.3352125">Tunable Consistency in MongoDB</a>.</li>
+  </ol>
+
+  <h2>6 · So in production you should…</h2>
+  <div class="callout">
+    <p><strong>Rule: decide per write whether you can afford to lose it in a failover. If not, use <code>w: "majority"</code> and retryable writes, and treat anything acknowledged with less as "probably saved".</strong></p>
+  </div>
+  <ol>
+    <li><strong>Keep the default <code>w: "majority"</code></strong> (the implicit default since 5.0 on most deployments) for reviews you must keep. Only drop to <code>w: 1</code> for data you can regenerate, and know the failover window loses it.</li>
+    <li><strong>Set a <code>wtimeout</code> (or <code>timeoutMS</code>) and handle the error as "unknown outcome"</strong>, not "failed". In the lab, the timed-out majority insert existed on the old primary and was rolled back later; on a healthy set it may well succeed. Make writes idempotent (a unique key such as the review's <code>_id</code>) so retrying is safe.</li>
+    <li><strong>Use an odd number of voting members in separate failure domains.</strong> With three, losing one still elects; a 2-member set can't elect after losing one. To survive losing a whole site you need voting members in three places (for example 2 + 2 + 1), so that any one site's loss still leaves a majority.</li>
+    <li><strong>For reads that must not go backwards, use <code>readConcern: "majority"</code></strong>, or causally consistent sessions to read your own writes. <code>local</code> is faster but can show data that is rolled back.</li>
+    <li><strong>Plan for ≈ 10–15 s with no primary on a crash or partition.</strong> Make clients tolerate it (retryable writes, <code>serverSelectionTimeoutMS</code> above 15 s) and use <code>rs.stepDown()</code> for maintenance: it's a few tens of milliseconds.</li>
+    <li><strong>Alert on rollbacks.</strong> A <code>rollback/</code> directory appearing under <code>dbPath</code> (or <code>"Operations reverted by rollback"</code> in the log) means acknowledged writes were lost. Check the <code>removed.*.bson</code> files and re-apply what matters.</li>
+  </ol>
+
+  <h3>Diagnosis table</h3>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Symptom</th><th>Cause</th><th>Proof</th></tr>
+    <tr><td>~10–15 s of "not primary" errors</td><td>Election after crash or partition</td><td>Log: <code>Election succeeded</code>, new term in <code>rs.status().term</code></td></tr>
+    <tr><td>Acknowledged write missing later</td><td>It was <code>w:1</code> on a primary that lost leadership: rolled back</td><td><code>rollback/</code> folder, <code>Operations reverted by rollback</code></td></tr>
+    <tr><td>Write returns <code>writeConcernError</code> but the data is there</td><td>Applied locally, not yet majority-acknowledged</td><td>Document present on primary; commit point behind</td></tr>
+    <tr><td>Primary flips back to a specific node after recovery</td><td>Priority takeover</td><td>Term increases by 1 after the heal</td></tr>
+  </table>
+  </div>
+
+  <h2>7 · Check yourself</h2>
+  <div id="quiz"></div>
+
+  <h2>Where this fits</h2>
+  <ol>
+    <li><s>Phases 1–2</s> ✓ · Phase 3: <s>query planning</s> ✓ · <s>oplog and syncing</s> ✓ · <strong>elections, commit point, rollback</strong> (today) · sharding · recap.</li>
+  </ol>
+
+  <div class="callout source">
+    <p>Read the <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#elections">Elections section of the replication README</a>, then the NSDI '21 paper, <a href="https://www.usenix.org/conference/nsdi21/presentation/zhou">"Fault-Tolerant Replication with Pull-Based Consensus in MongoDB"</a>, and the Jepsen analysis of <a href="https://jepsen.io/analyses/mongodb-4.2.6">MongoDB 4.2.6</a> for what the defaults do <em>not</em> guarantee.</p>
+  </div>
+
+  <div class="callout ask">
+    <p>Try it on your own system: which write concern does your review-creating code use today (check the connection string and each call)? Tell me, and what a user sees if the primary dies in the middle of a request.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="0013-oplog-and-sync.html">← Lesson 13: The oplog</a>
+    <a href="../reference/architecture-map.html">Reference: architecture map</a>
+    <a href="0015-sharding.html">Lesson 15: Sharding →</a>
+  </nav>
+</main>
+
+<script src="../../assets/quiz.js"></script>
+<script>
+const R = 'https://github.com/mongodb/mongo/blob/r8.0.34/';
+const REPL = R + 'src/mongo/db/repl/README.md';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0014-elections-and-rollback',
+  questions: [
+    { layer: 'review',
+      q: '<em>From lesson 13:</em> a bulk <code>updateMany</code> matches 100,000 reviews but modifies 70,090. How many oplog entries does it write?',
+      options: ['100,000', '70,090', '1', '30,000'], answer: 1,
+      explain: `One idempotent entry per modified document. No-op updates write nothing.${c(REPL + '#doing-a-write', 'repl README')}` },
+
+    { layer: 'election',
+      q: 'The primary of a 3-member set is killed (no clean shutdown). Roughly how long until a new primary accepts writes, with default settings?',
+      options: ['A few milliseconds', 'About 10 seconds plus the election', 'About 60 seconds', 'Until an admin intervenes'], answer: 1,
+      explain: `Secondaries wait <code>electionTimeoutMillis</code> (10 s) without a primary, then run (13 s in the lab). A planned <code>stepDown</code> uses election handoff and took tens of milliseconds in lesson 7.${c(REPL + '#step-up', 'step up')}` },
+
+    { layer: 'election',
+      q: 'The old primary is isolated from both secondaries. What does it do after about 10 seconds?',
+      options: ['Keeps accepting writes forever', 'Steps down because it can\'t see a majority', 'Promotes the oldest secondary', 'Shuts down'], answer: 1,
+      explain: `It stepped down on its own (the log showed PRIMARY → SECONDARY about 10 s after the partition) and reads/writes then fail with "not primary". Before that it kept accepting writes.${c(REPL + '#step-down', 'step down')}` },
+
+    { layer: 'concern',
+      q: 'On the isolated old primary you insert with <code>w: 1</code>. After the set heals, what happens to that document?',
+      options: ['It is merged into the new primary', 'It is rolled back and written to a rollback file', 'It stays on all members', 'It is re-inserted automatically'], answer: 1,
+      explain: `It was never on a majority, so the new primary's history doesn't contain it. The old primary rolled it back (log: <code>Operations reverted by rollback</code>, insert: 2 in the lab) and saved it to <code>rollback/…/removed.*.bson</code>.${c(REPL + '#rollback-recover-to-a-timestamp-rtt', 'rollback')}` },
+
+    { layer: 'concern',
+      q: 'Why can a write acknowledged with <code>w: "majority"</code> never be rolled back?',
+      options: ['Majority writes are written to disk twice', 'Any member that can win an election has it, because any two majorities overlap', 'Rollback only applies to updates', 'The old primary refuses to rejoin'], answer: 1,
+      explain: `Voters only vote for a candidate whose oplog is at least as new as theirs. A majority-committed entry is on at least one voter of any majority, so that candidate can't win without it.${c('https://doi.org/10.14778/3352063.3352125', 'Tunable Consistency')}` },
+
+    { layer: 'concern',
+      q: 'A <code>w: "majority", wtimeout: 2000</code> insert returns a write concern error. What is the truth about the document?',
+      options: ['It was not written anywhere', 'It was applied on the primary; whether it survives is not yet known', 'It was written to a majority but the reply was lost', 'It was written to all members'], answer: 1,
+      explain: `The error only says the wait timed out. In the lab the document existed on the old primary and was rolled back later; on a healthy set it would normally replicate. Treat as unknown outcome and make the write idempotent.${c('https://www.mongodb.com/docs/manual/reference/write-concern/', 'write concern')}` },
+
+    { layer: 'concern',
+      q: 'On the isolated old primary, which read finds a review that was written there with <code>w: 1</code>?',
+      options: ['<code>readConcern: "majority"</code>', '<code>readConcern: "local"</code>', 'Both', 'Neither'], answer: 1,
+      explain: `<code>local</code> returned 1 document, <code>majority</code> returned 0: the write was never majority-committed. This is how a read can show data that is later rolled back.${c(REPL + '#commit-point-propagation', 'commit point')}` },
+
+    { layer: 'election',
+      q: 'After the heal, the term went from 4 to 5 and <code>m1</code> (priority 2) became primary again. Which mechanism?',
+      options: ['Catch-up takeover', 'Election handoff', 'Priority takeover', 'Manual replSetStepUp'], answer: 2,
+      explain: `A member with higher priority than the current primary calls an election once it's caught up. Lower-priority primaries lose their role to it.${c(REPL + '#step-up', 'step up')}` }
+  ]
+});
+</script>
+</body>
+</html>

@@ -52,7 +52,7 @@
 
 ## Gaps
 - ~~ingress thread model~~: closed in lesson 0009 from the r8.0.34 source (dedicated thread per connection; `docs/thread_pools.md` covers internal pools only).
-- Need a trusted source on the **query engine (SBE vs classic)** and plan cache.
+- ~~query engine / plan cache~~: closed in lesson 0012 from `src/mongo/db/query/README.md` (r8.0.34) plus `multi_plan.cpp`, `cached_plan.cpp`, `trial_period_utils.cpp`. Still missing: a trusted source on how `trySbeRestricted` decides which shapes use SBE.
 - ~~WiredTiger in-memory page structure~~: covered in lesson 2.1 via btmem.h. Still missing: authoritative source on hazard-pointer mechanics (only glossary + Jira so far).
 
 ### B-trees (added 2026-10-25)
@@ -123,3 +123,11 @@
   `commandStarted`/`Succeeded`/`Failed` events; duration runs from send to reply and may include BSON encoding and decoding. Use for: the driver-side "command duration" in a latency split.
 - [Source: `CurOp::_sumBlockedTimeTotal` + `workingMillis` (`curop.cpp`, r8.0.34)](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/curop.cpp#L568)
   `workingMillis` = `durationMillis` − lock waits − execution-ticket queueing − flow control. Use for: separating waiting from working in hop 4 (lesson 11).
+
+### Query engine (added 2026-10-30)
+- [Source: Query System Internals README (`src/mongo/db/query/README.md`)](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/query/README.md)
+  Phases from parsing to execution; classic vs SBE plan caches; works, inactive entries, replanning. Use for: lesson 12 and any plan-cache question.
+- Source (r8.0.34): [`exec/multi_plan.cpp`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/exec/multi_plan.cpp#L241), [`exec/cached_plan.cpp`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/exec/cached_plan.cpp#L104), [`exec/trial_period_utils.cpp`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/exec/trial_period_utils.cpp). Use for: trial limits (10,000 works or 30% of the collection, 101 results) and the replan limit (10× works).
+- Replication steady state (lesson 13): [`repl/README.md` r8.0.34, steady state](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#steady-state-replication) (OplogFetcher, OplogWriter, OplogApplier, sync source selection); [Docs: oplog size](https://www.mongodb.com/docs/manual/core/replica-set-oplog/). Use for: lag and oplog window questions.
+- Elections and rollback (lesson 14): [`repl/README.md` r8.0.34: Elections, Commit Point Propagation, Rollback: Recover to a Timestamp](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#elections). Use for: failover timing and what rollback keeps.
+- Sharding (lesson 15): [`db/s/README.md` r8.0.34](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README.md) and its siblings [`README_balancer.md`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README_balancer.md), [`README_migrations.md`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README_migrations.md), [`README_range_deleter.md`](https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README_range_deleter.md). Use for: routing, balancing by data size, migration critical section, orphans. Still missing: a primary source on mongos routing for queries (targeting logic) and shard-key design guidance beyond the manual.

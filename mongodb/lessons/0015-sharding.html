@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 15 · Sharding: Routing, Shard Keys and the Balancer</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<link rel="stylesheet" href="../../assets/quiz.css">
+<style>
+  /* Lesson-local: scrolling tables */
+  .table-scroll { overflow-x: auto; }
+</style>
+</head>
+<body>
+<main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>
+  <div class="kicker">MongoDB Internals · Lesson 0015 · Phase 3: Layers over the engine</div>
+  <h1>Sharding: routing, shard keys and the balancer</h1>
+  <p class="subtitle">How <code>mongos</code> decides which shard gets a review, why the shard key decides almost everything, and what the balancer does (and doesn't) to even things out.</p>
+
+  <p><strong>Your win today:</strong> given a shard key for <code>store.reviews</code>, you can predict which queries hit one shard and which hit all, whether new reviews spread or pile onto one shard, and read the balancer's state from <code>config.chunks</code>.</p>
+
+  <h2>0 · Warm-up from lessons 12 and 14</h2>
+  <ol>
+    <li>Lesson 12: what is the "shape" of a query for the plan cache?</li>
+    <li>Lesson 14: a <code>w: 1</code> write on a primary that then loses leadership. Where does it end up?</li>
+  </ol>
+  <p>Answers: (1) the filter, sort and projection with the constants removed. (2) Rolled back to a <code>removed.*.bson</code> file. Each shard is a replica set, so both apply inside every shard of today's cluster.</p>
+
+  <h2>1 · The pieces</h2>
+  <figure>
+    <svg viewBox="0 0 700 250" role="img" aria-label="A sharded cluster. The application connects to mongos, the router. mongos reads routing information from the config server replica set, which holds config.databases, config.collections and config.chunks, and caches it. mongos sends each command to one or more shards. Each shard is its own replica set holding some chunks of the collection. The balancer runs on the config server primary and orders chunk migrations between shards.">
+      <defs><marker id="ah15" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+      <rect class="box" x="10" y="95" width="100" height="50" rx="5"/><text class="lbl" x="22" y="118">App / driver</text><text class="lbl-sm" x="22" y="134">sees one DB</text>
+      <rect class="box-accent" x="160" y="95" width="120" height="50" rx="5"/><text class="lbl" x="172" y="118">mongos</text><text class="lbl-sm" x="172" y="134">router + cache</text>
+      <rect class="box" x="330" y="10" width="170" height="64" rx="5"/><text class="lbl" x="342" y="32">Config servers (CSRS)</text><text class="lbl-sm" x="342" y="50">config.collections, .chunks</text><text class="lbl-sm" x="342" y="64">+ the balancer (primary)</text>
+      <rect class="box" x="330" y="110" width="170" height="50" rx="5"/><text class="lbl" x="342" y="132">Shard s1rs</text><text class="lbl-sm" x="342" y="148">replica set, some chunks</text>
+      <rect class="box" x="330" y="180" width="170" height="50" rx="5"/><text class="lbl" x="342" y="202">Shard s2rs</text><text class="lbl-sm" x="342" y="218">replica set, other chunks</text>
+      <path class="edge" d="M110 120 H160" marker-end="url(#ah15)"/>
+      <path class="edge" d="M280 105 L330 55" marker-end="url(#ah15)"/>
+      <path class="edge" d="M280 125 L330 135" marker-end="url(#ah15)"/>
+      <path class="edge" d="M280 135 L330 200" marker-end="url(#ah15)"/>
+      <path class="edge" d="M415 74 V110" marker-end="url(#ah15)"/>
+      <text class="lbl-sm" x="520" y="40">routing table: which</text><text class="lbl-sm" x="520" y="56">key range lives where</text>
+      <text class="lbl-sm" x="520" y="140">migrations move a range</text><text class="lbl-sm" x="520" y="156">from one shard to another</text>
+    </svg>
+    <figcaption>The lab cluster: 1 config server, 2 shards (one node each), 1 <code>mongos</code>. Real ones use 3-node sets for the config servers and each shard.</figcaption>
+  </figure>
+  <ul>
+    <li>A <strong>shard key</strong> is a field (or fields) of every document. The collection is cut into contiguous <strong>chunks</strong> of the key's value range, each owned by exactly one shard. The map is <code>config.chunks</code>.</li>
+    <li><strong><code>mongos</code></strong> is stateless apart from a cache of that map. It parses a command, finds the owning shards from the key in the filter, forwards it, and merges results. It has no data and no oplog.</li>
+    <li>The <strong>router and shard roles</strong> are in the server source's sharding guide (<code>src/mongo/db/s/README.md</code>), which also lists the balancer, migrations and the range deleter as the main parts.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README.md">sharding README</a></li>
+  </ul>
+
+  <h2>2 · Routing: one shard or all of them</h2>
+  <p>I loaded 200,000 reviews and sharded them on <code>{_id: "hashed"}</code> across 2 shards. Then I ran <code>explain("executionStats")</code> through <code>mongos</code>:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Query</th><th>Stage</th><th>Shards asked</th><th>Docs examined</th></tr>
+    <tr><td><code>find({_id: id})</code></td><td><code>SINGLE_SHARD</code></td><td>1 (s2rs)</td><td>1</td></tr>
+    <tr><td><code>find({_id: {$gte: X}})</code> (a range of 10,000)</td><td><code>SHARD_MERGE</code></td><td>both</td><td>10,000</td></tr>
+    <tr><td><code>find({rating: 5, verified: true})</code></td><td><code>SHARD_MERGE</code></td><td>both</td><td>295,880 (COLLSCAN on each)</td></tr>
+    <tr><td><code>find({tags: "battery"}).limit(10)</code></td><td><code>SHARD_MERGE</code></td><td>both</td><td>111 total (stops early)</td></tr>
+  </table>
+  </div>
+  <ol>
+    <li><strong>Equality on the shard key → one shard.</strong> <code>mongos</code> hashes the <code>_id</code>, finds the chunk, asks one shard. This scales: more shards, same cost.</li>
+    <li><strong>A range on a <em>hashed</em> key → every shard.</strong> Hashing scatters neighbouring values; a range of consecutive <code>_id</code>s (which means "reviews in a time window") lives everywhere. With a <em>ranged</em> key the same filter would hit the one or two shards owning that range.</li>
+    <li><strong>No shard key in the filter → scatter-gather.</strong> Every shard works, <code>mongos</code> merges (and sorts, if asked). The cost is the sum, and the slowest shard sets the latency. The lab query read 295,880 documents with no index on <code>rating</code>.</li>
+  </ol>
+  <p>That last number is larger than the 200,000 reviews. <strong>Shard <code>s1rs</code> had 200,000 documents on disk</strong> while owning only half: after a migration, the donor keeps the moved documents (<em>orphans</em>) until the range deleter removes them, by default after a delay. Queries filter orphans out, but they still pay to read them: a <code>COLLSCAN</code> read 200,000 on <code>s1rs</code> plus 95,880 on <code>s2rs</code>. Counts through <code>mongos</code> are correct (200,000); <code>$collStats</code> per shard are not.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README_migrations.md">migrations README</a></p>
+  <p>How does <code>mongos</code> know its cached map is right? Every request carries the version of the routing info it used; a shard that owns a different version answers with a stale-config error and <code>mongos</code> refreshes from the config servers and retries. I didn't trigger that here; it's described in the README on versioning protocols.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README.md">sharding README</a></p>
+
+  <h2>3 · The shard key decides where writes go</h2>
+  <p>Each experiment: an empty sharded <code>store.reviews</code>, then 60,000 new reviews inserted in order (their <code>_id</code>s grow with time, like real ones). I counted inserts handled by each shard (<code>opcounters.insert</code>):</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Shard key</th><th>s1rs inserts</th><th>s2rs inserts</th><th>Why</th></tr>
+    <tr><td><code>{_id: "hashed"}</code></td><td>30,038</td><td>29,962</td><td>The hash spreads consecutive ids evenly.</td></tr>
+    <tr><td><code>{_id: 1}</code> (ranged)</td><td><strong>60,000</strong></td><td><strong>0</strong></td><td>Every new <code>_id</code> is above all existing ones, so every insert goes into the last chunk, on one shard.</td></tr>
+  </table>
+  </div>
+  <p>That is the <strong>hot shard</strong> problem for monotonically increasing keys (ObjectIds, timestamps). The balancer can move old chunks away afterwards, but the chunk taking new writes is always the top one; it can only be split, and the new top chunk lands on the same shard.</p>
+  <p>A third key shows the opposite failure. With <code>{rating: 1}</code> (five values) and a range size of 1 MB (I shrank it, to see in seconds what 128 MB shows at scale), all 120,000 reviews stayed on one shard:</p>
+<pre class="output"><code>chunk {rating: MinKey} -> {rating: 3}   s1rs JUMBO
+chunk {rating: 3}      -> {rating: 4}   s1rs JUMBO
+chunk {rating: 4}      -> {rating: 5}   s1rs JUMBO
+chunk {rating: 5}      -> {rating: MaxKey} s1rs JUMBO
+rating 2: 12,000 · 3: 12,000 · 4: 36,000 · 5: 60,000</code></pre>
+  <p>A chunk can be split only <em>between</em> key values. With five values there are at most five chunks, and the one holding 5★ (60,000 reviews) can never be split further. Chunks above the range size that can't be split are flagged <code>jumbo</code> and are not moved. <strong>A shard key needs high cardinality</strong> (many distinct values) and a good spread of both data and writes.</p>
+  <p>Which of the course's fields could work? <code>_id: "hashed"</code> spreads writes and data and gives targeted <code>_id</code> lookups. <code>{verified: 1, rating: 1}</code> has only 10 combinations: too few. A compound key such as <code>{rating: 1, _id: 1}</code> adds cardinality, but still sends all new 5★ reviews to one end of one range. The shard key you want is the field most queries filter on that also has many values; for a review store that usually points at a <em>product id</em>, which this collection lacks (I'm only noting it: the schema stays as it is).</p>
+
+  <h2>4 · The balancer, step by step</h2>
+  <p>The balancer is a background thread on the config server's primary. In rounds with a pause between them, it first splits oversized ranges, then moves ranges from the shard with the most data to the one with the least.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README_balancer.md">balancer README</a> I sharded the 200,000 loaded reviews on <code>{_id: "hashed"}</code>, so everything began on <code>s1rs</code> (31 MB, one chunk), and shrank the range size to 1 MB to make it act:</p>
+  <ol>
+    <li><strong>≈5 s:</strong> still 1 chunk on <code>s1rs</code>. The balancer's first round is a delay away.</li>
+    <li><strong>10–25 s:</strong> the range was split into 16 chunks and 15 of them moved to <code>s2rs</code>, one migration at a time: 5, 9, 13, 15 chunks on <code>s2rs</code>. Each migration went through the 6 steps in <code>config.changelog</code> (<code>moveChunk.start</code> → <code>commit</code>). The slow step is step 4 (about 106 ms of the ~165 ms in the one I read), where the data is cloned and the recipient catches up.</li>
+    <li><strong>Then it stopped</strong>, with <code>balancerCompliant: true</code>, even though the chunk counts read <code>s1rs: 1, s2rs: 15</code>. Real documents: <code>s2rs</code> 95,880 and <code>s1rs</code> about 104,000. <strong>Since 6.0 the balancer balances by data size, not chunk count</strong>, so one big chunk on <code>s1rs</code> and fifteen small ones on <code>s2rs</code> are already even.</li>
+    <li>Moved documents stayed on <code>s1rs</code> as orphans (raw count 200,000) until the range deleter ran.</li>
+  </ol>
+  <p>A migration, from the README: the recipient clones the range while the donor keeps serving; then the donor enters a <strong>critical section</strong> that blocks writes (and then reads) to that range, the recipient catches up, the ownership change is committed on the config servers, and the critical section is released.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README_migrations.md">migrations README</a> It's short, but it exists: writes to that range wait during it, and migrating costs I/O and cache on both shards (lessons 3 and 5).</p>
+
+  <h2>5 · Lab: build the cluster</h2>
+  <div class="lab">
+    <p>About 20 minutes. <code>lessons/code/0015-sharding-lab.sh</code> has one command per experiment (I ran its pieces one by one; the script itself is a repackaging of them).</p>
+    <ol>
+      <li><code>bash lessons/code/0015-sharding-lab.sh setup</code>: 1 config server, 2 shards, 1 <code>mongos</code>, 200,000 reviews.</li>
+      <li><code>… hashed</code>: shards on <code>{_id: "hashed"}</code> with a 1 MB range size and prints chunks per shard every 5 s. Compare the per-shard raw counts with <code>countDocuments</code>.</li>
+      <li><code>… routing</code>: the explains from section 2. Predict <code>SINGLE_SHARD</code> or <code>SHARD_MERGE</code> first.</li>
+      <li><code>… inserts</code>, then <code>… lowcard</code>: the two shard-key failures from section 3.</li>
+      <li>Open <code>config.chunks</code> and <code>config.changelog</code> on <code>mongos</code> and find a <code>moveChunk.commit</code>.</li>
+    </ol>
+  </div>
+
+  <h2>6 · Read it in the source</h2>
+  <ol>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README.md">Sharding Architecture Guide</a>: the map of the components.</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README_balancer.md"><code>README_balancer.md</code></a>: rounds, policies, data-size balancing; and <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README_migrations.md"><code>README_migrations.md</code></a>: the critical section.</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README_range_deleter.md"><code>README_range_deleter.md</code></a>: when orphans go away.</li>
+  </ol>
+
+  <h2>7 · So in production you should…</h2>
+  <div class="callout">
+    <p><strong>Rule: choose the shard key from your queries and your write pattern, not from the data's shape. It should appear in the filter of your hot queries, have many values, and not increase monotonically. It is hard to change later.</strong></p>
+  </div>
+  <ol>
+    <li><strong>Put the shard key in every hot query.</strong> One shard answers; the rest don't work. Everything else is scatter-gather, whose latency is the slowest shard's.</li>
+    <li><strong>Don't use a monotonically increasing key as a ranged key</strong> (the 60,000 / 0 split in the lab). Hash it, or lead with a high-cardinality field.</li>
+    <li><strong>Avoid low-cardinality keys</strong> (<code>rating</code>, <code>verified</code>): chunks can't split below one value and become jumbo. Compound them with something high-cardinality.</li>
+    <li><strong>Hashed keys trade away range queries.</strong> Time-window queries on <code>_id</code> hit every shard. If those matter, shard on a ranged key that includes another prefix.</li>
+    <li><strong>Don't trust per-shard counts after migrations.</strong> Orphans inflate <code>$collStats</code> and scans; count through <code>mongos</code>, and let the range deleter finish before measuring.</li>
+    <li><strong>Judge balance by data size and load per shard</strong>, not chunk counts. <code>sh.status()</code>, <code>getShardDistribution()</code> and the balancer window setting (to keep migrations out of peak hours) are your tools.</li>
+    <li><strong>You can change the key later</strong> with <code>reshardCollection</code> (5.0+), but it copies the whole collection. Treat the choice as a design decision, and test it with the shard key analyzer before you shard.</li>
+  </ol>
+
+  <h3>Diagnosis table</h3>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Symptom</th><th>Cause</th><th>Proof</th></tr>
+    <tr><td>One shard at 100% CPU, others idle, during inserts</td><td>Monotonic ranged key: all writes to the top chunk</td><td>Per-shard <code>opcounters.insert</code>; the max chunk's owner</td></tr>
+    <tr><td>Chunks flagged <code>jumbo</code>, balancer idle</td><td>Low-cardinality key; one value exceeds the range size</td><td><code>config.chunks.find({jumbo: true})</code></td></tr>
+    <tr><td>Query slower on a sharded collection than on one node</td><td>Scatter-gather: no shard key in the filter</td><td><code>explain()</code>: <code>SHARD_MERGE</code>, shards listed</td></tr>
+    <tr><td>Per-shard counts add up to more than the total</td><td>Orphans after migrations</td><td><code>countDocuments</code> via <code>mongos</code> is the true number; <code>config.rangeDeletions</code></td></tr>
+    <tr><td>Chunk counts are uneven but the balancer is idle</td><td>Balancing is by data size</td><td><code>balancerCollectionStatus</code>: <code>balancerCompliant: true</code></td></tr>
+  </table>
+  </div>
+
+  <h2>8 · Check yourself</h2>
+  <div id="quiz"></div>
+
+  <h2>Where this fits</h2>
+  <ol>
+    <li><s>Phases 1–2</s> ✓ · Phase 3: <s>query planning</s> ✓ · <s>oplog and syncing</s> ✓ · <s>elections and rollback</s> ✓ · <strong>sharding</strong> (today) · recap.</li>
+  </ol>
+
+  <div class="callout source">
+    <p>Read <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/README_balancer.md"><code>README_balancer.md</code></a> (the "chunk selection policy" part, about line 80), then the manual's page on <a href="https://www.mongodb.com/docs/manual/core/sharding-balancer-administration/">balancer administration</a>.</p>
+  </div>
+
+  <div class="callout ask">
+    <p>Try it on your own system: if you shard (or plan to), what is the key, and what are the three most frequent queries' filters? Tell me and we'll predict, for each, one shard or all.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="0014-elections-and-rollback.html">← Lesson 14: Elections</a>
+    <a href="../reference/architecture-map.html">Reference: architecture map</a>
+    <a href="0016-layers-recap.html">Lesson 16: Phase 3 recap →</a>
+  </nav>
+</main>
+
+<script src="../../assets/quiz.js"></script>
+<script>
+const R = 'https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/s/';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0015-sharding',
+  questions: [
+    { layer: 'review',
+      q: '<em>From lesson 14:</em> which write concern can never be rolled back after a failover?',
+      options: ['<code>w: 1</code>', '<code>w: "majority"</code> once acknowledged', 'Any with <code>j: true</code>', 'Writes with a wtimeout'], answer: 1,
+      explain: `A majority-committed write is on a member of every possible majority, so any electable member has it.${c('https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/repl/README.md#commit-point-propagation', 'commit point')}` },
+
+    { layer: 'routing',
+      q: 'Shard key <code>{_id: "hashed"}</code>. Which query is answered by exactly one shard?',
+      options: ['<code>find({_id: id})</code>', '<code>find({_id: {$gte: X}})</code>', '<code>find({rating: 5})</code>', '<code>find({tags: "battery"})</code>'], answer: 0,
+      explain: `Equality on the shard key is hashed and routed to one chunk (<code>SINGLE_SHARD</code>). A range on a hashed key hits every shard, as do filters without the key (<code>SHARD_MERGE</code> in the lab).${c(R + 'README.md', 'sharding README')}` },
+
+    { layer: 'routing',
+      q: 'What does <code>mongos</code> store?',
+      options: ['A copy of every chunk', 'A cache of the routing table; no data', 'The oplog of each shard', 'The balancer\'s state'], answer: 1,
+      explain: `The map lives in the config servers (<code>config.chunks</code> etc.); <code>mongos</code> caches it and refreshes when a shard reports a version mismatch. The balancer runs on the config server primary.${c(R + 'README.md', 'sharding README')}` },
+
+    { layer: 'key',
+      q: '60,000 reviews with increasing ObjectId <code>_id</code>s are inserted into a collection sharded on <code>{_id: 1}</code> with 2 shards. What was measured?',
+      options: ['30,000 on each shard', '60,000 on one shard, 0 on the other', 'Alternating by chunk', '40,000 / 20,000'], answer: 1,
+      explain: `Every new id is above all existing ones, so all inserts go to the top chunk on one shard. With <code>{_id: "hashed"}</code> it was 30,038 / 29,962.${c(R + 'README_balancer.md', 'balancer README')}` },
+
+    { layer: 'key',
+      q: 'Why did sharding on <code>{rating: 1}</code> leave all 120,000 reviews on one shard?',
+      options: ['The balancer was disabled', 'Chunks can only split between values, so each of the 5 stayed whole (jumbo)', 'The range deleter was running', 'mongos refused to route'], answer: 1,
+      explain: `With five distinct values there are at most five chunks; the 5★ chunk holds 60,000 reviews and can't be split. Chunks above the range size that can't split are marked <code>jumbo</code> and aren't migrated.${c(R + 'README_balancer.md', 'balancer README')}` },
+
+    { layer: 'balancer',
+      q: 'After balancing, <code>config.chunks</code> shows 1 chunk on s1rs and 15 on s2rs, and <code>balancerCompliant</code> is true. How?',
+      options: ['It is a bug', 'Since 6.0 the balancer balances by data size per shard, not chunk count', 'Chunks on s1rs are replicated', 'The balancer ignores s1rs'], answer: 1,
+      explain: `The data-size policy picks the most and least loaded shards by bytes. One big chunk and fifteen small ones were already even (about 104,000 vs 95,880 documents).${c(R + 'README_balancer.md', 'balancer README')}` },
+
+    { layer: 'migration',
+      q: 'During a chunk migration, when are writes to that range blocked?',
+      options: ['For the whole migration', 'Never', 'During the donor\'s critical section, near the end', 'Only for reads'], answer: 2,
+      explain: `The recipient clones while the donor serves normally. Then the donor enters a critical section (blocking writes, then reads) while the recipient catches up and ownership is committed.${c(R + 'README_migrations.md', 'migrations README')}` },
+
+    { layer: 'orphans',
+      q: 'After the balancer moved half the data, <code>find({rating: 5, verified: true})</code> examined 295,880 documents on a 200,000-document collection. Why?',
+      options: ['The query ran twice', 'The donor shard still held the moved documents (orphans) and scanned them before filtering', 'The index was rebuilt', 'Duplicates exist in the data'], answer: 1,
+      explain: `Orphans stay until the range deleter removes them. Queries filter them out but still read them. <code>countDocuments</code> via <code>mongos</code> correctly said 200,000.${c(R + 'README_range_deleter.md', 'range deleter')}` }
+  ]
+});
+</script>
+</body>
+</html>

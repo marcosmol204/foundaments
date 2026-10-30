@@ -38,11 +38,11 @@
 
     <div class="phase">Phase 3 · Layers built over the engine</div>
     <div class="layer over"><div><h3>Query</h3><span class="path">src/mongo/db/query/, db/exec/</span></div>
-      <p>Planning and execution: classic engine and SBE, plus aggregation document sources. <em>(Lesson pending; see Gaps in RESOURCES.md.)</em></p></div>
+      <p>Planning and execution: classic engine and SBE, plus aggregation document sources. Plan selection races candidate plans for a first batch of 101 results, then caches the winner by query shape (classic: per collection; SBE: one per process). A cached plan gets 10× its recorded works before it is replanned. <a href="../lessons/0012-query-planning.html">Lesson 12</a>.</p></div>
     <div class="layer over"><div><h3>Replication</h3><span class="path">src/mongo/db/repl/</span></div>
-      <p>Oplog <code>local.oplog.rs</code> (capped, idempotent entries). Secondaries <strong>pull</strong> from a sync source. PV1 elections are built on Raft. The majority commit point drives <code>w:"majority"</code> and <code>readConcern:"majority"</code>.</p></div>
+      <p>Oplog <code>local.oplog.rs</code> (capped, idempotent entries). Secondaries <strong>pull</strong> from a sync source (fetch, write, apply; <a href="../lessons/0013-oplog-and-sync.html">lesson 13</a>). PV1 elections are built on Raft (10 s election timeout; <a href="../lessons/0014-elections-and-rollback.html">lesson 14</a>); writes not on a majority are rolled back to a file after a failover. The majority commit point drives <code>w:"majority"</code> and <code>readConcern:"majority"</code>.</p></div>
     <div class="layer over"><div><h3>Sharding</h3><span class="path">src/mongo/s/ (mongos), db/s/ (shard)</span></div>
-      <p><code>mongos</code> routes by shard key. The balancer runs on the CSRS primary. Default range size is 128 MB, and a migration happens once shards differ by 3× that.</p></div>
+      <p><code>mongos</code> routes by shard key. The balancer runs on the CSRS primary and balances by data size per shard (<a href="../lessons/0015-sharding.html">lesson 15</a>). Default range size is 128 MB, and a migration happens once shards differ by 3× that.</p></div>
 
     <div class="phase">Phase 1 · The engine</div>
     <div class="layer engine"><div><h3>Storage engine API</h3><span class="path">src/mongo/db/storage/</span></div>

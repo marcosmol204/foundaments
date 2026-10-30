@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lesson 12 · Query Planning and the Plan Cache</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<link rel="stylesheet" href="../../assets/quiz.css">
+<style>
+  /* Lesson-local: scrolling tables, a "race" figure */
+  .table-scroll { overflow-x: auto; }
+  svg .bar { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.2; }
+  svg .bar-warn { fill: var(--warn-bg); stroke: var(--warn); stroke-width: 1.2; }
+  svg .stop { stroke: var(--bad); stroke-width: 1.6; fill: none; }
+</style>
+</head>
+<body>
+<main>
+  <nav class="crumbs" aria-label="Breadcrumb"><a href="../../index.html">Home</a> / <a href="../index.html">MongoDB</a></nav>
+  <div class="kicker">MongoDB Internals · Lesson 0012 · Phase 3: Layers over the engine</div>
+  <h1>Query planning and the plan cache</h1>
+  <p class="subtitle">What happens inside <code>workingMillis</code>, before the first page is read: how the server picks one index out of several, remembers its choice, and notices when the choice has gone stale.</p>
+
+  <p><strong>Your win today:</strong> given a slow-log line for a <code>reviews</code> query, you can say which index was chosen and why, whether that plan came from the cache, whether it was replanned, and what to do about it (a better index, a hint, or nothing).</p>
+
+  <h2>0 · Warm-up from lessons 2 and 10</h2>
+  <p>From memory, before reading on.</p>
+  <ol>
+    <li>From lesson 2: <code>find({rating: 5})</code> with no index on <code>rating</code>. What does <code>planSummary</code> say, and how many documents are read?</li>
+    <li>From lesson 10: the slow-log line has <code>durationMillis: 900</code> and <code>workingMillis: 880</code>. Which hop is the time in?</li>
+  </ol>
+  <p>Answers: (1) <code>COLLSCAN</code>, every document. (2) Hop 4 and below, the work itself. Today we open that box: <em>which</em> work does the server decide to do?</p>
+
+  <h2>1 · From filter to plan, step by step</h2>
+  <p>The query: "verified reviews with 4★ or more, about the battery".</p>
+<pre><code>db.reviews.find({ verified: true, rating: { $gte: 4 }, tags: "battery" })</code></pre>
+  <p>The collection has three secondary indexes: <code>{verified: 1, rating: 1}</code>, <code>{rating: 1}</code> and <code>{tags: 1}</code> (multikey), plus <code>_id</code>. The server's query code is documented in its <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/query/README.md">query README</a>. In order:</p>
+
+  <figure>
+    <svg viewBox="0 0 680 300" role="img" aria-label="The query pipeline for one find. 1, parse and canonicalize the filter into a MatchExpression. 2, look up the query shape in the plan cache. On a hit, apply the cached index tags and skip to execution with a replanning check. On a miss: 3, tag the predicates with the indexes that could serve them. 4, enumerate plans. 5, run the candidates in a trial and pick a winner. 6, store the winner in the cache, inactive. Then 7, execute the winning plan and return batches.">
+      <defs><marker id="ah12" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path class="arrow" d="M0 0 L8 4 L0 8 z"/></marker></defs>
+      <rect class="box" x="20" y="10" width="300" height="38" rx="5"/>
+      <text class="lbl" x="32" y="27">① parse + canonicalize</text><text class="lbl-sm" x="32" y="42">filter → MatchExpression, simplified</text>
+      <rect class="box-accent" x="20" y="62" width="300" height="38" rx="5"/>
+      <text class="lbl" x="32" y="79">② plan cache lookup by shape</text><text class="lbl-sm" x="32" y="94">constants removed: {verified, rating $gte, tags}</text>
+      <rect class="box" x="20" y="114" width="300" height="38" rx="5"/>
+      <text class="lbl" x="32" y="131">③ tag: which index fits which predicate</text><text class="lbl-sm" x="32" y="146">three indexes are relevant</text>
+      <rect class="box" x="20" y="166" width="300" height="38" rx="5"/>
+      <text class="lbl" x="32" y="183">④ enumerate candidate plans</text><text class="lbl-sm" x="32" y="198">one per useful index (or combination)</text>
+      <rect class="box-accent" x="20" y="218" width="300" height="38" rx="5"/>
+      <text class="lbl" x="32" y="235">⑤ trial: race the candidates</text><text class="lbl-sm" x="32" y="250">first to return a batch (or finish) wins</text>
+      <rect class="box" x="20" y="262" width="300" height="32" rx="5"/>
+      <text class="lbl" x="32" y="283">⑥ cache the winner (inactive) ⑦ execute</text>
+      <path class="edge" d="M170 48 V62" marker-end="url(#ah12)"/><path class="edge" d="M170 100 V114" marker-end="url(#ah12)"/>
+      <path class="edge" d="M170 152 V166" marker-end="url(#ah12)"/><path class="edge" d="M170 204 V218" marker-end="url(#ah12)"/><path class="edge" d="M170 256 V262" marker-end="url(#ah12)"/>
+      <path class="edge" d="M320 81 H420 V262 H320" marker-end="url(#ah12)"/>
+      <text class="lbl-sm" x="432" y="150">cache hit: skip ③④⑤,</text>
+      <text class="lbl-sm" x="432" y="166">apply the saved index tags,</text>
+      <text class="lbl-sm" x="432" y="182">then run a replanning check</text>
+      <text class="lbl-sm" x="432" y="198">(section 3)</text>
+    </svg>
+    <figcaption>Planning one <code>find</code>. The two green steps are the lesson: the trial race (section 2) and the cache (section 3).</figcaption>
+  </figure>
+
+  <h3>Step by step: the race (step ⑤)</h3>
+  <p>With three plausible indexes, the server doesn't guess from statistics. It <strong>runs all candidates at the same time</strong>, taking turns one unit of work at a time (one "work" is one step of a plan stage: advance an index cursor, fetch a document), and stops when one plan returns a first batch of 101 results, or any plan reaches the end. The trial is capped at <code>max(10000, 0.3 × documents)</code> works (<code>internalQueryPlanEvaluationWorks</code> and <code>…CollFraction</code>).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/exec/multi_plan.cpp#L241">multi_plan.cpp</a> Then the plans are ranked by results produced per work.</p>
+  <p>This is what <code>explain("allPlansExecution")</code> showed on 500,000 reviews:</p>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Candidate</th><th>Works</th><th>Results returned</th><th>Result</th></tr>
+    <tr><td><code>{tags: 1}</code></td><td>195</td><td><strong>101</strong></td><td>winner (first full batch)</td></tr>
+    <tr><td><code>{verified: 1, rating: 1}</code></td><td>195</td><td>42</td><td>rejected</td></tr>
+    <tr><td><code>{rating: 1}</code></td><td>195</td><td>29</td><td>rejected</td></tr>
+  </table>
+  </div>
+  <p>Why did <code>tags</code> win? Each work on the tag index lands on a review for which the other two predicates hold more often. In the trial, it turned 195 works into 101 matches, the other two into 42 and 29. The full query then returned 45,902 reviews after 93,748 keys and documents (55 ms). Note what the trial measures: <em>progress per work on the first 101 results</em>, not total cost.</p>
+
+  <h2>2 · The plan cache: remember the winner</h2>
+  <p>Racing three plans costs real work on every execution. So the server stores the winner, keyed by the query's <strong>shape</strong>: the filter, sort and projection with the constants removed.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/query/README.md#plan-caching">query README: plan caching</a> The cache lives in memory on each <code>mongod</code> (never on <code>mongos</code>) and is lost on restart.</p>
+  <p>Step by step, same query, run four times on a fresh cache (<code>$planCacheStats</code>):</p>
+  <ol>
+    <li><strong>Run 1:</strong> multi-planning. An entry appears: <code>isActive: false</code>, <code>works: 195</code>, index <code>tags_1</code>. An <em>inactive</em> entry exists but isn't used yet.</li>
+    <li><strong>Run 2:</strong> same shape, multi-planned again (the entry is inactive). Its trial is as good as the entry's, so the entry becomes <code>isActive: true</code>.</li>
+    <li><strong>Runs 3–4:</strong> the plan comes from the cache. No race. <code>explain()</code> now shows <code>isCached: true</code>.</li>
+  </ol>
+  <p>Why the two-step? The query README: an unreasonably high <code>works</code> value in a new entry would never trigger replanning, so an entry is only trusted once a second trial matches or beats it.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/query/README.md#inactive-cache-entries">inactive entries</a></p>
+  <p>Constants don't matter: <code>{verified: false, rating: {$gte: 2}, tags: "price"}</code> maps to the <em>same</em> entry (still one entry in the cache). Changing the shape does: <code>tags: {$in: [...]}</code> made a second entry.</p>
+  <p>There are two caches. The classic engine has one cache <em>per collection</em> and stores index choices ("tags"); the plan tree is rebuilt on each use, and a query with only one candidate gets no entry. The SBE cache is one per process and stores compiled, auto-parameterized plans, so even single-candidate queries are cached.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/query/README.md#plan-caching">query README</a> Any index build or drop, or collection drop, clears the collection's entries.</p>
+
+  <h2>3 · Replanning: noticing a stale choice</h2>
+  <p>A plan that was best for one set of constants can be terrible for another. The cache handles this with a <strong>trial on every cache hit</strong>: run the cached plan for up to <code>10 × works</code> (<code>internalQueryCacheEvictionRatio</code>) until the first batch is ready. If it needs more, the buffered results are thrown away, the entry is deactivated, and the query is planned from scratch.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/exec/cached_plan.cpp#L104">cached_plan.cpp L104</a></p>
+  <p>I built a case with one shape and very different constants. The only change is how far back the <code>_id</code> range reaches (<code>_id</code> encodes the time, from lesson 2):</p>
+<pre><code>{ _id: { $gte: X }, rating: 1, verified: false, tags: "sound" }</code></pre>
+  <ol>
+    <li><strong>Narrow</strong> (X = the last 100 reviews): the <code>_id</code> index wins, 100 keys, 0 results, <code>works: 101</code>. Run three times, it is active and <code>fromPlanCache: true</code>.</li>
+    <li><strong>Wide</strong> (X = the first review, same shape): the cached plan is the <code>_id</code> scan. To find 101 matches in a 0.6%-selective filter it would need thousands of works, but the cap is 10 × 101 = 1,010. The profiler says:
+<pre class="output"><code>"replanned": true, "replanReason": "cached plan was less efficient than expected:
+  expected trial execution to take 101 works but it took at least 1010 works"
+planSummary: IXSCAN { verified: 1, rating: 1 }   keysExamined: 556</code></pre></li>
+    <li>The new winner is cached, as <em>inactive</em> with <code>works: 202</code>, then 404, then 808 on the next runs. Every replan that doesn't confirm it doubles the stored works, so the entry gets room to settle.</li>
+  </ol>
+  <p><strong>Replanning is a safety net, not an optimizer.</strong> In a milder case (<code>{_id: {$gte: X}, rating: 5}</code>) the narrow plan was cached, and the wide query ran the <code>_id</code> scan 3 times at ~775 ms with no replan: it found its 101 results well within 1,010 works. Starting fresh, the planner chose <code>{rating: 1}</code> and took ~650 ms. A plan that is 20% worse but never crosses the 10× line stays cached forever.</p>
+
+  <h2>4 · Two engines: classic and SBE</h2>
+  <p>MongoDB 8.0 has two execution engines. The <strong>classic</strong> engine interprets a tree of stages (<code>IXSCAN</code>, <code>FETCH</code>, …) one document at a time. The <strong>slot-based engine (SBE)</strong> compiles the plan into a tree of stages that pass values in numbered slots. It was designed to run queries that span several collections (for example <code>$lookup</code>), and it has its own, process-wide plan cache.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/query/README.md#plan-caching">query README</a> The default <code>internalQueryFrameworkControl</code> is <code>trySbeRestricted</code>: SBE only for query shapes where it is known to help.</p>
+  <p>You can tell which ran: <code>queryFramework</code> in the slow log (we saw <code>"sbe"</code> for the <code>countDocuments</code> in lesson 10), or <code>explainVersion</code>. On this data a plain <code>find</code> with an index stayed classic (<code>explainVersion: 1</code>, <code>FETCH</code> over <code>IXSCAN</code>), while <code>aggregate([{$match…}, {$group: {_id: "$rating", …}}])</code> used SBE (<code>explainVersion: 2</code>). Indexes work the same in both; only the executor and the cache differ.</p>
+
+  <h2>5 · Lab: watch the planner decide</h2>
+  <div class="lab">
+    <p>About 10 minutes. The script <code>lessons/code/0012-query-lab.js</code> runs everything in this lesson.</p>
+    <ol>
+      <li>Start a server and seed 500,000 reviews:
+<pre class="terminal"><code>docker run -d --name lab12 -m 1g mongo:8.0 --wiredTigerCacheSizeGB 0.25
+docker cp lessons/code/seed-reviews.js lab12:/seed-reviews.js
+docker exec lab12 mongosh store --eval 'const N = 500000' --file /seed-reviews.js</code></pre></li>
+      <li>Run the lab:
+<pre class="terminal"><code>docker cp lessons/code/0012-query-lab.js lab12:/0012-query-lab.js
+docker exec lab12 mongosh store --quiet --file /0012-query-lab.js</code></pre></li>
+      <li>Read part 1: three candidates, 195 works each. Which index won, and why does returning more results per work decide it?</li>
+      <li>In part 2, predict <code>active</code> on runs 1, 2 and 3 before looking.</li>
+      <li>In part 3, find the line with <code>replanned: true</code>. Then change the narrow filter to <code>rating: 5</code> only (drop <code>verified</code> and <code>tags</code>) and see that replanning no longer happens.</li>
+    </ol>
+  </div>
+
+  <h2>6 · Read it in the source</h2>
+  <ol>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/query/README.md">Query README</a>: the phases, then "Plan caching".</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/exec/multi_plan.cpp#L241"><code>multi_plan.cpp</code> L241</a>: the trial's work limit and batch size.</li>
+    <li><a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/exec/cached_plan.cpp#L104"><code>cached_plan.cpp</code> L104–L200</a>: <code>maxWorksBeforeReplan</code> and the exact <code>replanReason</code> text you saw.</li>
+  </ol>
+
+  <h2>7 · So in production you should…</h2>
+  <div class="callout">
+    <p><strong>Rule: make the right index obviously best, so the race and the cache have nothing to get wrong. Give each important query one index that matches its equality fields first, then its range, then its sort.</strong></p>
+  </div>
+  <ol>
+    <li><strong>Read <code>planCacheKey</code>, <code>queryHash</code> and <code>replanned</code> in the slow log.</strong> <code>replanned: true</code> repeating for one shape means one plan doesn't suit all its constants.</li>
+    <li><strong>Don't depend on the trial.</strong> It picks the plan that makes quick progress on the first 101 results. With a <code>sort</code> or a big result set, that can differ from the plan with the lowest total cost. A compound index that serves filter and sort removes the contest.</li>
+    <li><strong>Skewed values are the classic trap</strong> (one tag with 80% of reviews, one with 0.1%). Either split the query by value in application code, or use a <code>hint</code> or Query Settings (<code>setQuerySettings</code>, 8.0) to pin the index for that shape.</li>
+    <li><strong>After index changes, expect a short spike.</strong> Building or dropping an index clears that collection's cache entries; every shape is multi-planned again (<code>planCacheKey</code> stays the same, <code>fromPlanCache</code> is absent for the first runs).</li>
+    <li><strong>Too many indexes make the race longer and noisier.</strong> Each extra candidate means more trial work and more chance of a surprising winner. Drop indexes nothing uses (<code>$indexStats</code>).</li>
+    <li><strong>Check the cache when a query suddenly changes:</strong> <code>db.reviews.getPlanCache().list()</code> or <code>$planCacheStats</code>; <code>getPlanCache().clear()</code> forces fresh planning.</li>
+  </ol>
+
+  <h3>Diagnosis table</h3>
+  <div class="table-scroll">
+  <table>
+    <tr><th>Symptom</th><th>Cause</th><th>Proof</th></tr>
+    <tr><td>Same query shape fast for some values, slow for others</td><td>Plan cached for one constant, not replanned</td><td>Same <code>planCacheKey</code>, different <code>keysExamined</code>, no <code>replanned</code></td></tr>
+    <tr><td>Slow log: <code>replanned: true</code> over and over</td><td>Plan flips between constants</td><td><code>replanReason</code>; <code>$planCacheStats</code> inactive, <code>works</code> growing</td></tr>
+    <tr><td>Latency spike right after an index build or drop</td><td>Plan cache flushed; every shape multi-plans</td><td>Spike ends after a few runs; <code>fromPlanCache</code> returns</td></tr>
+    <tr><td>Query chose an index you didn't expect</td><td>It won the first-batch race</td><td><code>explain("allPlansExecution")</code>: works and <code>nReturned</code> per candidate</td></tr>
+  </table>
+  </div>
+
+  <h2>8 · Check yourself</h2>
+  <div id="quiz"></div>
+
+  <h2>Where this fits</h2>
+  <ol>
+    <li><s>Phase 1, the engine</s> ✓ · <s>Phase 2, transport &amp; wire</s> ✓</li>
+    <li><strong>Phase 3, the layers built on the engine:</strong> <strong>query planning</strong> (today) · replication: the oplog and syncing · replication: elections and the commit point · sharding: routing and the balancer · recap.</li>
+  </ol>
+
+  <div class="callout source">
+    <p>Read the <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/query/README.md#plan-caching">"Plan caching" section of the query README</a> end to end (it is short), then <code>CachedPlanStage::pickBestPlan</code> in <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/exec/cached_plan.cpp#L104"><code>cached_plan.cpp</code></a>.</p>
+  </div>
+
+  <div class="callout ask">
+    <p>Try it on your own system: take your slowest query's slow-log line and tell me its <code>planSummary</code>, <code>keysExamined</code>, <code>docsExamined</code>, <code>nreturned</code> and whether <code>replanned</code> appears. If <code>keysExamined</code> is far above <code>nreturned</code>, we'll work out which index fixes it.</p>
+  </div>
+
+  <nav class="lesson-nav">
+    <a href="0011-transport-recap.html">← Lesson 11: Phase 2 recap</a>
+    <a href="../reference/architecture-map.html">Reference: architecture map</a>
+    <a href="0013-oplog-and-sync.html">Lesson 13: The oplog →</a>
+  </nav>
+</main>
+
+<script src="../../assets/quiz.js"></script>
+<script>
+const R = 'https://github.com/mongodb/mongo/blob/r8.0.34/';
+const QR = R + 'src/mongo/db/query/README.md';
+const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
+
+Quiz.mount('#quiz', {
+  id: 'lesson-0012-query-planning',
+  questions: [
+    { layer: 'review',
+      q: '<em>From lesson 10:</em> a slow-log line shows <code>durationMillis: 900</code>, <code>workingMillis: 880</code>, <code>planSummary: "COLLSCAN"</code>. Which fix goes at the right layer?',
+      options: ['Raise maxPoolSize in the driver', 'Add an index for the filter', 'Lower the connection limit', 'Switch to OP_COMPRESSED'], answer: 1,
+      explain: `The time is inside the command's own work, and the plan reads every document. Pool, connection limit and compression are hops 1–3.${c('https://www.mongodb.com/docs/manual/reference/explain-results/', 'explain results')}` },
+
+    { layer: 'planner',
+      q: 'Three indexes can serve <code>find({verified: true, rating: {$gte: 4}, tags: "battery"})</code>. How does the server choose?',
+      options: ['By the order the indexes were created', 'By index size on disk', 'It runs all candidates in a trial and picks the best progress', 'By the number of fields each index covers'], answer: 2,
+      explain: `<code>MultiPlanStage</code> works each candidate in turn and stops when one returns a first batch (101 results) or ends. In the lab all three used 195 works; <code>tags_1</code> had returned 101 results, the others 42 and 29.${c(R + 'src/mongo/db/exec/multi_plan.cpp#L241', 'multi_plan.cpp')}` },
+
+    { layer: 'cache',
+      q: 'You run the same query shape twice on a fresh cache. After run 1, <code>$planCacheStats</code> shows <code>isActive: false</code>. What happens on run 2?',
+      options: ['It uses the cached plan, with no trial', 'It is multi-planned again; if the trial is as good, the entry turns active', 'The entry is deleted as stale', 'The server replans with 10× the works'], answer: 1,
+      explain: `New entries start inactive so a lucky or odd first trial can't get stuck at a high works value. A second similar-or-better trial promotes it. Runs 3+ come from the cache.${c(QR + '#inactive-cache-entries', 'inactive entries')}` },
+
+    { layer: 'cache',
+      q: 'Which two queries share one plan cache entry (classic engine)?',
+      options: ['<code>{tags: "price"}</code> and <code>{tags: {$in: ["price","size"]}}</code>', '<code>{rating: 5}</code> and <code>{rating: 5}.sort({_id: 1})</code>', '<code>{tags: "price", verified: true}</code> and <code>{tags: "sound", verified: false}</code>', '<code>{rating: 5}</code> in one database and <code>{rating: 5}</code> in another'], answer: 2,
+      explain: `The key is the shape with constants removed (match, sort, projection). Different constants, same shape, same entry. A different operator (<code>$in</code>) or a sort makes a different shape, and each collection has its own cache.${c(QR + '#classic-plan-cache', 'classic plan cache')}` },
+
+    { layer: 'replan',
+      q: 'A cached plan had <code>works: 101</code>. A new query of the same shape needs 800 works to fill its first batch with that plan. What does the server do?',
+      options: ['Keeps the plan; only 10× is tolerated and 800 < 1,010', 'Replans, since 800 is more than 101', 'Drops the index', 'Fails the query'], answer: 0,
+      explain: `The limit is <code>internalQueryCacheEvictionRatio × works</code> = 10 × 101 = 1,010. At 800 the plan stays, even if another index would do it in 200. Replanning is a safety net for plans far off, not an optimizer.${c(R + 'src/mongo/db/exec/cached_plan.cpp#L104', 'cached_plan.cpp')}` },
+
+    { layer: 'replan',
+      q: 'What does a slow-log line with <code>replanned: true</code> and a <code>replanReason</code> of "…expected trial execution to take 101 works but it took at least 1010 works" tell you?',
+      options: ['The cache entry was evicted for memory', 'An index was dropped', 'The cached plan was bad for these constants, so the query was planned again', 'The query hit maxTimeMS'], answer: 2,
+      explain: `The cached plan couldn't produce its first batch within 10× the recorded works. The buffered results were discarded, the entry deactivated, and the query planned from scratch. If it repeats for one shape, the plan depends on the constants.${c(R + 'src/mongo/db/exec/cached_plan.cpp#L196', 'cached_plan.cpp L196')}` },
+
+    { layer: 'cache',
+      q: 'You add a new index to <code>store.reviews</code>. What happens to its plan cache entries?',
+      options: ['They stay; the new index is used when it improves', 'They are cleared; each shape is planned again', 'They are marked inactive', 'Only the entries for the new index are cleared'], answer: 1,
+      explain: `Index builds and drops (and collection drops) invalidate the collection's entries. Expect a brief re-planning spike, then entries return.${c(QR + '#cache-eviction-and-invalidation', 'invalidation')}` },
+
+    { layer: 'engine',
+      q: 'Which statement about classic vs. SBE in 8.0 is true?',
+      options: ['SBE is a different storage engine', 'SBE has one plan cache per collection', 'The classic cache holds no entry when there is only one candidate; the SBE cache does', 'Both caches survive a restart'], answer: 2,
+      explain: `The classic cache exists to skip multi-planning, so a single solution isn't cached. SBE also avoids compiling, so single-solution queries are cached. SBE's cache is process-wide; neither persists.${c(QR + '#sbe-plan-cache', 'SBE plan cache')}` }
+  ]
+});
+</script>
+</body>
+</html>
