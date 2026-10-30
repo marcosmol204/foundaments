@@ -88,7 +88,7 @@
 
   <h3>Walkthrough 2 · The journal sync (≤ 100 ms later)</h3>
   <ol>
-    <li>A background thread, the <strong>JournalFlusher</strong>, wakes up every <code>commitIntervalMs</code> (default 100).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/control/journal_flusher.h#L50-L58">journal_flusher.h</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/storage_options.h#L89-L93">storage_options.h</a></li>
+    <li>A background thread, the <strong>JournalFlusher</strong>, wakes up every <code>commitIntervalMs</code> (default 100).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/storage/control/journal_flusher.h#L50-L58">journal_flusher.h</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/storage_options.h#L89-L93">storage_options.h</a></li>
     <li>It asks WiredTiger to write the log buffer to the journal file and <strong>fsync</strong> it. Now R survives a crash, even though P is still only in memory.</li>
     <li>With <code>j: true</code>, the server doesn't wait for the timer. It requests a flush right away and acknowledges only after the sync.<a class="cite" href="https://www.mongodb.com/docs/manual/core/journaling/">journaling</a></li>
   </ol>
@@ -122,7 +122,7 @@
   <p>An fsync waits for the disk. If 100 clients each needed their own fsync, they'd queue. Two layers prevent that:</p>
   <ol>
     <li><strong>WiredTiger slots.</strong> "WiredTiger has a pool of log buffers called slots." Concurrent commits join the same slot without locks, so one write to the file carries many records.<a class="cite" href="https://source.wiredtiger.com/develop/arch-logging.html">WT logging</a></li>
-    <li><strong>MongoDB's flusher.</strong> "Asynchronously grouping data flush requests reduces the total number of flushes executed."<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/control/journal_flusher.h#L50-L58">journal_flusher.h</a> A <code>j: true</code> waiter that arrives while a sync is running just waits for the next one. In the code: "Someone else synced already since we read lastSyncTime, so we're done!"<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/wiredtiger/wiredtiger_session_cache.cpp#L317-L347">session_cache.cpp</a></li>
+    <li><strong>MongoDB's flusher.</strong> "Asynchronously grouping data flush requests reduces the total number of flushes executed."<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/storage/control/journal_flusher.h#L50-L58">journal_flusher.h</a> A <code>j: true</code> waiter that arrives while a sync is running just waits for the next one. In the code: "Someone else synced already since we read lastSyncTime, so we're done!"<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/wiredtiger/wiredtiger_session_cache.cpp#L317-L347">session_cache.cpp</a></li>
   </ol>
   <p>The same idea works inside one client: an <code>insertMany</code> of 2,000 reviews with <code>j: true</code> costs one sync, not 2,000.</p>
 
@@ -344,7 +344,7 @@ const JOURNAL = 'https://www.mongodb.com/docs/manual/core/journaling/';
 const BLOCK = 'https://source.wiredtiger.com/develop/arch-block.html';
 const BTREE = 'https://source.wiredtiger.com/develop/arch-btree.html';
 const EVICT = 'https://source.wiredtiger.com/develop/arch-eviction.html';
-const FLUSHER = 'https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/control/journal_flusher.h#L50-L58';
+const FLUSHER = 'https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/storage/control/journal_flusher.h#L50-L58';
 const TABLELOG = 'https://github.com/mongodb/mongo/blob/r8.0.4/src/mongo/db/storage/wiredtiger/wiredtiger_util.cpp#L1015-L1048';
 const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;
 

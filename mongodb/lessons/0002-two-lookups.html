@@ -96,7 +96,7 @@
     <tr><td>Max leaf page</td><td>32 KB</td><td>16 KB</td></tr>
     <tr><td>Max internal page</td><td>4 KB</td><td>16 KB</td></tr>
     <tr><td>Compression</td><td>snappy (block)</td><td>prefix compression<a class="cite" href="https://www.mongodb.com/docs/manual/core/wiredtiger/">docs</a></td></tr>
-    <tr><td>Tree depth (200k docs)</td><td>3</td><td>n/a (stat not yet populated)</td></tr>
+    <tr><td>Tree depth (200k docs)</td><td>3</td><td>0 right after creation (fills in later)</td></tr>
   </table>
 
   <h3>Pages live in two places</h3>
@@ -171,15 +171,15 @@
   <p>Query <code>find({verified: true, rating: {$gte: 4}})</code>, the verified positive reviews, matches 97,789 reviews, with index <code>{verified: 1, rating: 1}</code>. Best of 5 runs:</p>
   <table>
     <tr><th>Variant</th><th>Plan</th><th>keys</th><th>docs</th><th>time</th><th>bytes returned</th></tr>
-    <tr><td>No projection</td><td>FETCH ← IXSCAN</td><td>97,789</td><td>97,789</td><td>44 ms</td><td>15.6 MB</td></tr>
-    <tr><td><code>{rating: 1}</code></td><td>PROJECTION_SIMPLE ← FETCH ← IXSCAN</td><td>97,789</td><td>97,789</td><td>57 ms</td><td>3.2 MB</td></tr>
-    <tr><td><code>{_id: 0, rating: 1}</code></td><td>PROJECTION_COVERED ← IXSCAN</td><td>97,789</td><td><strong>0</strong></td><td><strong>31 ms</strong></td><td><strong>1.6 MB</strong></td></tr>
+    <tr><td>No projection</td><td>FETCH ← IXSCAN</td><td>97,789</td><td>97,789</td><td>44 ms</td><td>15.6 MiB</td></tr>
+    <tr><td><code>{rating: 1}</code></td><td>PROJECTION_SIMPLE ← FETCH ← IXSCAN</td><td>97,789</td><td>97,789</td><td>57 ms</td><td>3.2 MiB</td></tr>
+    <tr><td><code>{_id: 0, rating: 1}</code></td><td>PROJECTION_COVERED ← IXSCAN</td><td>97,789</td><td><strong>0</strong></td><td><strong>31 ms</strong></td><td><strong>1.6 MiB</strong></td></tr>
   </table>
   <p>Three lessons hide in that table:</p>
   <ol>
     <li><strong>The win comes from removing FETCH, not from projecting.</strong> Row 2 projects too, but still returns <code>_id</code>, so it still does 97,789 collection seeks. Inside the database it was even a bit slower, since it adds a projection stage. Projection alone only saves network bytes.<a class="cite" href="https://www.mongodb.com/docs/manual/core/query-optimization/">docs</a></li>
     <li><strong>It gets better when data is cold.</strong> My data was all in cache, so the gap was only 44 → 31 ms. Index keys are smaller than documents and are "typically available in RAM". Documents may have to come from disk, and then each FETCH can cost a disk read.<a class="cite" href="https://www.mongodb.com/docs/manual/core/query-optimization/">docs</a></li>
-    <li><strong>Less data over the wire.</strong> 15.6 MB → 1.6 MB for the same rows, mostly because the <code>review</code> text stays behind. Your app server feels that too.</li>
+    <li><strong>Less data over the wire.</strong> 15.6 MiB → 1.6 MiB for the same rows, mostly because the <code>review</code> text stays behind. Your app server feels that too.</li>
   </ol>
 
   <h3>When a query <em>can't</em> be covered</h3>

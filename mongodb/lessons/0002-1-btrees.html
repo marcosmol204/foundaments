@@ -49,7 +49,7 @@
   <!-- ============================================================ -->
   <h2>Part 2 · Build one in C</h2>
   <p>The full file is <a href="code/btree.c"><code>lessons/code/btree.c</code></a> (about 150 lines). It uses T = 2, so a page holds at most <strong>3 keys</strong>. That's tiny on purpose, so splits happen often enough to watch. The keys are plain integers. Read them as RecordIds in the <code>reviews</code> collection table: that's exactly what a collection B-tree is keyed by.</p>
-<pre class="terminal"><code>cd ~/Development/foundaments/lessons/code
+<pre class="terminal"><code>cd ~/Development/foundaments/mongodb/lessons/code
 cc -std=c11 -Wall -o btree btree.c && ./btree</code></pre>
 
   <h3>The page</h3>

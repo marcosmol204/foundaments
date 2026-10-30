@@ -101,7 +101,7 @@
   <p>Before writing, the server fixes the document: <code>fixDocumentForInsert</code> moves <code>_id</code> to the <em>front</em>.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/ops/insert.cpp#L175">insert.cpp</a> On the wire <code>_id</code> came last. In the stored document and the oplog entry, it's first.</p>
   <p>The same code path that runs the command then waits for the write concern, in the same thread (<code>RunCommandAndWaitForWriteConcern</code>).<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/service_entry_point_common.cpp#L1327">entry point</a> Hold on to that: hop 8 happens <em>here</em>, after the write has already committed.</p>
 
-  <h3><span class="hop">5</span>One storage transaction, five tables</h3>
+  <h3><span class="hop">5</span>One storage transaction, five tables (six with the session record)</h3>
   <p>This is lesson 2 meeting replication. <code>insertDocumentsAtomically</code> opens one <code>WriteUnitOfWork</code> (WUOW) and commits it at the end.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/ops/write_ops_exec.cpp#L393">write_ops_exec.cpp</a> "All writes in the scope of a WUOW are transactional; they are either all committed or all rolled-back."<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/catalog/README.md#writeunitofwork">catalog README</a> Inside it, step by step:<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/catalog/collection_write_path.cpp#L336">collection_write_path.cpp</a></p>
 
   <figure>
@@ -129,7 +129,7 @@
       <path class="edge-accent" d="M340 252 L340 276" marker-end="url(#ah6)"/>
       <text class="lbl" x="352" y="290">commit → journal record (lesson 5)</text>
     </svg>
-    <figcaption>One insert, five B-trees, one commit. The slow-query log in the lab reports <code>ninserted: 1, keysInserted: 5</code>.</figcaption>
+    <figcaption>One insert, five B-trees, one commit (plus <code>config.transactions</code> for a retryable write). The slow-query log in the lab reports <code>ninserted: 1, keysInserted: 5</code>.</figcaption>
   </figure>
 
   <ol>

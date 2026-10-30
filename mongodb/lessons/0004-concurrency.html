@@ -73,7 +73,7 @@
   <h3>Walkthrough 3 · A third voter hits a write conflict</h3>
   <ol>
     <li>Transaction <strong>108</strong> wants to <code>$inc</code> R as well. Before it adds an update, WiredTiger looks at the head of the chain: 107, which is <em>not visible</em> to 108, because it isn't committed.</li>
-    <li>If 108 wrote <code>helpful 3</code> on top, 107's vote would be lost. So WiredTiger refuses: it returns <code>WT_ROLLBACK</code> with the reason "Write conflict between concurrent operations" and counts it in the <code>update conflicts</code> stat.<a class="cite" href="https://github.com/wiredtiger/wiredtiger/blob/develop/src/include/txn_inline.h">txn_inline.h</a></li>
+    <li>If 108 wrote <code>helpful 3</code> on top, 107's vote would be lost. So WiredTiger refuses: it returns <code>WT_ROLLBACK</code> with the reason "conflict between concurrent operations" (newer WiredTiger versions prefix it with "Write") and counts it in the <code>update conflicts</code> stat.<a class="cite" href="https://github.com/wiredtiger/wiredtiger/blob/develop/src/include/txn_inline.h">txn_inline.h</a></li>
     <li>The same happens if the head is <em>committed</em> but committed after 108's snapshot was taken. The rule is "the newest version must be visible to me". So the first writer wins, and the second one has to start over.</li>
   </ol>
 
@@ -206,7 +206,7 @@ docker exec mongo-lab4 mongosh store --quiet --eval 'db.reviews.findOne({_id: Ob
 <pre class="output"><code>5000 updates on 6955b9000000000000000000 in 2831 ms; writeConflicts (whole server) +1678
 5000 updates on 6955b9000000000000000000 in 2833 ms; writeConflicts (whole server) +1678
 { _id: ObjectId('6955b9000000000000000000'), helpful: 10000 }</code></pre>
-      Exactly 10,000: no vote lost, even with ~1,700 conflicts (I got 1,648 to 1,802 over three runs). Both lines show the same number because the counter is for the whole server.</li>
+      Exactly 10,000: no vote lost, even with ~1,700 conflicts (I got 1,648 to 1,802 over three runs; a re-check gave 1,804 to 2,082, so it varies by machine). Both lines show the same number because the counter is for the whole server.</li>
       <li><strong>The control.</strong> Same race, but the second shell votes on a <em>different</em> review (<code>WHICH = 1</code>):
 <pre class="terminal"><code>docker exec mongo-lab4 mongosh store --quiet --eval 'const RACE = 5000' --file /lab.js &amp; \
 docker exec mongo-lab4 mongosh store --quiet --eval 'const RACE = 5000, WHICH = 1' --file /lab.js &amp; wait</code></pre>

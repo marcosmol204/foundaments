@@ -65,7 +65,7 @@
   <h3>Walkthrough 1 · First read (a miss)</h3>
   <ol>
     <li>Your app asks for the reviews of 10 January, so it needs the reviews on P. The seek starts at the root. The root and the internal page are already in cache, because <em>every</em> seek passes through them.</li>
-    <li>The internal page points to P, but P is not in cache. That's a <strong>miss</strong>. "Lookups start at the root and load any missing page from storage as they descend."<a class="cite" href="https://source.wiredtiger.com/develop/arch-cache.html">WT cache</a></li>
+    <li>The internal page points to P, but P is not in cache. That's a <strong>miss</strong>. Lookups start at the root page and search the tree. "If WiredTiger encounters a page that is not in memory, it loads that page from storage and continues the search."<a class="cite" href="https://source.wiredtiger.com/develop/arch-cache.html">WT cache</a></li>
     <li>WiredTiger asks the block manager for P's block. The OS serves it from its cache or from disk.</li>
     <li>WiredTiger decompresses the block and builds the in-memory page, with an index for binary search inside it.<a class="cite" href="https://source.wiredtiger.com/develop/arch-cache.html">WT cache</a> Then the query reads its documents.</li>
   </ol>
@@ -143,8 +143,8 @@
     <tr><td>One day of reviews, <strong>cold</strong> (restart + OS cache dropped)</td><td>253</td><td>53–65 ms</td></tr>
     <tr><td>Same, <strong>OS cache warm</strong> (restart only)</td><td>253</td><td>41–47 ms (one run 78)</td></tr>
     <tr><td>Same, <strong>WiredTiger cache warm</strong></td><td>0</td><td>33–37 ms</td></tr>
-    <tr><td>Full collection scan #1</td><td>3,020</td><td>1,518 pages evicted</td></tr>
-    <tr><td>Full collection scan #2, nothing changed</td><td><strong>2,567</strong></td><td>2,252 pages evicted</td></tr>
+    <tr><td>Full collection scan #1</td><td>2,875</td><td>1,518 pages evicted</td></tr>
+    <tr><td>Full collection scan #2, nothing changed</td><td><strong>2,500</strong></td><td>2,252 pages evicted</td></tr>
     <tr><td>Backfill: verify every unverified review, one day per batch</td><td>n/a</td><td>dirty peaked at <strong>19.6%</strong>, dirty trigger reached 5 times, 2,866 dirty pages reconciled</td></tr>
   </table>
   <p>Times are <code>executionTimeMillis</code> for 4 runs each, on a laptop SSD. On networked cloud disks, each miss usually costs more, so the cold/warm gap gets bigger. Three things to notice:</p>
@@ -300,7 +300,7 @@ Quiz.mount('#quiz', {
     { layer: 'cache',
       q: 'A collection is bigger (uncompressed) than the cache. You scan it fully twice, and nothing else runs. What happens on the second scan?',
       options: ['It reads many pages again', 'It is served from cache', 'It is skipped by planner', 'It writes every page out'], answer: 0,
-      explain: `With LRU eviction, the start of the collection was evicted to make room for its end. So the second scan misses again. In the lab, scan #2 read 2,567 pages back in, and in the simulator, the second pass got zero hits.${c(EVICT, 'WT eviction')}` },
+      explain: `With LRU eviction, the start of the collection was evicted to make room for its end. So the second scan misses again. In the lab, scan #2 read ~2,500 pages back in, and in the simulator, the second pass got zero hits.${c(EVICT, 'WT eviction')}` },
 
     { layer: 'cache',
       q: 'Which <code>serverStatus</code> number, compared between two snapshots, best shows that your working set doesn\'t fit?',

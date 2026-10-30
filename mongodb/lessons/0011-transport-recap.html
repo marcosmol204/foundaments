@@ -82,7 +82,7 @@
     <li><strong>App sees.</strong> Your own timer around the call. Everything.</li>
     <li><strong>Command duration</strong> (driver). The driver's command monitoring event (<code>commandSucceeded</code> / <code>commandFailed</code>) times one command from "sent" to "reply received". The spec allows it to include BSON encoding and decoding.<a class="cite" href="https://specifications.readthedocs.io/en/latest/command-logging-and-monitoring/command-logging-and-monitoring/">command monitoring spec</a> It does <em>not</em> include server selection or the pool checkout, which happen before the command exists on a connection. The checkout itself has its own event: <code>connectionCheckedOut.durationMS</code>.<a class="cite" href="https://specifications.readthedocs.io/en/latest/connection-monitoring-and-pooling/connection-monitoring-and-pooling/">CMAP spec</a></li>
     <li><strong><code>durationMillis</code></strong> (slow-query log, or the profiler). CurOp's clock, which starts in dispatch, after the bytes were read and parsed, and stops when the reply is built (<a href="0010-dispatch.html">lesson 10</a>, steps 6 to 8). So it doesn't contain the network.</li>
-    <li><strong><code>workingMillis</code></strong>. <code>durationMillis</code> minus the time the operation was <em>blocked</em>: lock waits, the queue for execution tickets, and flow control.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/curop.cpp#L568">curop.cpp L568</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/curop.cpp#L642">L642</a> The ticket wait is also logged on its own, as <code>queues.execution.totalTimeQueuedMicros</code>.</li>
+    <li><strong><code>workingMillis</code></strong>. <code>durationMillis</code> minus the time the operation was <em>blocked</em>: lock waits, the queue for execution tickets, and flow control.<a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/curop.cpp#L569">curop.cpp L569</a><a class="cite" href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/curop.cpp#L642">L642</a> The ticket wait is also logged on its own, as <code>queues.execution.totalTimeQueuedMicros</code>.</li>
   </ol>
   <p>Then subtract:</p>
   <div class="table-scroll">
@@ -291,7 +291,7 @@ bash lessons/code/0011-mystery.sh heal</code></pre>
   </ol>
 
   <div class="callout source">
-    <p>Read the <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/admission/README.md">Execution Control README at r8.0.34</a> (throughput probing: how the ticket count in the walkthrough is chosen), then <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/curop.cpp#L568"><code>CurOp::_sumBlockedTimeTotal</code> and the <code>workingMillis</code> computation in <code>curop.cpp</code></a>: ten lines that define the most useful subtraction in this lesson. For the driver side, the event lists in the <a href="https://specifications.readthedocs.io/en/latest/connection-monitoring-and-pooling/connection-monitoring-and-pooling/">CMAP spec</a> and the <a href="https://specifications.readthedocs.io/en/latest/command-logging-and-monitoring/command-logging-and-monitoring/">command monitoring spec</a>.</p>
+    <p>Read the <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/admission/README.md">Execution Control README at r8.0.34</a> (throughput probing: how the ticket count in the walkthrough is chosen), then <a href="https://github.com/mongodb/mongo/blob/r8.0.34/src/mongo/db/curop.cpp#L569"><code>CurOp::_sumBlockedTimeTotal</code> and the <code>workingMillis</code> computation in <code>curop.cpp</code></a>: ten lines that define the most useful subtraction in this lesson. For the driver side, the event lists in the <a href="https://specifications.readthedocs.io/en/latest/connection-monitoring-and-pooling/connection-monitoring-and-pooling/">CMAP spec</a> and the <a href="https://specifications.readthedocs.io/en/latest/command-logging-and-monitoring/command-logging-and-monitoring/">command monitoring spec</a>.</p>
   </div>
 
   <div class="callout ask">
@@ -312,7 +312,7 @@ const BTREE = 'https://source.wiredtiger.com/develop/arch-btree.html';
 const EVICT = 'https://source.wiredtiger.com/develop/arch-eviction.html';
 const CMAP = 'https://specifications.readthedocs.io/en/latest/connection-monitoring-and-pooling/connection-monitoring-and-pooling/';
 const SEL = 'https://specifications.readthedocs.io/en/latest/server-selection/server-selection/';
-const CUROP = R + 'src/mongo/db/curop.cpp#L568';
+const CUROP = R + 'src/mongo/db/curop.cpp#L569';
 const CMON = 'https://specifications.readthedocs.io/en/latest/command-logging-and-monitoring/command-logging-and-monitoring/';
 const MON = 'https://specifications.readthedocs.io/en/latest/server-discovery-and-monitoring/server-monitoring/';
 const c = (url, label) => `<a class="cite" href="${url}" target="_blank">${label}</a>`;

@@ -13,7 +13,7 @@ _2026-10-25 · [lesson 2 §3b](lessons/0002-two-lookups.html#s3b)_
 
 <details><summary>Answer</summary>
 
-A covered query takes every filtered and returned field from one index, so the plan has no `FETCH` and no collection seeks (`totalDocsExamined: 0`). A projection that still returns `_id` keeps the `FETCH`, so it only saves network bytes. On 200k reviews with `{verified: 1, rating: 1}`: 44 ms / 15.6 MB with `FETCH`, 31 ms / 1.6 MB covered with `{_id: 0, rating: 1}`. Cover only your hottest queries, because each index is another B-tree that every insert has to update. ([Query optimization](https://www.mongodb.com/docs/manual/core/query-optimization/))
+A covered query takes every filtered and returned field from one index, so the plan has no `FETCH` and no collection seeks (`totalDocsExamined: 0`). A projection that still returns `_id` keeps the `FETCH`, so it only saves network bytes. On 200k reviews with `{verified: 1, rating: 1}`: 44 ms / 15.6 MiB with `FETCH`, 31 ms / 1.6 MiB covered with `{_id: 0, rating: 1}`. Cover only your hottest queries, because each index is another B-tree that every insert has to update. ([Query optimization](https://www.mongodb.com/docs/manual/core/query-optimization/))
 
 </details>
 
